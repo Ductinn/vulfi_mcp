@@ -1,0 +1,24 @@
+# Local credentials and agent state
+.env
+.env.*
+!.env.example
+.omp/
+
+# Python and JavaScript build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+
+# IDA analysis databases and intermediate files
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
