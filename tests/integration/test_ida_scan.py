@@ -156,17 +156,40 @@ def test_wrapper_loop_and_array_fact_detection(
     assert [row["priority"] for row in fixed] == ["Low"]
     assert fixed[0]["evidence"]["params"][1]["number"] == 7
 
-    # The one mutation a scan may make, and its disclosure: `lstrcpya` has a
-    # pinned VulFi prototype and no type of its own in the database.
+    # `lstrcpya` has a pinned VulFi prototype and no type of its own, but the
+    # decompiler recovers its call's arguments unaided, so the scan must leave
+    # the managed database alone.
+    assert result["scope_health"]["ida"]["applied_prototypes"] == []
+    typed = _for_rule(result, 3)
+    assert [row["function_name"] for row in typed] == ["lstrcpya"]
+    assert typed[0]["evidence"]["argument_count"] == 2
+
+
+def test_prototype_is_applied_only_when_arguments_cannot_be_recovered(
+    compiled_shapes: Path, managed_data_dir: Path
+) -> None:
+    # Without a decompiler, `get_arg_addrs` cannot read a call to an untyped
+    # `lstrcpya` at all. That — and only that — is what earns the one write a
+    # scan may make, so the arguments come back on the retry.
+    rule = _stock_rule("strcpy")
+    result = _scan(compiled_shapes, (rule,), decompiler="disabled")
+
     applied = result["scope_health"]["ida"]["applied_prototypes"]
     assert [entry["function"] for entry in applied] == ["lstrcpya"]
     assert applied[0]["prototype"] == (
         "char* lstrcpyA(char* lpString1, char* lpString2);"
     )
     assert applied[0]["address"].startswith("0x")
-    typed = _for_rule(result, 3)
-    assert [row["function_name"] for row in typed] == ["lstrcpya"]
-    assert typed[0]["evidence"]["argument_count"] == 2
+    # The retry recovered both arguments: the rule is unsupported because a
+    # disassembly-only backend cannot establish `is_constant`, not because the
+    # arguments are missing.
+    reason = result["rule_coverage"][0]["reason"] or ""
+    assert "constant" in reason
+    assert result["scope_health"]["ida"]["call_sites"] == 1
+
+    # The database now carries that type, so a second scan writes nothing more.
+    again = _scan(compiled_shapes, (rule,))
+    assert again["scope_health"]["ida"]["applied_prototypes"] == []
 
 
 def test_verified_zero_arguments_get_info(

@@ -36,6 +36,7 @@ import ast
 import math
 import operator
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, TypeAlias, TypeVar
@@ -1205,6 +1206,8 @@ class _Scanner:
         self._functions: list[int] = []
         self._code_functions: list[int] = []
         self._applied: list[dict[str, object]] = []
+        #: Functions a pinned prototype has already been offered to.
+        self._typed: set[int] = set()
         self._warnings: list[str] = []
         self._bounded = False
         self._cfuncs: dict[int, Any] = {}
@@ -1216,7 +1219,6 @@ class _Scanner:
 
     def run(self) -> dict[str, object]:
         self._collect_functions()
-        self._apply_prototypes()
         records: list[dict[str, object]] = []
         for rule in self._rules:
             names = rule["function_names"]
@@ -1277,46 +1279,50 @@ class _Scanner:
         for index in range(self._api.get_import_module_qty()):
             self._api.enum_import_names(index, collect)
 
-    def _apply_prototypes(self) -> None:
-        """Type a named function VulFi ships a prototype for, when IDA has none.
+    def _apply_prototype(self, ea: int, name: str) -> bool:
+        """Type a rule-named function VulFi ships a prototype for, once.
 
-        Upstream applied a prototype to every function it recognized. This
-        applies one only to a function some rule actually asks about and that
-        IDA has no type for at all, because that is the only case where
-        neither ``get_arg_addrs`` nor the decompiler has a prototype to
-        recover the call's arguments from. It is the only write this operation
-        makes, it happens in the managed database alone, and every application
-        is reported back as ``applied_prototypes``.
+        Upstream applied a prototype to every function it recognized, up
+        front. This runs only after argument recovery for a call to ``ea``
+        actually failed, which is the only state in which a missing prototype
+        is what the recovery lacked: a function IDA already types, and one the
+        decompiler recovered arguments for on its own, are never rewritten. It
+        is the only write this operation makes, it happens in the managed
+        database alone, and every application is reported back as
+        ``applied_prototypes``.
         """
-        wanted: set[str] = set()
-        for rule in self._rules:
-            if rule["function_names"] in ([ARRAY_RULE_NAME], [LOOP_RULE_NAME]):
-                continue
-            wanted |= self._wanted_names(rule)
-        if not wanted:
-            return
-        for ea in self._functions:
-            name = self._func_name(ea)
-            if not name or (name not in wanted and name.lower() not in wanted):
-                continue
-            prototype = self._prototypes.get(name.lower())
-            if prototype is None:
-                continue
-            try:
-                if self._idc.get_type(ea):
-                    continue
-                applied = bool(self._idc.SetType(ea, prototype))
-                if applied:
-                    self._api.auto_wait()
-            except Exception as error:
-                applied = False
-                self._warn(f"{name}: SetType: {type(error).__name__}: {error}")
-            if not applied:
-                self._warn(f"{name}: IDA did not accept the pinned prototype")
-                continue
-            self._applied.append(
-                {"function": name, "address": hex(ea), "prototype": prototype}
-            )
+        if not name or ea in self._typed:
+            return False
+        self._typed.add(ea)
+        prototype = self._prototypes.get(name.lower())
+        if prototype is None:
+            return False
+        try:
+            if self._idc.get_type(ea):
+                return False
+            applied = bool(self._idc.SetType(ea, prototype))
+            if applied:
+                self._api.auto_wait()
+        except Exception as error:
+            self._warn(f"{name}: SetType: {type(error).__name__}: {error}")
+            return False
+        if not applied:
+            self._warn(f"{name}: IDA did not accept the pinned prototype")
+            return False
+        self._forget_decompilations()
+        self._applied.append(
+            {"function": name, "address": hex(ea), "prototype": prototype}
+        )
+        return True
+
+    def _forget_decompilations(self) -> None:
+        """Drop every cached ctree: a new prototype changes what they say."""
+        for entry in self._cfuncs:
+            # No decompiler, or nothing cached for that function.
+            with suppress(Exception):
+                self._hx.mark_cfunc_dirty(entry)
+        self._cfuncs.clear()
+        self._trees.clear()
 
     def _wanted_names(self, rule: dict[str, Any]) -> set[str]:
         """The spellings upstream matches a function name against."""
@@ -1516,6 +1522,31 @@ class _Scanner:
     ) -> tuple[list[dict[str, object]] | None, str | None, int | None]:
         """This call's arguments, or exactly why they could not be recovered.
 
+        A first attempt uses whatever IDA already knows. Only if that fails is
+        the callee offered its pinned VulFi prototype, and only then is the
+        recovery retried — once. That is the whole of the ``SetType`` trigger:
+        a prototype is applied when, and only when, the arguments could not
+        otherwise be recovered.
+        """
+        params, reason, expected = self._recover_arguments(
+            call_ea, callee_name, callee_ea
+        )
+        if params is not None:
+            return params, reason, expected
+        if not self._apply_prototype(callee_ea, callee_name):
+            return None, reason, expected
+        retried, retry_reason, expected = self._recover_arguments(
+            call_ea, callee_name, callee_ea
+        )
+        if retried is not None:
+            return retried, retry_reason, expected
+        return None, f"{retry_reason} (after applying the pinned prototype)", expected
+
+    def _recover_arguments(
+        self, call_ea: int, callee_name: str, callee_ea: int
+    ) -> tuple[list[dict[str, object]] | None, str | None, int | None]:
+        """One recovery attempt against the database as it stands.
+
         An empty list is only a *verified* empty argument list. Hex-Rays builds
         a call node's argument list from what it decided the callee takes, so
         an empty one there is an observation; without a decompiler an empty
@@ -1586,33 +1617,46 @@ class _Scanner:
         return None, f"the ctree has no call to {callee_name} at this address"
 
     def _arguments_disass(self, call_ea: int) -> tuple[list[Any] | None, str | None]:
+        """Every argument slot IDA reports, keeping the ones it cannot read.
+
+        ``get_arg_addrs`` returns ``BADADDR`` whenever it cannot attribute the
+        instruction that sets an argument, and an instruction that does not
+        decode is the same kind of hole. Upstream compacts those slots away,
+        which silently renumbers every later argument; a hole travels as
+        ``None`` here so ``param[i]`` keeps meaning argument ``i`` and the
+        unread one reads as unavailable instead of as its neighbour.
+        """
         try:
             addresses = self._api.get_arg_addrs(call_ea)
         except Exception:  # upstream swallows this the same way
             addresses = None
         if addresses is None:
             return None, "IDA could not locate this call's argument instructions"
-        operands: list[Any] = []
-        for param_ea in addresses:
-            if param_ea == self._idc.BADADDR:
-                continue
-            insn = self._ua.insn_t()
-            if self._ua.decode_insn(insn, param_ea) == self._idc.BADADDR:
-                continue
-            feature = insn.get_canon_feature()
-            if feature & 0x100:
-                operands.append((insn, insn.Op1))
-            elif feature & 0x200:
-                operands.append((insn, insn.Op2))
-            elif feature & 0x400:
-                operands.append((insn, insn.Op3))
-        return operands, None
+        return [self._argument_operand(param_ea) for param_ea in addresses], None
+
+    def _argument_operand(self, param_ea: int) -> Any:
+        if param_ea == self._idc.BADADDR:
+            return None
+        insn = self._ua.insn_t()
+        if self._ua.decode_insn(insn, param_ea) == self._idc.BADADDR:
+            return None
+        feature = insn.get_canon_feature()
+        if feature & 0x100:
+            return (insn, insn.Op1)
+        if feature & 0x200:
+            return (insn, insn.Op2)
+        if feature & 0x400:
+            return (insn, insn.Op3)
+        return None
 
     # -- argument facts ---------------------------------------------------
 
     def _param_facts(
         self, item: Any, call_ea: int, callee_name: str
     ) -> dict[str, object]:
+        if item is None:
+            # A slot IDA could not read: the position is real, its facts are not.
+            return {"kind": "absent"}
         if self._hexrays:
             return self._ctree_param_facts(item, call_ea, callee_name)
         return self._operand_param_facts(item[1], call_ea)

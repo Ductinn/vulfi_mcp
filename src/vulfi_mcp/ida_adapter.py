@@ -589,7 +589,13 @@ def _scan_result(
     binary_sha256 = raw.get("input_sha256")
     findings: list[Finding] = []
     coverage: list[RuleCoverage] = []
-    tally = {"sites": 0, "evaluated": 0, "unsupported": 0, "failed": 0}
+    tally = {
+        "sites": 0,
+        "evaluated": 0,
+        "unsupported": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
     complete = not raw.get("bounded")
 
     for index, rule in enumerate(rules):
@@ -600,7 +606,7 @@ def _scan_result(
                 _coverage(index, "failed", "the scan returned no result for this rule")
             )
             continue
-        rows, state, reason, counts = _rule_outcome(
+        rows, state, reason, site_counts = _rule_outcome(
             rule,
             index,
             record,
@@ -612,14 +618,14 @@ def _scan_result(
         )
         findings.extend(rows)
         coverage.append(_coverage(index, state, reason))
-        for key, value in counts.items():
+        for key, value in site_counts.items():
             tally[key] += value
         if state != "evaluated":
             complete = False
 
-    counts = dict.fromkeys(TRIAGE_STATUSES, 0)
+    status_counts = dict.fromkeys(TRIAGE_STATUSES, 0)
     for finding in findings:
-        counts[finding["status"]] += 1
+        status_counts[finding["status"]] += 1
     warnings = [str(warning) for warning in raw.get("warnings") or []]
     warnings.append(_CATALOG_WARNING)
     return {
@@ -640,7 +646,10 @@ def _scan_result(
         # Plan 3's catalog is the other store; an absent store is unavailable,
         # never zero, so this total is explicitly incomplete.
         "target_total_complete": False,
-        "status_counts": {BACKEND: counts, "aggregate": dict(counts)},
+        "status_counts": {
+            BACKEND: status_counts,
+            "aggregate": dict(status_counts),
+        },
         "scope_health": {
             BACKEND: {
                 "analysis_mode": mode,
@@ -652,6 +661,9 @@ def _scan_result(
                 "evaluated_sites": tally["evaluated"],
                 "unsupported_sites": tally["unsupported"],
                 "failed_sites": tally["failed"],
+                # Wrapper sites the wrapped call ruled out, as upstream
+                # does: discovered and returned, deliberately unevaluated.
+                "skipped_wrapper_sites": tally["skipped"],
                 "bounded": bool(raw.get("bounded")),
                 "applied_prototypes": raw.get("applied_prototypes") or [],
             }
@@ -695,10 +707,12 @@ def _rule_outcome(
     unsupported: list[str] = []
     failed: list[str] = []
     evaluated = 0
+    skipped = 0
     skip = 0
     for site in record.get("sites", []):
         if skip:
             skip -= 1
+            skipped += 1
             continue
         priority, problem, outcome = _site_priority(rule, site)
         if outcome == "unsupported":
@@ -759,6 +773,7 @@ def _rule_outcome(
         "evaluated": evaluated,
         "unsupported": len(unsupported),
         "failed": len(failed),
+        "skipped": skipped,
     }
     return findings, state, reason, counts
 
