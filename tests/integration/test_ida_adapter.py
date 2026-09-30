@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 from ida_nexus import DatabaseBusyError, DatabaseHandle, RemoteError
 
-from vulfi_mcp.ida_adapter import ensure_managed_idb, invoke_ida
+from vulfi_mcp.ida_adapter import (
+    ManagedDatabaseError,
+    _publish,
+    ensure_managed_idb,
+    invoke_ida,
+)
 
 pytestmark = pytest.mark.requires_ida
 
@@ -28,6 +33,11 @@ def _managed_databases(root: Path) -> set[Path]:
     return set(root.rglob("*.i64")) if root.exists() else set()
 
 
+def _beside(source: Path) -> list[str]:
+    """Everything in the source's directory except the source itself."""
+    return sorted(item.name for item in source.parent.iterdir() if item != source)
+
+
 def test_managed_copy_opens_saves_reopens(
     compiled_calls: Path, managed_data_dir: Path, tmp_path: Path
 ) -> None:
@@ -38,8 +48,9 @@ def test_managed_copy_opens_saves_reopens(
     assert managed.is_file()
     assert managed.suffix == ".i64"
     assert managed_data_dir in managed.parents
-    # The source binary is read-only: no IDB is created beside it.
-    assert list(compiled_calls.parent.glob("*.i64")) == []
+    # The source binary is read-only: IDA leaves nothing at all beside it, not
+    # even the unpacked components that only become a `.i64` when saved.
+    assert _beside(compiled_calls) == [managed_data_dir.name]
     assert _digest(compiled_calls) == source_digest
 
     summary = invoke_ida(str(managed), SUMMARY, {"name_limit": 500})
@@ -112,4 +123,25 @@ def test_invoke_refuses_to_open_a_binary(compiled_calls: Path) -> None:
     with pytest.raises(ValueError):
         invoke_ida(str(compiled_calls), SUMMARY, {})
 
-    assert list(compiled_calls.parent.glob("*.i64")) == []
+    assert _beside(compiled_calls) == []
+
+
+def test_a_live_database_is_never_published(
+    compiled_calls: Path, managed_data_dir: Path, tmp_path: Path
+) -> None:
+    # A `.i64` exists on disk while its database is live, and the lease close
+    # only waits when Nexus reported a pending shutdown, so publishing must be
+    # gated on the observed state instead of on the file being there.
+    staged = Path(ensure_managed_idb(str(compiled_calls)))
+    target = tmp_path / "published.i64"
+
+    holder = DatabaseHandle.open(str(staged))
+    try:
+        with pytest.raises(ManagedDatabaseError) as failure:
+            _publish(staged, target)
+    finally:
+        holder.close(wait_for_database=True)
+
+    assert "in_use" in str(failure.value)
+    assert not target.exists()
+    assert staged.is_file()

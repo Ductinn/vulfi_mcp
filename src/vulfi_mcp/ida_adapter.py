@@ -27,6 +27,7 @@ import math
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from functools import lru_cache
@@ -34,7 +35,12 @@ from pathlib import Path
 from typing import Any, Final
 
 import ida_nexus
-from ida_nexus import DatabaseBusyError, DatabaseHandle, DatabaseOpenOptions
+from ida_nexus import (
+    DatabaseBusyError,
+    DatabaseHandle,
+    DatabaseInstance,
+    DatabaseOpenOptions,
+)
 from ida_nexus.database_state import unpacked_database_paths
 
 from vulfi_mcp import ida_runtime
@@ -57,6 +63,9 @@ IDB_SUFFIXES: Final = (".i64", ".idb")
 #: Seconds one worker operation may run before the lease gives up on it.
 WORKER_TIMEOUT: Final = 600.0
 
+#: Seconds to wait for IDA to repack a database once its lease closed.
+RELEASE_TIMEOUT: Final = 120.0
+
 #: File states of a supplied IDB that make copying it unsafe.
 _UNSAFE_STATES: Final = {
     "in_use": "it is open in another IDA session",
@@ -77,22 +86,27 @@ class ManagedDatabaseError(RuntimeError):
 
 
 def data_dir() -> Path:
-    """Root directory for everything this server owns on disk."""
+    """Root directory for everything this server owns on disk.
+
+    Resolved once, here: a relative or symlinked configuration would otherwise
+    make every managed path depend on the process working directory, and would
+    hand callers a spelling of the file that differs from the one IDA reports.
+    """
     configured = os.environ.get(DATA_DIR_ENV)
     if configured:
-        return Path(configured).expanduser()
+        return Path(configured).expanduser().resolve()
     base = Path(os.environ.get("XDG_DATA_HOME") or "~/.local/share").expanduser()
-    return base / "vulfi-mcp"
+    return (base / "vulfi-mcp").resolve()
 
 
 def ensure_managed_idb(path: str) -> str:
     """Return the managed IDB for ``path``, analyzing or cloning it if needed.
 
     ``path`` is either a binary, which is analyzed into a fresh managed
-    database, or a saved ``.i64``/``.idb``, which is copied with its companion
-    files and opened only as that copy. A supplied IDB that is open, unpacked,
-    dirty, crashed, or owned by a live instance raises
-    :class:`ida_nexus.DatabaseBusyError` and is left untouched.
+    database, or a saved ``.i64``/``.idb``, which is copied and opened only as
+    that copy. A supplied IDB that is open, unpacked, dirty, crashed, or owned
+    by a live instance raises :class:`ida_nexus.DatabaseBusyError` and is left
+    untouched.
 
     The result is deterministic: the same file at the same path always resolves
     to the same managed database, and a database that is already there is
@@ -245,14 +259,17 @@ def _analyze_binary(source: Path, managed: Path, workspace: Path) -> str:
 
 
 def _clone_idb(source: Path, managed: Path, workspace: Path) -> str:
-    """Copy a saved, unlocked IDB into the workspace and open only the copy."""
+    """Copy a saved, unlocked IDB into the workspace and open only the copy.
+
+    Only the packed file is copied. ``_require_released`` already established
+    that no component files exist beside it, and the one way they could appear
+    afterwards is another session opening the source: copying that session's
+    live components would stage a database that probes as crashed.
+    """
     staging = _staging(workspace)
     try:
         copy = staging / managed.name
         shutil.copy2(source, copy)
-        for companion in unpacked_database_paths(source):
-            if companion.is_file():
-                shutil.copy2(companion, copy.with_suffix(companion.suffix))
         with _lease(copy, DatabaseOpenOptions(worker_cwd=str(staging))) as handle:
             produced = Path(handle.instance.idb_path)
             _require_saved(handle.save_database(), produced)
@@ -262,9 +279,23 @@ def _clone_idb(source: Path, managed: Path, workspace: Path) -> str:
 
 
 def _publish(produced: Path, managed: Path) -> str:
-    """Move a finished database from staging onto its deterministic name."""
+    """Move a released database from staging onto its deterministic name.
+
+    A ``.i64`` exists on disk while its database is live, so the file being
+    there proves nothing. ``DatabaseHandle.close(wait_for_database=True)`` only
+    waits when its lease-release call reported a pending shutdown, and that call
+    can time out; publishing then would rename and delete files a worker is
+    still writing, and the half-written result would be reused forever. The
+    probe is the invariant: only a ``packed`` database is finished.
+    """
     if not produced.is_file():
         raise ManagedDatabaseError(f"IDA did not leave a database at {produced}")
+    state = ida_nexus.probe_database_state(produced)["state"]
+    if state != "packed":
+        raise ManagedDatabaseError(
+            f"refusing to publish {produced}: IDA has not released it"
+            f" (state: {state})"
+        )
     _discard(managed)
     os.replace(produced, managed)
     return str(managed)
@@ -302,14 +333,21 @@ def _require_saved(result: Any, database: Path) -> None:
 
 @contextmanager
 def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandle]:
-    """Hold exactly one Nexus lease and always release it.
+    """Hold exactly one Nexus lease, release it, and see it released.
 
-    The close waits for the database itself: an IDB is unpacked while a worker
-    holds it, so returning before that worker repacked it would hand callers a
-    path that is not yet a file. A failure while closing is only reported when
-    the work itself succeeded, so it can never mask the real error.
+    An IDB is unpacked while a worker holds it, and the worker keeps the packed
+    file open until it exits, so a caller that returns earlier would hand out a
+    path whose bytes are still moving. ``close(wait_for_database=True)`` is
+    asked for that wait but only performs it when its ``/release_lease`` call
+    reported ``shutdown_pending``, and that call is a two-second best effort
+    that reports ``False`` on any timeout or transport error. The observed
+    release is therefore the authority, not the close.
+
+    A failure while closing is only reported when the work itself succeeded, so
+    it can never mask the real error.
     """
     handle = DatabaseHandle.open(str(target), options=options)
+    instance = handle.instance
     failed = False
     try:
         yield handle
@@ -319,9 +357,31 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     finally:
         try:
             handle.close(wait_for_database=True)
+            if not failed:
+                _await_released(instance)
         except Exception:
             if not failed:
                 raise
+
+
+def _await_released(instance: DatabaseInstance) -> None:
+    """Wait for the worker to let go of its database and finish repacking it."""
+    database = Path(instance.idb_path)
+    if not ida_nexus.wait_database_released(instance, timeout=RELEASE_TIMEOUT):
+        raise ManagedDatabaseError(
+            f"{database} was still held {RELEASE_TIMEOUT:g}s after its lease closed"
+        )
+    deadline = time.monotonic() + RELEASE_TIMEOUT
+    while True:
+        state = ida_nexus.probe_database_state(database)["state"]
+        if state == "packed":
+            return
+        if time.monotonic() >= deadline:
+            raise ManagedDatabaseError(
+                f"{database} is still {state} {RELEASE_TIMEOUT:g}s after its lease"
+                " closed; IDA never repacked it"
+            )
+        time.sleep(0.05)
 
 
 @lru_cache(maxsize=1)
