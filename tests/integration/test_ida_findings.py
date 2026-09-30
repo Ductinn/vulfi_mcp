@@ -18,6 +18,7 @@ from ida_nexus import DatabaseOpenOptions, RemoteError
 from vulfi_mcp.contracts import Finding
 from vulfi_mcp.ida_adapter import (
     _lease,
+    _save_session,
     _session,
     ensure_managed_idb,
     findings_ida,
@@ -123,18 +124,20 @@ payload.hex()
 """
 
 
-def _in_database(managed: str, code: str) -> Any:
+def _in_database(managed: str, code: str, *, save: bool = True) -> Any:
     """Run one statement inside the managed database, and save what it did.
 
-    It borrows the adapter's own lease so the database is released and
-    repacked before the next scan opens it, exactly as a real operation
-    would leave it.
+    It borrows the adapter's own lease and its own save, so the database is
+    released, repacked and backed up before the next scan opens it, exactly as
+    a real operation would leave it. A statement that only reads is no reason
+    to rewrite the IDB, so those pass ``save=False``.
     """
     target = Path(managed)
     with _lease(target, DatabaseOpenOptions(worker_cwd=str(target.parent))) as handle:
         result = handle.execute_python(code)
         assert not result["stderr"], result["stderr"]
-        assert handle.save_database()["saved"]
+        if save:
+            _save_session(handle, target)
     return result["result"]
 
 
@@ -466,4 +469,4 @@ def test_unknown_schema_version_is_refused_without_overwriting(
         triage_ida(managed, "ida:default:0:x:image:0x1:0", "Vulnerable", "anything")
 
     # Refused, every time, and still exactly the bytes the later build wrote.
-    assert _in_database(managed, _READ_BLOB) == future
+    assert _in_database(managed, _READ_BLOB, save=False) == future

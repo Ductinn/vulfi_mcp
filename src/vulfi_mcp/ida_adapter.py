@@ -50,6 +50,7 @@ from ida_nexus import (
     DatabaseInstance,
     DatabaseOpenOptions,
     NexusError,
+    WorkerStartError,
 )
 from ida_nexus.database_state import unpacked_database_paths
 
@@ -124,6 +125,15 @@ _RUNTIME_SOURCE: Final = Path(ida_runtime.__file__).resolve()
 _STAGING: Final = ".staging-"
 #: Longest directory-name prefix kept from a target's file name.
 _MAX_STEM: Final = 48
+
+#: Name suffix of the copy a mutating save keeps of the bytes it replaces.
+#: IDA 9.4 occasionally packs a database it can no longer open — ``rc 4``,
+#: ``Database is empty``, while the file still probes ``packed`` — so the last
+#: known-good bytes stay beside it until an open proves the new ones readable.
+_PRE_SAVE: Final = ".pre-save"
+#: Where that copy is written before it is put in place, so a copy interrupted
+#: half way never becomes the copy a recovery trusts.
+_PARTIAL: Final = ".partial"
 
 #: The backend tag every row this adapter produces carries. The worker names
 #: itself the same way, and refuses a row that claims anything else.
@@ -421,9 +431,53 @@ def _reusable(managed: Path) -> str | None:
 
 
 def _discard(database: Path) -> None:
-    for stale in (database, *unpacked_database_paths(database)):
+    _unlink(
+        database,
+        *unpacked_database_paths(database),
+        *_pre_save_paths(database),
+    )
+
+
+def _discard_unpacked(database: Path) -> None:
+    """Drop the components an interrupted open left beside a packed database.
+
+    A worker that dies in ``open_database`` still leaves the ``.id0`` and its
+    siblings behind, and a packed ``.i64`` next to them is a crashed database
+    that the next open refuses outright.
+    """
+    _unlink(*unpacked_database_paths(database))
+
+
+def _unlink(*paths: Path) -> None:
+    for stale in paths:
         with suppress(FileNotFoundError, IsADirectoryError):
             stale.unlink()
+
+
+def _pre_save(database: Path) -> Path:
+    """Where the bytes a mutating save replaces are kept, beside the database."""
+    return database.with_name(database.name + _PRE_SAVE)
+
+
+def _pre_save_paths(database: Path) -> tuple[Path, ...]:
+    spare = _pre_save(database)
+    return (spare, spare.with_name(spare.name + _PARTIAL))
+
+
+def _keep_pre_save(database: Path) -> None:
+    """Copy ``database`` aside so a save that damages it can be undone.
+
+    Written under a scratch name and renamed into place: a copy interrupted
+    half way must never become the copy a recovery puts back.
+    """
+    spare, partial = _pre_save_paths(database)
+    shutil.copy2(database, partial)
+    os.replace(partial, spare)
+
+
+def _drop_pre_save(database: Path) -> None:
+    """Forget the spare copy: the bytes on disk have just been opened."""
+    _unlink(*_pre_save_paths(database))
 
 
 def _staging(workspace: Path) -> Path:
@@ -527,6 +581,19 @@ def _require_saved(result: Any, database: Path) -> None:
         raise ManagedDatabaseError(f"IDA reported no save for {database}: {result!r}")
 
 
+def _save_session(handle: DatabaseHandle, database: Path) -> None:
+    """Commit what a live lease changed, keeping the bytes it overwrites.
+
+    Every write this module makes to a database that is already published
+    goes through here, so the spare copy exists for all of them and for
+    nothing else. The two staging saves behind ``ensure_managed_idb`` need no
+    spare: they write a private file that only reaches its managed name once
+    ``_publish`` has seen IDA release it.
+    """
+    _keep_pre_save(database)
+    _require_saved(handle.save_database(), database)
+
+
 # --------------------------------------------------------------------------
 # One lease, one worker entry point
 # --------------------------------------------------------------------------
@@ -580,11 +647,15 @@ class _Worker:
         write does not weaken that — the save runs inside the lease, before
         the database is closed, and its failure reaches the caller instead of
         a result that looks durable.
+
+        IDA reporting a successful save is not proof that it wrote a database
+        it can read back, so the bytes this save replaces are kept beside it
+        until an open proves the new ones good.
         """
         if not self._unsaved:
             return
         self._unsaved = False
-        _require_saved(self._handle.save_database(), self._database)
+        _save_session(self._handle, self._database)
 
 
 @contextmanager
@@ -655,9 +726,28 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     What differs on a failing path is only whose error is reported: the body's,
     always. A teardown that then fails travels with it as a note instead of
     replacing it or vanishing.
+
+    One open failure is recoverable rather than fatal. IDA 9.4 sometimes packs
+    a database it then refuses to load (``rc 4``, ``Database is empty``, while
+    ``probe_database_state`` still calls the file ``packed``), so every save
+    this module makes leaves the previous bytes in a spare copy. When the open
+    fails on a database nobody owns and that copy is there, it is put back and
+    the open is tried once more. Whether or not that second open works, the
+    caller is told: a rolled-back database is missing whatever the last save
+    changed, and answering from it as if nothing had happened would contradict
+    the durability the operation before this one was given.
     """
     prior = _prior_owner(target, options.output_database)
-    handle = DatabaseHandle.open(str(target), options=options)
+    recovered = False
+    try:
+        handle = DatabaseHandle.open(str(target), options=options)
+    except WorkerStartError as damaged:
+        handle = _restore_pre_save(target, options, damaged)
+        recovered = True
+    else:
+        # These bytes load, so the copy taken before they were written has
+        # nothing left to rescue.
+        _drop_pre_save(target)
     instance = handle.instance
     # Not "nobody owned it before": the instance this lease actually got. A
     # stale owner seen a moment ago must not disown a worker we then spawned.
@@ -668,6 +758,15 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     )
     failure: BaseException | None = None
     try:
+        if recovered:
+            # Raised inside the lease so the restored database is released the
+            # same way any other lease releases one.
+            raise ManagedDatabaseError(
+                f"IDA could not open {target}: the save before this one left a"
+                " database it cannot read. The copy taken before that save has"
+                " been put back and opens, so this workspace works again, but"
+                " whatever that save changed is gone from it."
+            )
         yield handle
     except BaseException as error:
         failure = error
@@ -697,6 +796,35 @@ def _prior_owner(target: Path, output_database: str | Path | None) -> object:
         # Several live candidates: this lease cannot claim what it will get.
         return _AMBIGUOUS
     return owner.record_id if owner is not None else None
+
+
+def _restore_pre_save(
+    target: Path,
+    options: DatabaseOpenOptions,
+    damaged: WorkerStartError,
+) -> DatabaseHandle:
+    """Put the copy taken before the last save back, and open that instead.
+
+    Only for a database no live instance owns and no unregistered session
+    holds: overwriting a file another session has open would destroy that
+    session's work. With no spare copy there is nothing to recover and the
+    original failure stands.
+    """
+    spare = _pre_save(target)
+    if not spare.is_file() or _prior_owner(target, None) is not None:
+        raise damaged
+    if ida_nexus.probe_database_state(target)["state"] == "in_use":
+        raise damaged
+    _discard_unpacked(target)
+    os.replace(spare, target)
+    try:
+        return DatabaseHandle.open(str(target), options=options)
+    except WorkerStartError as dead:
+        raise ManagedDatabaseError(
+            f"IDA could not open {target}, and neither can the copy taken"
+            " before its last save; nothing in this workspace is usable and it"
+            " has to be built again from its source"
+        ) from dead
 
 
 def _await_released(instance: DatabaseInstance) -> None:

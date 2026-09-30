@@ -17,6 +17,7 @@ from ida_nexus import (
     DatabaseHandle,
     NexusConnectionError,
     RemoteError,
+    WorkerStartError,
     find_database_owner,
     probe_database_state,
 )
@@ -24,14 +25,37 @@ from ida_nexus import (
 from vulfi_mcp.ida_adapter import (
     RELEASE_TIMEOUT,
     ManagedDatabaseError,
+    _pre_save,
     _publish,
     ensure_managed_idb,
     invoke_ida,
+    scan_ida,
 )
+from vulfi_mcp.rules import Rule, load_stock_rules
 
 pytestmark = pytest.mark.requires_ida
 
 SUMMARY = "database_summary"
+
+#: The stock rule that matches this fixture's `strcpy` call sites, so one scan
+#: really does write a record.
+BUFFER_OVERFLOW: Rule = next(
+    rule for rule in load_stock_rules() if rule["function_names"][0] == "strcpy"
+)
+
+#: A packed .i64 IDA still calls ``packed`` and can no longer load. Zeroing a
+#: page well past the header reproduces the production signature exactly:
+#: ``probe_database_state`` says ``packed`` and ``idapro.open_database``
+#: answers ``rc 4`` with "Database is empty".
+_DAMAGE_AT = 0x8000
+_DAMAGE_LEN = 0x1000
+
+
+def _damage(database: Path) -> None:
+    raw = bytearray(database.read_bytes())
+    assert len(raw) > _DAMAGE_AT + _DAMAGE_LEN, "fixture database is too small"
+    raw[_DAMAGE_AT : _DAMAGE_AT + _DAMAGE_LEN] = bytes(_DAMAGE_LEN)
+    database.write_bytes(bytes(raw))
 
 
 def _digest(path: Path) -> str:
@@ -230,3 +254,74 @@ def test_a_failed_shutdown_still_closes_the_lease(
     clone = ensure_managed_idb(str(managed))
     assert Path(clone).is_file()
     assert invoke_ida(str(managed), SUMMARY, {"name_limit": 5})["function_count"] > 0
+
+
+def test_a_mutating_operation_keeps_the_bytes_it_replaces(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # IDA reporting a successful save is not proof that it wrote a database it
+    # can read back, so the bytes a save replaces stay beside it until an open
+    # proves the new ones good — and are dropped as soon as one does.
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+    spare = _pre_save(managed)
+    assert not spare.exists()
+    before = managed.read_bytes()
+
+    scan_ida(str(managed), (BUFFER_OVERFLOW,), "default", path=str(compiled_calls))
+    assert spare.read_bytes() == before
+    assert managed.read_bytes() != before
+
+    saved = managed.read_bytes()
+    assert invoke_ida(str(managed), SUMMARY, {"name_limit": 5})["function_count"] > 0
+    assert not spare.exists()
+    assert managed.read_bytes() == saved
+
+
+def test_a_save_that_cannot_be_reopened_is_rolled_back_and_reported(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # IDA 9.4 sometimes packs a database it then refuses to load, while the
+    # file still probes `packed`. The spare copy is put back, the caller is
+    # told what that cost, and the workspace works again afterwards.
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+    good = managed.read_bytes()
+    shutil.copy2(managed, _pre_save(managed))
+    _damage(managed)
+    assert probe_database_state(managed)["state"] == "packed"
+
+    with pytest.raises(ManagedDatabaseError) as rolled_back:
+        invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
+    assert "put back" in str(rolled_back.value)
+
+    assert managed.read_bytes() == good
+    assert not _pre_save(managed).exists()
+    assert invoke_ida(str(managed), SUMMARY, {"name_limit": 5})["function_count"] > 0
+
+
+def test_a_damaged_database_with_no_spare_copy_still_fails(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # Nothing to recover from: the open failure reaches the caller unchanged,
+    # and no database is invented to answer from.
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+    _damage(managed)
+    damaged = managed.read_bytes()
+
+    with pytest.raises(WorkerStartError):
+        invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
+    assert managed.read_bytes() == damaged
+
+
+def test_a_spare_copy_that_is_damaged_too_is_reported_as_unusable(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # The recovery is tried once and then gives up loudly, rather than
+    # answering from a database nothing has ever opened.
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+    _damage(managed)
+    shutil.copy2(managed, _pre_save(managed))
+
+    with pytest.raises(ManagedDatabaseError) as unusable:
+        invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
+    assert "built again from its source" in str(unusable.value)
+    assert not _pre_save(managed).exists()
