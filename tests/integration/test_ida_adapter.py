@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 from ida_nexus import DatabaseBusyError, DatabaseHandle, RemoteError
 
 from vulfi_mcp.ida_adapter import (
+    RELEASE_TIMEOUT,
     ManagedDatabaseError,
     _publish,
     ensure_managed_idb,
@@ -145,3 +147,23 @@ def test_a_live_database_is_never_published(
     assert "in_use" in str(failure.value)
     assert not target.exists()
     assert staged.is_file()
+
+
+def test_a_shared_database_is_not_waited_on(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # A lease that attached to somebody else's live instance must not wait for
+    # that instance to die: the wait could only end when the other session
+    # does, and would then discard an operation that already completed.
+    managed = ensure_managed_idb(str(compiled_calls))
+
+    holder = DatabaseHandle.open(managed)
+    try:
+        started = time.monotonic()
+        result = invoke_ida(managed, SUMMARY, {"name_limit": 5})
+        elapsed = time.monotonic() - started
+    finally:
+        holder.close(wait_for_database=True)
+
+    assert result["function_count"] > 0
+    assert elapsed < RELEASE_TIMEOUT

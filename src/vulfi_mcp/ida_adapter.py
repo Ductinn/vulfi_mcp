@@ -40,6 +40,7 @@ from ida_nexus import (
     DatabaseHandle,
     DatabaseInstance,
     DatabaseOpenOptions,
+    NexusError,
 )
 from ida_nexus.database_state import unpacked_database_paths
 
@@ -333,7 +334,7 @@ def _require_saved(result: Any, database: Path) -> None:
 
 @contextmanager
 def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandle]:
-    """Hold exactly one Nexus lease, release it, and see it released.
+    """Hold exactly one Nexus lease, release it, and see our own worker go.
 
     An IDB is unpacked while a worker holds it, and the worker keeps the packed
     file open until it exits, so a caller that returns earlier would hand out a
@@ -343,11 +344,21 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     that reports ``False`` on any timeout or transport error. The observed
     release is therefore the authority, not the close.
 
+    That wait is only ours to make when this lease spawned the worker. Nexus
+    attaches to any live instance that already owns the target instead of
+    spawning one, and such an instance's lifetime lock belongs to whoever owns
+    it — a GUI session or a sibling lease. Waiting on that lock would stall
+    until somebody else's session ends and then fail an operation that already
+    completed, and possibly already saved, which is why a database somebody
+    else already owns is left on Nexus's own semantics.
+
     A failure while closing is only reported when the work itself succeeded, so
     it can never mask the real error.
     """
+    alone = _opens_alone(target, options.output_database)
     handle = DatabaseHandle.open(str(target), options=options)
     instance = handle.instance
+    ours = alone and instance.managed
     failed = False
     try:
         yield handle
@@ -357,11 +368,24 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     finally:
         try:
             handle.close(wait_for_database=True)
-            if not failed:
+            if not failed and ours:
                 _await_released(instance)
         except Exception:
             if not failed:
                 raise
+
+
+def _opens_alone(target: Path, output_database: str | Path | None) -> bool:
+    """Whether opening ``target`` spawns a worker instead of attaching to one."""
+    try:
+        owner = ida_nexus.find_database_owner(
+            str(target), output_database=output_database
+        )
+    except NexusError:
+        # Several live candidates: somebody else is running, so this lease is
+        # not the one that will own the worker either way.
+        return False
+    return owner is None
 
 
 def _await_released(instance: DatabaseInstance) -> None:
