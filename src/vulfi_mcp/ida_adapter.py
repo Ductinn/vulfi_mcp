@@ -135,6 +135,27 @@ _PRE_SAVE: Final = ".pre-save"
 #: half way never becomes the copy a recovery trusts.
 _PARTIAL: Final = ".partial"
 
+#: ``ida_nexus`` raises one ``WorkerStartError`` for three unrelated failures:
+#: a readiness timeout, a worker that opened a different IDB than asked for,
+#: and a launcher process that exited non-zero — licence trouble, a missing
+#: shared library, an OOM kill, a transient fork failure. Only the last, and
+#: only when the worker log tail it carries shows idalib refusing this very
+#: file, says anything about the bytes on disk. Everything else leaves a
+#: perfectly readable database that must not be rolled back over.
+_LAUNCHER_EXIT: Final = "idalib worker launcher "
+_EXITED_WITH: Final = " exited with status "
+#: The two lines idalib leaves when it named a database and refused to load
+#: it, each as the text before and after the path. The first is
+#: ``ida_domain.database._open_new_database`` re-raising a non-zero
+#: ``idapro.open_database``, which is the ``rc 4`` / "Database is empty" shape
+#: the vendor defect produces; the second is IDA's own kernel abort on a
+#: database it parsed far enough to reject. Both name the file, and a line
+#: that names a different file is about a different file.
+_REFUSALS: Final = (
+    ("Failed to open database ", ""),
+    ("FATAL ERROR: The database ", " is corrupted"),
+)
+
 #: The backend tag every row this adapter produces carries. The worker names
 #: itself the same way, and refuses a row that claims anything else.
 BACKEND: Final[Backend] = "ida"
@@ -667,6 +688,12 @@ def _session(idb_path: str) -> Iterator[_Worker]:
     changed reaches disk either: the operation it failed in never returned a
     result claiming durability, and a lease this process owns ends with a
     discarding shutdown whether or not the body raised.
+
+    This is the only lease that asks for the rescue copy. It is the only one
+    whose target is a published managed database, so it is the only one whose
+    target can ever have a spare worth consulting: the other two lease a
+    source binary and a staging copy, beside neither of which this module
+    writes anything.
     """
     database = Path(idb_path).expanduser()
     if database.suffix.lower() not in IDB_SUFFIXES:
@@ -676,14 +703,19 @@ def _session(idb_path: str) -> Iterator[_Worker]:
     if not database.is_file():
         raise FileNotFoundError(f"no such IDA database: {database}")
     options = DatabaseOpenOptions(worker_cwd=str(database.parent))
-    with _lease(database, options) as handle:
+    with _lease(database, options, rescue=True) as handle:
         worker = _Worker(handle, database)
         yield worker
         worker.save()
 
 
 @contextmanager
-def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandle]:
+def _lease(
+    target: Path,
+    options: DatabaseOpenOptions,
+    *,
+    rescue: bool = False,
+) -> Iterator[DatabaseHandle]:
     """Hold exactly one Nexus lease and shut our own worker down behind us.
 
     A worker closes its database with ``save=True`` by default, so *every*
@@ -727,27 +759,40 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     always. A teardown that then fails travels with it as a note instead of
     replacing it or vanishing.
 
-    One open failure is recoverable rather than fatal. IDA 9.4 sometimes packs
-    a database it then refuses to load (``rc 4``, ``Database is empty``, while
+    One open failure is recoverable rather than fatal, but only one shape of
+    it, and only for a ``rescue`` lease. IDA 9.4 sometimes packs a database it
+    then refuses to load (``rc 4``, ``Database is empty``, while
     ``probe_database_state`` still calls the file ``packed``), so every save
-    this module makes leaves the previous bytes in a spare copy. When the open
-    fails on a database nobody owns and that copy is there, it is put back and
-    the open is tried once more. Whether or not that second open works, the
-    caller is told: a rolled-back database is missing whatever the last save
-    changed, and answering from it as if nothing had happened would contradict
-    the durability the operation before this one was given.
+    :func:`_session` makes leaves the previous bytes in a spare copy. When an
+    open fails *with that signature* on a database nobody owns and that copy
+    is there, it is put back and the open is tried once more. Whether or not
+    that second open works, the caller is told: a rolled-back database is
+    missing whatever the last save changed, and answering from it as if
+    nothing had happened would contradict the durability the operation before
+    this one was given.
+
+    Every other ``WorkerStartError`` travels untouched. A readiness timeout, a
+    worker that opened the wrong IDB, a launcher that died of a licence or a
+    missing library — none of them says the file is bad, and rolling back on
+    one would destroy a readable database, report a cause that is not true,
+    and (for the timeout, whose worker is often still starting) unlink the
+    ``.id0`` that worker is in the middle of creating.
+
+    Dropping the spare is gated the same way for the same reason. Nexus
+    returns an already-live instance before it touches the filesystem, so a
+    lease that attached to a GUI session's or a sibling's worker never read
+    the packed file and proves nothing about it; only ``ours`` means "this
+    lease spawned the worker, so idalib loaded these bytes".
     """
     prior = _prior_owner(target, options.output_database)
     recovered = False
     try:
         handle = DatabaseHandle.open(str(target), options=options)
     except WorkerStartError as damaged:
+        if not rescue or not _refused_these_bytes(damaged, target):
+            raise
         handle = _restore_pre_save(target, options, damaged)
         recovered = True
-    else:
-        # These bytes load, so the copy taken before they were written has
-        # nothing left to rescue.
-        _drop_pre_save(target)
     instance = handle.instance
     # Not "nobody owned it before": the instance this lease actually got. A
     # stale owner seen a moment ago must not disown a worker we then spawned.
@@ -756,6 +801,11 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
         and prior is not _AMBIGUOUS
         and prior != instance.record_id
     )
+    if rescue and ours and not recovered:
+        # Our own worker loaded these bytes, so the copy taken before they
+        # were written has nothing left to rescue. An attached instance read
+        # nothing: its answer is valid even when the path does not exist.
+        _drop_pre_save(target)
     failure: BaseException | None = None
     try:
         if recovered:
@@ -798,6 +848,40 @@ def _prior_owner(target: Path, output_database: str | Path | None) -> object:
     return owner.record_id if owner is not None else None
 
 
+def _refused_these_bytes(damaged: WorkerStartError, target: Path) -> bool:
+    """Whether this start failure is idalib refusing to load ``target`` itself.
+
+    ``WorkerStartError`` is Nexus's single "the worker never became ready", and
+    two of the three conditions behind it say nothing at all about the file: a
+    readiness timeout, and a worker that opened some other IDB. The third, a
+    launcher exiting non-zero, covers everything from a licence failure to an
+    OOM kill; only the worker log tail it carries distinguishes them, and only
+    a line naming *this* database as one idalib refused means the bytes are
+    the problem.
+
+    The path is compared against the resolved target because that is what the
+    worker opened (``args.input.expanduser().resolve(strict=True)``). Anything
+    that does not match exactly is not recognised, and an unrecognised failure
+    never overwrites a file.
+    """
+    first, _, tail = str(damaged).partition("\n")
+    if not (first.startswith(_LAUNCHER_EXIT) and _EXITED_WITH in first):
+        return False
+    named = {str(target), os.path.realpath(target)}
+    for line in tail.splitlines():
+        for head, end in _REFUSALS:
+            if head not in line:
+                continue
+            said = line.partition(head)[2].strip()
+            if end:
+                if not said.endswith(end):
+                    continue
+                said = said[: -len(end)].strip()
+            if said in named:
+                return True
+    return False
+
+
 def _restore_pre_save(
     target: Path,
     options: DatabaseOpenOptions,
@@ -809,11 +893,20 @@ def _restore_pre_save(
     holds: overwriting a file another session has open would destroy that
     session's work. With no spare copy there is nothing to recover and the
     original failure stands.
+
+    ``probe_database_state`` reports ``in_use`` only when it took and read the
+    advisory ``.id0`` lock. It reports ``unknown`` with ``error`` set when the
+    database is on a network filesystem where locks are not reliable, when the
+    ``.id0`` header cannot be inspected, and when that header is truncated or
+    unsigned — exactly the cases where another live session cannot be excluded.
+    Those are refusals too, for the same reason ``_require_released`` refuses
+    every unsafe state rather than the one it can name.
     """
     spare = _pre_save(target)
     if not spare.is_file() or _prior_owner(target, None) is not None:
         raise damaged
-    if ida_nexus.probe_database_state(target)["state"] == "in_use":
+    state = ida_nexus.probe_database_state(target)
+    if state["state"] == "in_use" or state["error"] is not None:
         raise damaged
     _discard_unpacked(target)
     os.replace(spare, target)

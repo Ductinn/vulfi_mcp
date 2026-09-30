@@ -14,11 +14,17 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from functools import lru_cache
 from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
+from ida_nexus import WorkerStartError, probe_database_state
+
+from vulfi_mcp.ida_adapter import ManagedDatabaseError, findings_ida
+from vulfi_mcp.ida_runtime import TRIAGE_STATUSES
 
 #: Set to ``1`` to fail instead of skip when a live prerequisite is missing.
 REQUIRE_LIVE_ENV = "VULFI_REQUIRE_LIVE"
@@ -114,3 +120,91 @@ def compiled_calls(tmp_path: Path) -> Path:
             f"{completed.stderr.strip()}"
         )
     return binary
+
+
+# --------------------------------------------------------------------------
+# The vendor's bad-pack defect, and the contract this project keeps around it
+# --------------------------------------------------------------------------
+
+#: IDA 9.4.260714 sometimes packs a database it then refuses to reopen — an
+#: open Hex-Rays defect ("Inaccurate 'database is empty' error (9.4)"),
+#: measured on this build at roughly one packed database in fifty and recorded
+#: in `.superpowers/sdd/2026-09-29-vulfi-ida-core/task-3-report.md`. Nothing
+#: this adapter controls moves that rate, so the durability a save can promise
+#: is not "it survived" but **"never silently corrupt, and always tell the
+#: caller"**: the bytes each save replaces are kept, a failed reopen rolls back
+#: to them exactly once, and the caller is told what that cost.
+#:
+#: A live test that saves a managed database and opens it again therefore has
+#: two correct outcomes, and asserting only the first is what made this suite
+#: flake. **Do not "fix" a test that uses this by deleting the tolerance** —
+#: that reintroduces a failure roughly two runs in three. Tighten it only when
+#: the vendor defect is fixed, or when this server verifies each pack at save
+#: time (ruled out for this milestone: one extra IDA process per mutating
+#: operation, permanently, for a defect that is the vendor's to fix).
+_ROLLED_BACK = "the save before this one left a database it cannot read"
+_UNRECOVERABLE = "built again from its source"
+
+
+def names_the_rollback(error: BaseException) -> bool:
+    """Whether ``error`` is this server reporting the vendor's bad pack."""
+    return isinstance(error, ManagedDatabaseError) and (
+        _ROLLED_BACK in str(error) or _UNRECOVERABLE in str(error)
+    )
+
+
+@contextmanager
+def _durable_or_reported() -> Iterator[list[str]]:
+    """Hold a body to "the state is intact, or the loss was reported".
+
+    Append each managed database the body produces to the yielded list. If the
+    body completes, every assertion in it stood and nothing was tolerated. If
+    it raises the rollback error instead, that outcome is accepted — but only
+    after checking the thing the rollback must never produce: a record that
+    answers, and answers something half-written. A rolled-back database is an
+    *earlier* consistent generation, never an inconsistent one.
+
+    Any other error, including a ``WorkerStartError`` with no rollback behind
+    it, propagates untouched. This tolerates one named vendor defect, not
+    failure in general.
+    """
+    produced: list[str] = []
+    try:
+        yield produced
+    except BaseException as reported:
+        if not names_the_rollback(reported):
+            raise
+        for database in produced:
+            _assert_record_is_consistent(database)
+
+
+def _assert_record_is_consistent(database: str) -> None:
+    """Every row the rolled-back database still answers with is whole."""
+    if probe_database_state(database)["state"] != "packed":
+        # `_restore_pre_save` said the workspace has to be rebuilt, and left
+        # nothing claiming to be readable. That is the loud outcome, not a
+        # silent one.
+        return
+    try:
+        page = findings_ida(database, 0, 200)
+    except ManagedDatabaseError as again:
+        assert names_the_rollback(again), f"{database}: {again!r}"
+        return
+    except WorkerStartError:
+        # Not readable at all is not "silently wrong": nothing answered. The
+        # rollback consumed the spare, so a second bad pack has none left.
+        return
+    for row in page["findings"]:
+        assert row["status"] in TRIAGE_STATUSES, row
+        if row["status"] == "Not Checked":
+            assert row["rationale"] == "", row
+            assert row["triage_revision"] == 0, row
+        else:
+            assert row["rationale"].strip(), row
+            assert row["triage_revision"] >= 1, row
+
+
+@pytest.fixture
+def durable_or_reported() -> Callable[[], AbstractContextManager[list[str]]]:
+    """The bad-pack tolerance, as a fixture so no test has to import it."""
+    return _durable_or_reported

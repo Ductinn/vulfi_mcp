@@ -19,6 +19,14 @@ Findings and assessments live in the managed IDB's own netnode, so they survive 
 - **External backends.** `backend` accepts `ida` or `auto`; `ghidra` and `r2` are refused by name. No Ghidra or radare2 provider is built.
 - **Linked triage and the external catalog.** `binary_path` is refused on `vulfi_findings` and `vulfi_triage`. Every stored row reports `sync_state: "unlinked"`, and `target_total_complete` is `false` because the second store is absent — absent, not empty.
 
+### A save IDA 9.4.260714 cannot read back
+
+IDA 9.4.260714 has an open Hex-Rays defect where a database it has just packed cannot be opened again: `idapro.open_database` answers `rc 4` with "Database is empty" while the file still probes as `packed`, and the damage is permanent for that file ([Hex-Rays community: *Inaccurate "database is empty" error (9.4)*](https://community.hex-rays.com/t/inaccurate-database-is-empty-error-9-4/763)). Measured on this build, in a loop that did nothing but save and reopen one managed database, **7 of 331 saves — roughly one in fifty — produced a database IDA could not read back.** That is a number for this build and this machine, not a rate promised for any other.
+
+This server does not retry and does not hide it. Every save it makes to a managed database keeps the bytes that save replaces, beside the database. If the next open of that database fails with that exact signature and nothing else holds the file, the kept bytes are put back once and the operation fails with a `ManagedDatabaseError` saying so — so a database is never silently left corrupt, and a caller is never answered from one as if the last save had survived.
+
+Your recourse when it happens: **rescan.** The rolled-back workspace is usable again immediately and is missing only what the failed save changed. If the kept bytes cannot be opened either, the error says the workspace has to be rebuilt, which `vulfi_scan` does by pointing it at the source binary again — the source is never written to, so it is always available to rebuild from.
+
 ## Requirements
 
 - Python >= 3.11.

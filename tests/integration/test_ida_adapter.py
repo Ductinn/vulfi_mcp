@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import shutil
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,12 @@ from vulfi_mcp.ida_adapter import (
 from vulfi_mcp.rules import Rule, load_stock_rules
 
 pytestmark = pytest.mark.requires_ida
+
+#: `tests/conftest.py`'s `durable_or_reported` fixture: hold a body to "the
+#: state is intact, or the loss was reported", because IDA 9.4.260714 cannot
+#: promise that every pack reopens. Register each managed database with the
+#: list it yields.
+Tolerance = Callable[[], AbstractContextManager[list[str]]]
 
 SUMMARY = "database_summary"
 
@@ -257,12 +265,23 @@ def test_a_failed_shutdown_still_closes_the_lease(
 
 
 def test_a_mutating_operation_keeps_the_bytes_it_replaces(
-    compiled_calls: Path, managed_data_dir: Path
+    compiled_calls: Path, managed_data_dir: Path, durable_or_reported: Tolerance
+) -> None:
+    # One spare-backed pack and one reopen; see `durable_or_reported`. If that
+    # reopen is the one in fifty IDA 9.4.260714 refuses, the spare is consumed
+    # by the rollback instead of by the drop, and the rollback is reported.
+    with durable_or_reported() as produced:
+        _assert_the_replaced_bytes_are_kept(compiled_calls, produced)
+
+
+def _assert_the_replaced_bytes_are_kept(
+    compiled_calls: Path, produced: list[str]
 ) -> None:
     # IDA reporting a successful save is not proof that it wrote a database it
     # can read back, so the bytes a save replaces stay beside it until an open
     # proves the new ones good — and are dropped as soon as one does.
     managed = Path(ensure_managed_idb(str(compiled_calls)))
+    produced.append(str(managed))
     spare = _pre_save(managed)
     assert not spare.exists()
     before = managed.read_bytes()
@@ -275,6 +294,28 @@ def test_a_mutating_operation_keeps_the_bytes_it_replaces(
     assert invoke_ida(str(managed), SUMMARY, {"name_limit": 5})["function_count"] > 0
     assert not spare.exists()
     assert managed.read_bytes() == saved
+
+
+def test_analysis_never_touches_a_spare_beside_the_source_binary(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # The spare protocol belongs to the session lease alone. `_analyze_binary`
+    # leases the operator's *source binary*, so running it there would unlink
+    # `<binary>.pre-save` — a path this module never writes beside a source and
+    # whose contents it cannot know — and, on a failed start, restore it over
+    # the binary itself.
+    decoy = compiled_calls.with_name(compiled_calls.name + ".pre-save")
+    decoy.write_bytes(b"an operator's file this server did not write")
+    partial = compiled_calls.with_name(decoy.name + ".partial")
+    partial.write_bytes(b"and another")
+    source = _digest(compiled_calls)
+
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+
+    assert managed.is_file()
+    assert decoy.read_bytes() == b"an operator's file this server did not write"
+    assert partial.read_bytes() == b"and another"
+    assert _digest(compiled_calls) == source
 
 
 def test_a_save_that_cannot_be_reopened_is_rolled_back_and_reported(

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,12 @@ from vulfi_mcp.ida_adapter import ensure_managed_idb, scan_ida
 from vulfi_mcp.rules import Rule, load_stock_rules, validate_rules
 
 pytestmark = pytest.mark.requires_ida
+
+#: `tests/conftest.py`'s `durable_or_reported` fixture: hold a body to "the
+#: state is intact, or the loss was reported", because IDA 9.4.260714 cannot
+#: promise that every pack reopens. Register each managed database with the
+#: list it yields.
+Tolerance = Callable[[], AbstractContextManager[list[str]]]
 
 STOCK: tuple[Rule, ...] = load_stock_rules()
 
@@ -166,12 +174,24 @@ def test_wrapper_loop_and_array_fact_detection(
 
 
 def test_prototype_is_applied_only_when_arguments_cannot_be_recovered(
-    compiled_shapes: Path, managed_data_dir: Path
+    compiled_shapes: Path, managed_data_dir: Path, durable_or_reported: Tolerance
+) -> None:
+    # The one test in this file that saves and then reopens: applying the
+    # prototype is a real write, and the second scan opens what it wrote. One
+    # spare-backed pack and one reopen; see `durable_or_reported`. Observed
+    # failing here on a bad pack in a whole-suite run before it was wrapped.
+    with durable_or_reported() as produced:
+        _assert_prototype_is_applied_on_demand(compiled_shapes, produced)
+
+
+def _assert_prototype_is_applied_on_demand(
+    compiled_shapes: Path, produced: list[str]
 ) -> None:
     # Without a decompiler, `get_arg_addrs` cannot read a call to an untyped
     # `lstrcpya` at all. That — and only that — is what earns the one write a
     # scan may make, so the arguments come back on the retry.
     rule = _stock_rule("strcpy")
+    produced.append(ensure_managed_idb(str(compiled_shapes)))
     result = _scan(compiled_shapes, (rule,), decompiler="disabled")
 
     applied = result["scope_health"]["ida"]["applied_prototypes"]
