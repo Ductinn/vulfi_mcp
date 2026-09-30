@@ -38,11 +38,10 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
 import ida_nexus
 from ida_nexus import (
@@ -55,14 +54,27 @@ from ida_nexus import (
 from ida_nexus.database_state import unpacked_database_paths
 
 from vulfi_mcp import ida_runtime
-from vulfi_mcp.contracts import Backend, Finding, RuleCoverage, ScanResult
+from vulfi_mcp.contracts import (
+    Backend,
+    Finding,
+    FindingsPage,
+    RuleCoverage,
+    ScanResult,
+    TriageResult,
+)
 from vulfi_mcp.ida_runtime import (
+    TRIAGE_STATUSES,
     ExpressionError,
     FunctionCall,
     Param,
     RuleContext,
     UnavailableEvidenceError,
     evaluate_rule,
+    utc_now,
+    validate_page,
+    validate_rationale,
+    validate_scope,
+    validate_status,
 )
 from vulfi_mcp.rules import canonical_rule_digest
 
@@ -74,8 +86,10 @@ __all__ = [
     "ManagedDatabaseError",
     "data_dir",
     "ensure_managed_idb",
+    "findings_ida",
     "invoke_ida",
     "scan_ida",
+    "triage_ida",
 ]
 
 #: Operator configuration for the managed workspace root. Plan 2 reads the same
@@ -105,7 +119,8 @@ _STAGING: Final = ".staging-"
 #: Longest directory-name prefix kept from a target's file name.
 _MAX_STEM: Final = 48
 
-#: The backend tag every row this adapter produces carries.
+#: The backend tag every row this adapter produces carries. The worker names
+#: itself the same way, and refuses a row that claims anything else.
 BACKEND: Final[Backend] = "ida"
 
 #: Address space of a finding in a single-image database.
@@ -114,13 +129,11 @@ ADDRESS_SPACE: Final = "image"
 #: Findings one scan result carries back; ``scope_total`` counts them all.
 MAX_SCAN_FINDINGS: Final = 100
 
-#: Triage states a scope reports counts for, in the order they are shown.
-TRIAGE_STATUSES: Final = (
-    "Not Checked",
-    "False Positive",
-    "Suspicious",
-    "Vulnerable",
-)
+#: Rows one stored page carries when a caller does not say.
+DEFAULT_PAGE_LIMIT: Final = 100
+
+#: This milestone stores no reviewer-created links, so no pair is out of step.
+SYNC_STATE: Final = "unlinked"
 
 #: Facts that cross as JSON arrays but reach the evaluator as tuples.
 _SEQUENCE_FACTS: Final = frozenset(
@@ -135,6 +148,12 @@ _CATALOG_WARNING: Final = (
     " is not part of this IDA-only milestone"
 )
 
+#: Why the other store reports ``available: false``. An absent store is
+#: unavailable, never an empty one, so no reader can mistake it for zero rows.
+_CATALOG_REASON: Final = (
+    "the external finding catalog arrives with Plan 3; this milestone stores"
+    " IDA findings in the managed IDB only"
+)
 
 
 class ManagedDatabaseError(RuntimeError):
@@ -193,30 +212,8 @@ def invoke_ida(
     the operation reports ``mutated``, and a save that does not report success
     raises instead of returning a result that looks durable.
     """
-    database = Path(idb_path).expanduser()
-    if database.suffix.lower() not in IDB_SUFFIXES:
-        # Opening a binary here would analyze it in place, next to a file this
-        # server must never write to.
-        raise ValueError(f"invoke_ida needs an IDA database, got {database}")
-    if not database.is_file():
-        raise FileNotFoundError(f"no such IDA database: {database}")
-    if not isinstance(operation, str) or not operation:
-        raise ValueError("operation must be a non-empty string")
-    request = _json_value(payload if payload is not None else {}, "payload")
-    if not isinstance(request, dict):
-        raise TypeError(f"payload must be a JSON object, got {type(payload).__name__}")
-
-    options = DatabaseOpenOptions(worker_cwd=str(database.parent))
-    with _lease(database, options) as handle:
-        result = _worker_run()(handle, operation, request)
-        normalized = _json_value(result, f"{operation} result")
-        if not isinstance(normalized, dict):
-            raise ManagedDatabaseError(
-                f"{operation} returned {type(result).__name__}, expected a JSON object"
-            )
-        if normalized.get("mutated"):
-            _require_saved(handle.save_database(), database)
-    return normalized
+    with _session(idb_path) as worker:
+        return worker.run(operation, payload)
 
 
 def scan_ida(
@@ -228,7 +225,7 @@ def scan_ida(
     decompiler: str = "auto",
     limits: dict[str, int] | None = None,
 ) -> ScanResult:
-    """Evaluate ``rules`` over every call site one managed IDB can show.
+    """Evaluate ``rules`` over one managed IDB's call sites, and store the rows.
 
     The worker extracts JSON-native evidence; every ``mark_if`` branch is
     evaluated here, by the same restricted interpreter the rule template
@@ -238,19 +235,26 @@ def scan_ida(
     negative, and ``Info`` is reserved for a call site whose argument list IDA
     verified as empty.
 
+    The evaluated rows are then committed to the managed IDB's own record, and
+    the rows this returns are the stored ones: a rescan of this scope carries
+    an earlier assessment forward by exact finding ID, a ``complete`` scan
+    retires a row whose call site is gone, and a ``partial`` one keeps it and
+    marks it stale instead. Evaluation happens on the host between the two
+    worker calls, but both run under one lease and the record's whole
+    read/modify/write happens inside the second of them.
+
     ``decompiler="disabled"`` runs the same disassembly-only extraction IDA
     falls back to when Hex-Rays is absent. ``limits`` may only tighten
     :data:`vulfi_mcp.ida_runtime.SCAN_LIMITS`.
 
-    The scan is the one read path that may write: it applies a pinned VulFi
-    prototype with ``SetType`` to a rule-named function IDA has no type for,
-    in the managed database only, and reports each application under
-    ``scope_health["ida"]["applied_prototypes"]``.
+    The scan is the one read path that may write to the analysis itself: it
+    applies a pinned VulFi prototype with ``SetType`` to a rule-named function
+    IDA has no type for, in the managed database only, and reports each
+    application under ``scope_health["ida"]["applied_prototypes"]``.
     """
     if not rules:
         raise ValueError("scan_ida needs at least one rule")
-    if not isinstance(scope, str) or not scope:
-        raise ValueError("scope must be a non-empty string")
+    scope = validate_scope(scope)
     payload: dict[str, object] = {
         "rules": [
             {
@@ -265,9 +269,87 @@ def scan_ida(
     }
     if limits:
         payload["limits"] = dict(limits)
-    return _scan_result(
-        invoke_ida(idb_path, "scan", payload), rules, scope, idb_path, path
+    with _session(idb_path) as worker:
+        raw = worker.run("scan", payload)
+        evaluation = _evaluate(raw, rules, scope)
+        stored = worker.run("store_scan", _store_payload(rules, scope, evaluation))
+    return _scan_result(raw, scope, idb_path, path, evaluation, stored)
+
+
+def findings_ida(
+    idb_path: str,
+    offset: int = 0,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    *,
+    path: str | None = None,
+) -> FindingsPage:
+    """Page the rows this managed IDB already stores, without rescanning.
+
+    The window is checked before any database is opened, so an out-of-range
+    page costs nothing and can never create an IDB just to refuse a read. The
+    page spans every scope of the IDA backend in one total order: address
+    space, then location, then finding ID.
+    """
+    offset, limit = validate_page(offset, limit)
+    stored = invoke_ida(idb_path, "findings_page", {"offset": offset, "limit": limit})
+    return {
+        "path": path or idb_path,
+        "idb_path": idb_path,
+        "offset": offset,
+        "limit": limit,
+        "findings": _findings(stored),
+        "page_total": int(stored.get("page_total") or 0),
+        "target_total": int(stored.get("target_total") or 0),
+        # Plan 3's catalog is the other store, and it is not here yet.
+        "target_total_complete": False,
+        "stale_total": int(stored.get("stale_total") or 0),
+        "status_counts": _status_counts(stored),
+        "store_health": _store_health(stored),
+        "sync_state": SYNC_STATE,
+        "warnings": [_CATALOG_WARNING],
+    }
+
+
+def triage_ida(
+    idb_path: str,
+    finding_id: str,
+    status: str,
+    rationale: str,
+    *,
+    path: str | None = None,
+) -> TriageResult:
+    """Assess one stored finding, by its exact ID.
+
+    The status, the rationale and the ID's shape are checked here, before a
+    database is opened; the ID itself can only be checked against the record,
+    and an unknown one is refused there. Either way a refused update writes
+    nothing: the record keeps its bytes and ``triage_revision`` its value.
+    """
+    if not isinstance(finding_id, str) or not finding_id:
+        raise ValueError("finding_id must be a non-empty string")
+    status = validate_status(status)
+    rationale = validate_rationale(rationale)
+    stored = invoke_ida(
+        idb_path,
+        "triage",
+        {"finding_id": finding_id, "status": status, "rationale": rationale},
     )
+    finding = stored.get("finding")
+    if not isinstance(finding, dict):
+        raise ManagedDatabaseError(
+            f"triage stored {finding_id!r} but returned no finding"
+        )
+    return {
+        "path": path or idb_path,
+        "idb_path": idb_path,
+        "finding": finding,
+        "triage_revision": int(stored.get("triage_revision") or 0),
+        "target_total": int(stored.get("target_total") or 0),
+        "status_counts": _status_counts(stored),
+        "store_health": _store_health(stored),
+        "sync_state": SYNC_STATE,
+        "warnings": [_CATALOG_WARNING],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -438,6 +520,56 @@ def _require_saved(result: Any, database: Path) -> None:
 # --------------------------------------------------------------------------
 
 
+class _Worker:
+    """One open managed database, and the operations run against it.
+
+    A scan evaluates its rules on the host, between two worker operations, so
+    it needs both of them to see the same open database: a second lease would
+    reopen the IDB, and could find it owned by somebody else by then. Holding
+    one lease keeps the evidence and the record it is stored in consistent.
+    """
+
+    def __init__(self, handle: DatabaseHandle, database: Path) -> None:
+        self._handle = handle
+        self._database = database
+
+    def run(self, operation: str, payload: dict[str, object]) -> dict[str, object]:
+        """Run one operation, and save the database when it reports a mutation."""
+        if not isinstance(operation, str) or not operation:
+            raise ValueError("operation must be a non-empty string")
+        request = _json_value(payload if payload is not None else {}, "payload")
+        if not isinstance(request, dict):
+            raise TypeError(
+                f"payload must be a JSON object, got {type(payload).__name__}"
+            )
+        result = _worker_run()(self._handle, operation, request)
+        normalized = _json_value(result, f"{operation} result")
+        if not isinstance(normalized, dict):
+            raise ManagedDatabaseError(
+                f"{operation} returned {type(result).__name__}, expected a JSON object"
+            )
+        if normalized.get("mutated"):
+            # A netnode write that is not saved is not durable, and IDA offers
+            # no transaction: a failed save is reported, never swallowed.
+            _require_saved(self._handle.save_database(), self._database)
+        return normalized
+
+
+@contextmanager
+def _session(idb_path: str) -> Iterator[_Worker]:
+    """Open one managed IDB under one lease, for one or more operations."""
+    database = Path(idb_path).expanduser()
+    if database.suffix.lower() not in IDB_SUFFIXES:
+        # Opening a binary here would analyze it in place, next to a file this
+        # server must never write to.
+        raise ValueError(f"this operation needs an IDA database, got {database}")
+    if not database.is_file():
+        raise FileNotFoundError(f"no such IDA database: {database}")
+    options = DatabaseOpenOptions(worker_cwd=str(database.parent))
+    with _lease(database, options) as handle:
+        yield _Worker(handle, database)
+
+
 @contextmanager
 def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandle]:
     """Hold exactly one Nexus lease, release it, and see our own worker go.
@@ -571,14 +703,22 @@ def _prototypes() -> dict[str, str]:
     return table
 
 
-def _scan_result(
-    raw: dict[str, Any],
-    rules: tuple[Rule, ...],
-    scope: str,
-    idb_path: str,
-    path: str | None,
-) -> ScanResult:
-    """Turn one worker result plus the rules into the public scan contract."""
+class _Evaluation(NamedTuple):
+    """What the host made of one scan's evidence, before it was stored."""
+
+    scan_id: str
+    scanned_at: str
+    findings: list[Finding]
+    coverage: list[RuleCoverage]
+    complete: bool
+    tally: dict[str, int]
+    warnings: list[str]
+
+
+def _evaluate(
+    raw: dict[str, Any], rules: tuple[Rule, ...], scope: str
+) -> _Evaluation:
+    """Evaluate every rule over the evidence one scan brought back."""
     scan_id = uuid.uuid4().hex
     records = {
         record["rule_index"]: record
@@ -623,33 +763,75 @@ def _scan_result(
         if state != "evaluated":
             complete = False
 
-    status_counts = dict.fromkeys(TRIAGE_STATUSES, 0)
-    for finding in findings:
-        status_counts[finding["status"]] += 1
+    # Only what the scan itself observed is recorded; the catalog note below
+    # is about this response, not about anything this database now holds.
     warnings = [str(warning) for warning in raw.get("warnings") or []]
-    warnings.append(_CATALOG_WARNING)
+    return _Evaluation(
+        scan_id=scan_id,
+        scanned_at=utc_now(),
+        findings=findings,
+        coverage=coverage,
+        complete=complete,
+        tally=tally,
+        warnings=warnings,
+    )
+
+
+def _store_payload(
+    rules: tuple[Rule, ...],
+    scope: str,
+    evaluation: _Evaluation,
+) -> dict[str, object]:
+    """The scan, as the record's own operation wants to receive it."""
+    return {
+        "scope": scope,
+        "rules": [dict(rule) for rule in rules],
+        "scan_id": evaluation.scan_id,
+        "scanned_at": evaluation.scanned_at,
+        "coverage": "complete" if evaluation.complete else "partial",
+        "rule_coverage": list(evaluation.coverage),
+        "warnings": list(evaluation.warnings),
+        "findings": list(evaluation.findings),
+        "offset": 0,
+        "limit": MAX_SCAN_FINDINGS,
+    }
+
+
+def _scan_result(
+    raw: dict[str, Any],
+    scope: str,
+    idb_path: str,
+    path: str | None,
+    evaluation: _Evaluation,
+    stored: dict[str, Any],
+) -> ScanResult:
+    """Turn one scan's evidence and its committed record into the contract.
+
+    Every count here comes from the store, not from the evaluation: after a
+    partial scan the scope also holds the rows this scan did not see, and a
+    result that reported only the observed ones would quietly under-report a
+    scope it had just widened.
+    """
+    mode = raw.get("analysis_mode")
     return {
         "path": path or idb_path,
         "idb_path": raw.get("idb_path") or idb_path,
-        "binary_sha256": binary_sha256,
+        "binary_sha256": raw.get("input_sha256"),
         "analysis_id": None,
         "preparation_revision": None,
         "backend": BACKEND,
         "scope": scope,
-        "scan_id": scan_id,
-        "scanned_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "coverage": "complete" if complete else "partial",
-        "rule_coverage": coverage,
-        "findings": findings[:MAX_SCAN_FINDINGS],
-        "scope_total": len(findings),
-        "target_total": len(findings),
+        "scan_id": evaluation.scan_id,
+        "scanned_at": evaluation.scanned_at,
+        "coverage": "complete" if evaluation.complete else "partial",
+        "rule_coverage": evaluation.coverage,
+        "findings": _findings(stored),
+        "scope_total": int(stored.get("scope_total") or 0),
+        "target_total": int(stored.get("target_total") or 0),
         # Plan 3's catalog is the other store; an absent store is unavailable,
         # never zero, so this total is explicitly incomplete.
         "target_total_complete": False,
-        "status_counts": {
-            BACKEND: status_counts,
-            "aggregate": dict(status_counts),
-        },
+        "status_counts": _status_counts(stored),
         "scope_health": {
             BACKEND: {
                 "analysis_mode": mode,
@@ -657,18 +839,60 @@ def _scan_result(
                 "decompiler_requested": raw.get("decompiler_requested"),
                 "function_count": raw.get("function_count"),
                 "code_function_count": raw.get("code_function_count"),
-                "call_sites": tally["sites"],
-                "evaluated_sites": tally["evaluated"],
-                "unsupported_sites": tally["unsupported"],
-                "failed_sites": tally["failed"],
+                "call_sites": evaluation.tally["sites"],
+                "evaluated_sites": evaluation.tally["evaluated"],
+                "unsupported_sites": evaluation.tally["unsupported"],
+                "failed_sites": evaluation.tally["failed"],
                 # Wrapper sites the wrapped call ruled out, as upstream
                 # does: discovered and returned, deliberately unevaluated.
-                "skipped_wrapper_sites": tally["skipped"],
+                "skipped_wrapper_sites": evaluation.tally["skipped"],
                 "bounded": bool(raw.get("bounded")),
                 "applied_prototypes": raw.get("applied_prototypes") or [],
+                "observed_findings": len(evaluation.findings),
+                "stale_findings": int(stored.get("scope_stale") or 0),
             }
         },
-        "warnings": warnings,
+        "store_health": _store_health(stored),
+        "sync_state": SYNC_STATE,
+        "warnings": [*evaluation.warnings, _CATALOG_WARNING],
+    }
+
+
+def _findings(stored: dict[str, Any]) -> list[Finding]:
+    rows = stored.get("findings")
+    if not isinstance(rows, list):
+        raise ManagedDatabaseError(
+            f"the stored record returned {type(rows).__name__}, expected findings"
+        )
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _status_counts(stored: dict[str, Any]) -> dict[str, dict[str, int]]:
+    counts = stored.get("status_counts")
+    if not isinstance(counts, dict):
+        raise ManagedDatabaseError("the stored record returned no status counts")
+    return {
+        name: {status: int(table.get(status, 0)) for status in TRIAGE_STATUSES}
+        for name, table in counts.items()
+        if isinstance(table, dict)
+    }
+
+
+def _store_health(stored: dict[str, Any]) -> dict[str, object]:
+    """Which stores answered, and what the one that did has in it."""
+    return {
+        BACKEND: {
+            "available": True,
+            "netnode": ida_runtime.NETNODE_NAME,
+            "schema_version": stored.get("schema_version"),
+            "managed_idb_id": stored.get("managed_idb_id"),
+            "record_present": bool(stored.get("record_present")),
+            "record_digest": stored.get("record_digest"),
+            "record_bytes": stored.get("record_bytes"),
+            "stale_total": stored.get("stale_total"),
+            "scopes": stored.get("scopes") or [],
+        },
+        "catalog": {"available": False, "reason": _CATALOG_REASON},
     }
 
 

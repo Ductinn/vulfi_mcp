@@ -28,16 +28,26 @@ The worker half below :func:`run` is the other side of that contract: it
 reproduces upstream's IDA evidence extraction and reports each predicate as a
 JSON fact, leaving a fact it could not establish out of the payload entirely.
 Rule evaluation itself stays on the host.
+
+The last section owns the managed IDB's own authority: one versioned JSON
+record in netnode ``vulfi_mcp.v2``, read, modified and written inside a single
+worker operation so a finding, its assessment and its freshness never have to
+be assembled from two round trips.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import math
 import operator
+import unicodedata
+import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, TypeAlias, TypeVar
 
@@ -48,7 +58,15 @@ __all__ = [
     "MAX_COMPREHENSION_ITERATIONS",
     "MAX_EXPRESSION_LENGTH",
     "MAX_EXPRESSION_NODES",
+    "MAX_PAGE_LIMIT",
+    "MAX_RATIONALE_LENGTH",
+    "MAX_SCAN_NAME_LENGTH",
+    "NETNODE_BLOB_INDEX",
+    "NETNODE_BLOB_TAG",
+    "NETNODE_NAME",
     "PRIORITIES",
+    "SCHEMA_VERSION",
+    "TRIAGE_STATUSES",
     "UNAVAILABLE",
     "BranchPriority",
     "ExpressionBudgetError",
@@ -59,12 +77,21 @@ __all__ = [
     "OperationError",
     "Param",
     "RuleContext",
+    "SchemaVersionError",
     "Unavailable",
     "UnavailableEvidenceError",
+    "UnknownFindingError",
     "UnknownOperationError",
     "evaluate_rule",
+    "finding_order",
     "run",
+    "utc_now",
     "validate_expression",
+    "validate_page",
+    "validate_rationale",
+    "validate_scan_name",
+    "validate_scope",
+    "validate_status",
 ]
 
 BranchPriority: TypeAlias = Literal["High", "Medium", "Low"]
@@ -1029,12 +1056,25 @@ class _Interpreter:
 # ---------------------------------------------------------------------------
 
 
-class OperationError(Exception):
-    """A worker operation was rejected before it touched the database."""
+class OperationError(ValueError):
+    """A worker operation was rejected before it touched the database.
+
+    It derives from :class:`ValueError` because every rejection below is a
+    rejected argument, and because the host raises the same class for the
+    checks it runs before it opens a database at all.
+    """
 
 
 class UnknownOperationError(OperationError):
     """No operation is registered under the requested name."""
+
+
+class SchemaVersionError(OperationError):
+    """The stored record is a schema version this build must not overwrite."""
+
+
+class UnknownFindingError(OperationError):
+    """No stored finding carries the requested ID."""
 
 
 def run(operation: str, payload: dict[str, object]) -> dict[str, object]:
@@ -2661,9 +2701,629 @@ def _scan_limits(payload: dict[str, object]) -> dict[str, int]:
     return limits
 
 
+# ---------------------------------------------------------------------------
+# Managed IDB record: schema version 2.
+#
+# One UTF-8 JSON blob in netnode ``vulfi_mcp.v2``, blob ``(index=1, tag="S")``,
+# is the authority for IDA findings and unlinked assessments. Upstream VulFi's
+# ``vulfi_data`` netnode is a different, older store and is never read or
+# written here.
+#
+# Every operation below performs the whole read/modify/write inside one worker
+# call, so the host never holds half a record and two calls can never race
+# through it. The adapter saves the database afterwards, because a netnode
+# write that is not saved is not durable and IDA offers no transaction.
+# ---------------------------------------------------------------------------
+
+#: Netnode holding this server's record.
+NETNODE_NAME: Final = "vulfi_mcp.v2"
+#: Blob slot inside that netnode.
+NETNODE_BLOB_INDEX: Final = 1
+NETNODE_BLOB_TAG: Final = "S"
+#: The only record layout this build reads or writes. A record that says
+#: anything else belongs to a future build and is refused, never replaced.
+SCHEMA_VERSION: Final = 2
+
+#: Backend tag every row this worker stores carries.
+BACKEND_NAME: Final = "ida"
+
+#: Scope of a scan that ran the stock rules.
+DEFAULT_SCOPE: Final = "default"
+#: Prefix of a scope that ran agent-supplied rules.
+CUSTOM_SCOPE_PREFIX: Final = "custom:"
+#: Longest accepted ``custom:<scan_name>`` name.
+MAX_SCAN_NAME_LENGTH: Final = 64
+
+#: The four triage states, in the order results count them.
+TRIAGE_STATUSES: Final[tuple[str, str, str, str]] = (
+    "Not Checked",
+    "False Positive",
+    "Suspicious",
+    "Vulnerable",
+)
+#: Status a freshly stored finding carries.
+UNASSESSED_STATUS: Final = "Not Checked"
+
+#: Longest accepted rationale, in characters. Rationale text is untrusted, so
+#: it is stored exactly as supplied but is bounded and control-character free.
+MAX_RATIONALE_LENGTH: Final = 4000
+#: Whitespace a rationale may carry; every other control character is refused.
+_ALLOWED_CONTROLS: Final = frozenset("\t\n\r")
+#: Unicode categories a rationale may not carry: C0/C1 controls, and the
+#: surrogates that would make the record impossible to encode as UTF-8.
+_REFUSED_CATEGORIES: Final = frozenset({"Cc", "Cs"})
+
+#: Largest page one read may ask for.
+MAX_PAGE_LIMIT: Final = 200
+#: Rules one scope may record.
+MAX_SCOPE_RULES: Final = 1000
+#: Largest record this worker will write, in bytes. A scan that would exceed
+#: it fails loudly rather than truncate a scope into a quiet half-answer.
+MAX_RECORD_BYTES: Final = 64 * 1024 * 1024
+
+#: Finding facts the host establishes and the record stores verbatim.
+_FINDING_FACTS: Final = (
+    "id",
+    "backend",
+    "source",
+    "binary_sha256",
+    "rule_index",
+    "rule_digest",
+    "rule_name",
+    "function_name",
+    "found_in",
+    "address_space",
+    "address",
+    "relative_address",
+    "occurrence",
+    "priority",
+    "evidence",
+)
+#: Facts only this record may set. A scan payload never carries them, so a
+#: rescan cannot smuggle an assessment in, and an assessment survives a rescan
+#: only by being carried forward from the row with the exact same ID.
+_TRIAGE_FACTS: Final = (
+    "status",
+    "rationale",
+    "assessed_at",
+    "triage_revision",
+    "link_id",
+    "link_revision",
+)
+
+
+def utc_now() -> str:
+    """The current UTC time, in the one format this record stores."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def validate_scan_name(name: object) -> str:
+    """Accept one ``custom:<scan_name>`` name, or say exactly what is wrong.
+
+    An ASCII identifier cannot carry ``:``, ``/`` or ``\\``, so a scan name can
+    neither split a finding ID nor reach a path.
+    """
+    if not isinstance(name, str) or not name:
+        raise OperationError("scan_name must be a non-empty string")
+    if len(name) > MAX_SCAN_NAME_LENGTH:
+        raise OperationError(
+            f"scan_name is {len(name)} characters;"
+            f" the limit is {MAX_SCAN_NAME_LENGTH}"
+        )
+    if not (name.isascii() and name.isidentifier()):
+        raise OperationError(
+            "scan_name must be an ASCII identifier, without ':' or a path"
+            f" separator, got {name!r}"
+        )
+    return name
+
+
+def validate_scope(scope: object) -> str:
+    """Accept ``default`` or ``custom:<scan_name>``, and nothing else."""
+    if not isinstance(scope, str) or not scope:
+        raise OperationError("scope must be a non-empty string")
+    if scope == DEFAULT_SCOPE:
+        return scope
+    if not scope.startswith(CUSTOM_SCOPE_PREFIX):
+        raise OperationError(
+            f"scope must be {DEFAULT_SCOPE!r} or"
+            f" '{CUSTOM_SCOPE_PREFIX}<scan_name>', got {scope!r}"
+        )
+    validate_scan_name(scope[len(CUSTOM_SCOPE_PREFIX) :])
+    return scope
+
+
+def validate_status(status: object) -> str:
+    """Accept exactly one of the four triage states."""
+    if status not in TRIAGE_STATUSES:
+        raise OperationError(
+            f"status must be one of {' | '.join(TRIAGE_STATUSES)}, got {status!r}"
+        )
+    return str(status)
+
+
+def validate_rationale(rationale: object) -> str:
+    """Accept one assessment rationale as written, within bounds.
+
+    The text is a reviewer's own words and is stored verbatim, so every code
+    point that survives a JSON round trip is kept. What is refused is an empty
+    or whitespace-only claim, a rationale past the length bound, and control
+    characters other than ordinary whitespace.
+    """
+    if not isinstance(rationale, str):
+        raise OperationError(
+            f"rationale must be a string, got {type(rationale).__name__}"
+        )
+    if not rationale.strip():
+        raise OperationError("rationale must not be empty or whitespace only")
+    if len(rationale) > MAX_RATIONALE_LENGTH:
+        raise OperationError(
+            f"rationale is {len(rationale)} characters;"
+            f" the limit is {MAX_RATIONALE_LENGTH}"
+        )
+    for position, character in enumerate(rationale):
+        if character in _ALLOWED_CONTROLS:
+            continue
+        if unicodedata.category(character) in _REFUSED_CATEGORIES:
+            raise OperationError(
+                f"rationale carries the control character U+{ord(character):04X}"
+                f" at position {position}"
+            )
+    return rationale
+
+
+def validate_page(offset: object, limit: object) -> tuple[int, int]:
+    """Accept one page window: ``0 <= offset`` and ``1 <= limit <= 200``."""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise OperationError(f"offset must be an integer >= 0, got {offset!r}")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_PAGE_LIMIT
+    ):
+        raise OperationError(
+            f"limit must be an integer in 1..{MAX_PAGE_LIMIT}, got {limit!r}"
+        )
+    return offset, limit
+
+
+def finding_order(row: dict[str, Any]) -> tuple[str, int, str, str]:
+    """Total order over stored rows: address space, location, then ID.
+
+    The numeric address orders a page the way a reader reads a binary; the
+    textual address and the ID keep the order total when an address is not
+    hexadecimal or two rows sit at one location.
+    """
+    address = str(row.get("address") or "")
+    try:
+        location = int(address, 16)
+    except ValueError:
+        location = -1
+    return (
+        str(row.get("address_space") or ""),
+        location,
+        address,
+        str(row.get("id") or ""),
+    )
+
+
+# -- the netnode itself -----------------------------------------------------
+
+
+def _netnode(*, create: bool) -> Any:
+    """The record's netnode, or ``None`` when nothing was ever written."""
+    import ida_netnode
+
+    node = ida_netnode.netnode(NETNODE_NAME, 0, create)
+    if not create and node.index() == ida_netnode.BADNODE:
+        return None
+    return node
+
+
+def _empty_record() -> dict[str, Any]:
+    """A record with nothing in it yet, including its reserved sections.
+
+    ``preparation`` and every row's ``link_id``/``link_revision`` are Plan 2's
+    and Plan 4's to fill. They are written now, empty, so that arriving at
+    those plans is not a migration.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "managed_idb_id": None,
+        "preparation": _empty_preparation(),
+        "scopes": {},
+    }
+
+
+def _empty_preparation() -> dict[str, Any]:
+    return {"analysis_id": None, "revision": 0, "coverage": {}, "catalog_key": None}
+
+
+def _read_record() -> tuple[dict[str, Any], bytes | None]:
+    """The stored record and its exact bytes, or a fresh record and ``None``."""
+    node = _netnode(create=False)
+    blob = (
+        node.getblob(NETNODE_BLOB_INDEX, NETNODE_BLOB_TAG) if node is not None else None
+    )
+    if not blob:
+        return _empty_record(), None
+    stored = bytes(blob)
+    try:
+        record = json.loads(stored.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise OperationError(
+            f"the {NETNODE_NAME} record is not readable UTF-8 JSON: {error}"
+        ) from error
+    if not isinstance(record, dict):
+        raise OperationError(f"the {NETNODE_NAME} record is not a JSON object")
+    version = record.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"the {NETNODE_NAME} record is schema version {version!r};"
+            f" this build reads and writes version {SCHEMA_VERSION} only,"
+            " and will not overwrite it"
+        )
+    scopes = record.get("scopes")
+    if not isinstance(scopes, dict):
+        raise OperationError(f"the {NETNODE_NAME} record carries no 'scopes' object")
+    for name, scope in scopes.items():
+        if not isinstance(scope, dict) or not isinstance(scope.get("findings"), dict):
+            raise OperationError(
+                f"the {NETNODE_NAME} scope {name!r} is not a stored scope"
+            )
+        for key, row in scope["findings"].items():
+            if not isinstance(row, dict):
+                raise OperationError(
+                    f"the {NETNODE_NAME} scope {name!r} holds {key!r} as"
+                    f" {type(row).__name__}, which is not a finding"
+                )
+    if not isinstance(record.get("preparation"), dict):
+        record["preparation"] = _empty_preparation()
+    return record, stored
+
+
+def _write_record(record: dict[str, Any]) -> bytes:
+    """Write the record back as one canonical UTF-8 JSON blob.
+
+    ``sort_keys`` and compact separators make the bytes a function of the
+    record alone, so an unchanged record is byte-identical on disk and a
+    reader can compare digests instead of guessing.
+    """
+    if not record.get("managed_idb_id"):
+        # Created once, on the first write, and never again: Plan 2 uses it as
+        # the catalog identity of a database whose original bytes are unknown.
+        record["managed_idb_id"] = uuid.uuid4().hex
+    record["schema_version"] = SCHEMA_VERSION
+    payload = json.dumps(
+        record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if len(payload) > MAX_RECORD_BYTES:
+        raise OperationError(
+            f"the {NETNODE_NAME} record would be {len(payload)} bytes;"
+            f" the limit is {MAX_RECORD_BYTES}"
+        )
+    node = _netnode(create=True)
+    if not node.setblob(payload, NETNODE_BLOB_INDEX, NETNODE_BLOB_TAG):
+        raise OperationError(f"IDA refused to store the {NETNODE_NAME} record")
+    return payload
+
+
+# -- reading the record out -------------------------------------------------
+
+
+def _row(stored: dict[str, Any], scan_id: object) -> dict[str, Any]:
+    """One stored row as it is reported: ``stale`` is derived, never stored."""
+    row = dict(stored)
+    row["stale"] = stored.get("last_seen_scan_id") != scan_id
+    return row
+
+
+def _rows(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every reported row in the record, in page order."""
+    rows: list[dict[str, Any]] = []
+    for stored in record["scopes"].values():
+        scan_id = stored.get("scan_id")
+        rows.extend(_row(row, scan_id) for row in stored["findings"].values())
+    rows.sort(key=finding_order)
+    return rows
+
+
+def _scope_summary(name: str, stored: dict[str, Any]) -> dict[str, object]:
+    scan_id = stored.get("scan_id")
+    findings = stored["findings"]
+    return {
+        "scope": name,
+        "backend": stored.get("backend") or BACKEND_NAME,
+        "scan_id": scan_id,
+        "scanned_at": stored.get("scanned_at"),
+        "coverage": stored.get("coverage"),
+        "total": len(findings),
+        "stale": sum(
+            1 for row in findings.values() if row.get("last_seen_scan_id") != scan_id
+        ),
+    }
+
+
+def _summary(
+    record: dict[str, Any], blob: bytes | None, rows: list[dict[str, Any]]
+) -> dict[str, object]:
+    """What every record operation reports about the store as a whole.
+
+    ``rows`` is every reported row of the whole record; the caller already
+    built it to page or to count, and building it twice would walk the record
+    twice for the same answer.
+    """
+    counts = dict.fromkeys(TRIAGE_STATUSES, 0)
+    for row in rows:
+        status = row.get("status")
+        if status in counts:
+            counts[status] += 1
+    return {
+        "mutated": False,
+        "schema_version": SCHEMA_VERSION,
+        "managed_idb_id": record.get("managed_idb_id"),
+        "record_present": blob is not None,
+        "record_digest": hashlib.sha256(blob).hexdigest() if blob else None,
+        "record_bytes": len(blob) if blob else 0,
+        "scopes": [
+            _scope_summary(name, stored)
+            for name, stored in sorted(record["scopes"].items())
+        ],
+        "target_total": len(rows),
+        "stale_total": sum(1 for row in rows if row["stale"]),
+        "status_counts": {BACKEND_NAME: dict(counts), "aggregate": dict(counts)},
+    }
+
+
+def _page(
+    report: dict[str, object], rows: list[dict[str, Any]], offset: int, limit: int
+) -> dict[str, object]:
+    window = rows[offset : offset + limit]
+    report["offset"] = offset
+    report["limit"] = limit
+    report["findings"] = window
+    report["page_total"] = len(window)
+    return report
+
+
+# -- operations -------------------------------------------------------------
+
+
+def _findings_page(payload: dict[str, object]) -> dict[str, object]:
+    """Page stored rows across every scope of this backend, without rescanning."""
+    offset, limit = validate_page(payload.get("offset", 0), payload.get("limit", 100))
+    record, blob = _read_record()
+    rows = _rows(record)
+    return _page(_summary(record, blob, rows), rows, offset, limit)
+
+
+def _store_scan(payload: dict[str, object]) -> dict[str, object]:
+    """Commit one scan of one scope, preserving triage by exact finding ID.
+
+    A ``complete`` scan replaces this scope's rows with exactly what it saw, so
+    a row whose call site is gone is retired. A ``partial`` scan merges instead:
+    every row it did not observe is kept with the scan ID that last saw it, so
+    a reader can tell an assessed row that is stale from one that is current.
+    Neither touches another scope, another backend, or the legacy netnode.
+    """
+    scope = validate_scope(payload.get("scope"))
+    scan_id = _record_text(payload, "scan_id")
+    scanned_at = _record_text(payload, "scanned_at")
+    coverage = payload.get("coverage")
+    if coverage not in ("complete", "partial"):
+        raise OperationError(
+            f"store_scan: coverage must be 'complete' or 'partial', got {coverage!r}"
+        )
+    rules = _store_rules(payload)
+    rule_coverage = _store_rule_coverage(payload)
+    warnings = _store_warnings(payload)
+    observed = _store_findings(payload, scope, scan_id)
+    offset, limit = validate_page(payload.get("offset", 0), payload.get("limit", 100))
+
+    record, _ = _read_record()
+    kept = record["scopes"].get(scope, {}).get("findings", {})
+    # A complete scan replaces the scope with exactly what it saw. A partial
+    # one starts from the rows it never looked at, because not deciding about
+    # a call site is not the same as deciding there is nothing there.
+    findings: dict[str, Any] = (
+        {}
+        if coverage == "complete"
+        else {key: row for key, row in kept.items() if key not in observed}
+    )
+    for key, row in observed.items():
+        previous = kept.get(key)
+        if isinstance(previous, dict):
+            # Exact ID only. A changed rule, a changed digest or a changed
+            # occurrence ordinal produces a different ID, and the assessment
+            # that belonged to the old one is orphaned on purpose.
+            for fact in _TRIAGE_FACTS:
+                if fact in previous:
+                    row[fact] = previous[fact]
+        findings[key] = row
+    record["scopes"][scope] = {
+        "backend": BACKEND_NAME,
+        "rules": rules,
+        "scan_id": scan_id,
+        "scanned_at": scanned_at,
+        "coverage": coverage,
+        "rule_coverage": rule_coverage,
+        "warnings": warnings,
+        "findings": findings,
+    }
+    blob = _write_record(record)
+
+    rows = _rows(record)
+    report = _summary(record, blob, rows)
+    report["mutated"] = True
+    report["scope"] = scope
+    report["coverage"] = coverage
+    # The scope's own rows, taken out of the ordering the whole record was
+    # already put in, rather than sorted a second time. A finding ID names
+    # its own scope, so no other scope's row can answer to one of these keys.
+    scoped = [row for row in rows if row.get("id") in findings]
+    report["scope_total"] = len(scoped)
+    report["scope_stale"] = sum(1 for row in scoped if row["stale"])
+    return _page(report, scoped, offset, limit)
+
+
+def _triage(payload: dict[str, object]) -> dict[str, object]:
+    """Assess one stored finding, found by its exact ID and nothing else.
+
+    A rejected request raises before anything is written, so the blob stays
+    byte-identical and the adapter never saves the database. ``triage_revision``
+    therefore counts accepted updates only.
+    """
+    finding_id = payload.get("finding_id")
+    if not isinstance(finding_id, str) or not finding_id:
+        raise OperationError("triage: 'finding_id' must be a non-empty string")
+    status = validate_status(payload.get("status"))
+    rationale = validate_rationale(payload.get("rationale"))
+
+    record, _ = _read_record()
+    located: tuple[str, dict[str, Any], dict[str, Any]] | None = None
+    for name, entry in sorted(record["scopes"].items()):
+        stored = entry["findings"].get(finding_id)
+        if isinstance(stored, dict):
+            located = (name, entry, stored)
+            break
+    if located is None:
+        raise UnknownFindingError(
+            f"no stored finding carries the id {finding_id!r};"
+            " a rule change or a changed call-site ordering orphans an"
+            " assessment rather than moving it"
+        )
+    name, entry, stored = located
+    stored["status"] = status
+    stored["rationale"] = rationale
+    stored["assessed_at"] = utc_now()
+    revision = stored.get("triage_revision")
+    stored["triage_revision"] = (revision if isinstance(revision, int) else 0) + 1
+    blob = _write_record(record)
+
+    report = _summary(record, blob, _rows(record))
+    report["mutated"] = True
+    report["scope"] = name
+    report["finding"] = _row(stored, entry.get("scan_id"))
+    report["triage_revision"] = stored["triage_revision"]
+    return report
+
+
+# -- payload checking -------------------------------------------------------
+
+
+def _record_text(payload: dict[str, object], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value:
+        raise OperationError(f"store_scan: {name!r} must be a non-empty string")
+    return value
+
+
+def _store_rules(payload: dict[str, object]) -> list[dict[str, Any]]:
+    """The rules this scope ran, kept so the scope stays readable on its own."""
+    raw = payload.get("rules")
+    if not isinstance(raw, list) or not raw:
+        raise OperationError("store_scan: 'rules' must be a non-empty list")
+    if len(raw) > MAX_SCOPE_RULES:
+        raise OperationError(
+            f"store_scan: {len(raw)} rules exceed the {MAX_SCOPE_RULES} a scope"
+            " may record"
+        )
+    for position, rule in enumerate(raw):
+        if not isinstance(rule, dict):
+            raise OperationError(f"store_scan: rules[{position}] must be an object")
+    return [dict(rule) for rule in raw]
+
+
+def _store_rule_coverage(payload: dict[str, object]) -> dict[str, Any]:
+    """Per-rule outcome, keyed by the rule index it belongs to."""
+    raw = payload.get("rule_coverage")
+    if not isinstance(raw, list):
+        raise OperationError("store_scan: 'rule_coverage' must be a list")
+    coverage: dict[str, Any] = {}
+    for position, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise OperationError(
+                f"store_scan: rule_coverage[{position}] must be an object"
+            )
+        index = entry.get("rule_index")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise OperationError(
+                f"store_scan: rule_coverage[{position}].rule_index must be an index"
+            )
+        if entry.get("state") not in ("evaluated", "unsupported", "failed"):
+            raise OperationError(
+                f"store_scan: rule_coverage[{position}].state must be"
+                " evaluated, unsupported or failed"
+            )
+        coverage[str(index)] = {
+            "backend": entry.get("backend") or BACKEND_NAME,
+            "state": entry["state"],
+            "reason": entry.get("reason"),
+        }
+    return coverage
+
+
+def _store_warnings(payload: dict[str, object]) -> list[str]:
+    raw = payload.get("warnings") or []
+    if not isinstance(raw, list):
+        raise OperationError("store_scan: 'warnings' must be a list")
+    return [str(warning) for warning in raw[:MAX_SCAN_WARNINGS]]
+
+
+def _store_findings(
+    payload: dict[str, object], scope: str, scan_id: str
+) -> dict[str, dict[str, Any]]:
+    """The rows this scan observed, reduced to the facts the record stores."""
+    raw = payload.get("findings")
+    if not isinstance(raw, list):
+        raise OperationError("store_scan: 'findings' must be a list")
+    rows: dict[str, dict[str, Any]] = {}
+    for position, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise OperationError(f"store_scan: findings[{position}] must be an object")
+        row: dict[str, Any] = {}
+        for fact in _FINDING_FACTS:
+            if fact not in item:
+                raise OperationError(
+                    f"store_scan: findings[{position}] carries no {fact!r}"
+                )
+            row[fact] = item[fact]
+        key = row["id"]
+        if not isinstance(key, str) or not key:
+            raise OperationError(
+                f"store_scan: findings[{position}].id must be a non-empty string"
+            )
+        if row["backend"] != BACKEND_NAME:
+            raise OperationError(
+                f"store_scan: findings[{position}] claims backend"
+                f" {row['backend']!r}, but this worker is {BACKEND_NAME!r}"
+            )
+        if row["source"] != scope:
+            raise OperationError(
+                f"store_scan: findings[{position}] claims scope"
+                f" {row['source']!r}, not {scope!r}"
+            )
+        if key in rows:
+            raise OperationError(
+                f"store_scan: findings[{position}] repeats the id {key!r}"
+            )
+        row["status"] = UNASSESSED_STATUS
+        row["rationale"] = ""
+        row["assessed_at"] = None
+        row["triage_revision"] = 0
+        row["link_id"] = None
+        row["link_revision"] = None
+        row["last_seen_scan_id"] = scan_id
+        rows[key] = row
+    return rows
+
+
 #: Every operation ``run`` accepts, by name. Each takes the JSON payload and
 #: returns a JSON-native dictionary.
 _OPERATIONS: Final[dict[str, Callable[[dict[str, object]], dict[str, object]]]] = {
     "database_summary": _database_summary,
+    "findings_page": _findings_page,
     "scan": _scan,
+    "store_scan": _store_scan,
+    "triage": _triage,
 }

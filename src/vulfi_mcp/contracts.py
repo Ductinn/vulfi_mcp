@@ -13,10 +13,14 @@ from typing import Literal, TypedDict
 __all__ = [
     "Backend",
     "Finding",
+    "FindingsPage",
     "Priority",
     "RuleCoverage",
     "ScanCoverage",
     "ScanResult",
+    "ScopeSummary",
+    "SyncState",
+    "TriageResult",
     "TriageStatus",
 ]
 
@@ -24,6 +28,11 @@ Backend = Literal["ida", "ghidra", "r2"]
 Priority = Literal["High", "Medium", "Low", "Info"]
 TriageStatus = Literal["Not Checked", "False Positive", "Suspicious", "Vulnerable"]
 ScanCoverage = Literal["complete", "partial"]
+
+#: How an IDA row and its reviewer-linked external partner stand. Plan 4
+#: creates links; until then every stored row is ``unlinked``, which is not
+#: the same claim as ``synchronized``.
+SyncState = Literal["unlinked", "pending", "synchronized", "conflict", "paused"]
 
 
 class Finding(TypedDict):
@@ -77,11 +86,13 @@ class RuleCoverage(TypedDict):
 class ScanResult(TypedDict):
     """Result of one scan of one scope on one backend.
 
-    ``findings`` holds the first page of this scope's rows; ``scope_total``
-    counts the scope and ``target_total`` counts every available store for the
-    target, with ``target_total_complete`` false when a store is unavailable.
-    ``status_counts`` maps a backend name (plus ``"aggregate"``) to triage
-    status counts, and counts findings rather than deduplicated vulnerabilities.
+    ``findings`` holds the first page of this scope's stored rows;
+    ``scope_total`` counts the scope and ``target_total`` counts every
+    available store for the target, with ``target_total_complete`` false when
+    a store is unavailable. ``status_counts`` maps a backend name (plus
+    ``"aggregate"``) to triage status counts, and counts findings rather than
+    deduplicated vulnerabilities. ``store_health`` says which stores answered,
+    so a store that is absent is never read as an empty one.
     """
 
     path: str
@@ -101,4 +112,65 @@ class ScanResult(TypedDict):
     target_total_complete: bool
     status_counts: dict[str, dict[str, int]]
     scope_health: dict[str, object]
+    store_health: dict[str, object]
+    sync_state: SyncState
+    warnings: list[str]
+
+
+class ScopeSummary(TypedDict):
+    """One stored scope, as the store reports it alongside a page.
+
+    ``stale`` counts rows the scope's last scan did not observe again: a
+    partial scan keeps them rather than retiring a call site it never looked
+    at, so they are reported, and labelled, instead of silently dropped.
+    """
+
+    scope: str
+    backend: Backend
+    scan_id: str | None
+    scanned_at: str | None
+    coverage: ScanCoverage | None
+    total: int
+    stale: int
+
+
+class FindingsPage(TypedDict):
+    """One page of stored rows, read without rescanning anything.
+
+    Rows are ordered by verified address space, then location, then finding
+    ID, across every scope of the backend. The order is total and stable, but
+    it is not a snapshot: a rescan between two pages can change what the next
+    page holds.
+    """
+
+    path: str
+    idb_path: str
+    offset: int
+    limit: int
+    findings: list[Finding]
+    page_total: int
+    target_total: int
+    target_total_complete: bool
+    stale_total: int
+    status_counts: dict[str, dict[str, int]]
+    store_health: dict[str, object]
+    sync_state: SyncState
+    warnings: list[str]
+
+
+class TriageResult(TypedDict):
+    """One accepted assessment, as the store committed it.
+
+    ``triage_revision`` counts accepted updates to this one finding; a
+    rejected update writes nothing and leaves it where it was.
+    """
+
+    path: str
+    idb_path: str
+    finding: Finding
+    triage_revision: int
+    target_total: int
+    status_counts: dict[str, dict[str, int]]
+    store_health: dict[str, object]
+    sync_state: SyncState
     warnings: list[str]
