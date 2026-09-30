@@ -6,7 +6,10 @@ under the Apache-2.0 license shipped beside them as
 ``vulfi_mcp/data/Accenture-VulFi-LICENSE`` (``THIRD_PARTY_LICENSES/`` links to it
 in the source tree).
 
-Nothing in this module imports IDA.
+Every ``mark_if`` branch is preflighted through
+:func:`vulfi_mcp.ida_runtime.validate_expression`, so a rule is only ever
+accepted when all three of its expressions are interpretable. Nothing in this
+module imports IDA.
 """
 
 from __future__ import annotations
@@ -15,6 +18,14 @@ import hashlib
 import json
 from importlib import resources
 from typing import Final, TypedDict
+
+from vulfi_mcp.ida_runtime import (
+    MAX_COMPREHENSION_ITERATIONS,
+    MAX_EXPRESSION_LENGTH,
+    MAX_EXPRESSION_NODES,
+    ExpressionError,
+    validate_expression,
+)
 
 __all__ = [
     "MarkIf",
@@ -194,25 +205,31 @@ def rule_template() -> dict[str, object]:
             "string_methods": ["lower", "split", "startswith"],
             "param_methods": [
                 "is_constant()",
+                "is_const_number()",
                 "string_value()",
                 "number_value()",
+                "size()",
                 "used_as_index()",
                 "is_sign_compared()",
                 "set_to_null_after_call()",
                 "used_in_call_before(['strlen'])",
+                "used_in_call_after(['free'])",
             ],
             "function_call_methods": [
                 "return_value_checked()",
                 "return_value_checked(param_count - 2)",
+                "reachable_from('main')",
             ],
             "limits": {
                 "expression": (
-                    "One bounded expression per branch; oversized or unsupported"
-                    " syntax is rejected with a rule-indexed error."
+                    f"One expression per branch, at most {MAX_EXPRESSION_LENGTH}"
+                    f" characters and {MAX_EXPRESSION_NODES} syntax nodes; oversized"
+                    " or unsupported syntax is rejected with a rule-indexed error."
                 ),
                 "iteration": (
-                    "Comprehensions, any(), and range() iterate a bounded number of"
-                    " elements; an over-budget expression is rejected."
+                    "Comprehensions, any(), and range() iterate at most"
+                    f" {MAX_COMPREHENSION_ITERATIONS} elements per branch; an"
+                    " over-budget expression is rejected, never silently false."
                 ),
                 "calls": (
                     "Only the listed builtins, string methods, and fact methods may be"
@@ -293,6 +310,10 @@ def _validate_rule(item: object, index: int) -> Rule:
             raise ValueError(f"{where}: 'mark_if' is missing the {priority!r} branch")
         if not isinstance(mark_if[priority], str):
             raise ValueError(f"{where}: mark_if[{priority!r}] must be a string")
+        try:
+            validate_expression(mark_if[priority])
+        except ExpressionError as error:
+            raise ValueError(f"{where}: mark_if[{priority!r}]: {error}") from None
 
     return {
         "name": name,
