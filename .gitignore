@@ -14,7 +14,17 @@ __pycache__/
 node_modules/
 dist/
 
-# IDA analysis databases and intermediate files
+# Local RE analysis artifacts and catalogs
+.vulfi/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.gpr
+*.rep/
+*.r2
 *.i64
 *.idb
 *.id0
