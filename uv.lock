@@ -129,6 +129,7 @@ dependencies = [
     { name = "ida-domain" },
     { name = "ida-mcp" },
     { name = "ida-nexus" },
+    { name = "idapro" },
 ]
 
 [package.dev-dependencies]
@@ -141,6 +142,7 @@ requires-dist = [
     { name = "ida-domain", specifier = "==0.5.1" },
     { name = "ida-mcp", specifier = "==20260924.0.3" },
     { name = "ida-nexus", specifier = "==0.13.0" },
+    { name = "idapro", specifier = "==0.0.10" },
 ]
 
 [package.metadata.requires-dev]

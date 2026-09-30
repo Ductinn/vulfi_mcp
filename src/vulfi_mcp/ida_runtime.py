@@ -8,9 +8,10 @@ no :func:`eval` and no :func:`exec` anywhere.
 
 This file is shipped to the IDA worker **by path**
 (``ida_nexus.RemoteModule("<path>/ida_runtime.py", codec="json")``) and executes
-as a standalone module inside another interpreter. It therefore imports nothing
-from the :mod:`vulfi_mcp` package at runtime, uses no relative imports, and
-imports nothing from IDA at module load; IDA APIs are imported inside worker
+as a standalone module inside another interpreter, where
+:func:`run` is its single entry point. It therefore imports nothing from the
+:mod:`vulfi_mcp` package at runtime, uses no relative imports, and imports
+nothing from IDA at module load; IDA APIs are imported inside worker
 functions only. Rules arrive as plain JSON-native dictionaries.
 
 Nothing here may depend on the module being registered in ``sys.modules``: a
@@ -48,11 +49,14 @@ __all__ = [
     "ExpressionEvaluationError",
     "FunctionCall",
     "InvalidExpressionError",
+    "OperationError",
     "Param",
     "RuleContext",
     "Unavailable",
     "UnavailableEvidenceError",
+    "UnknownOperationError",
     "evaluate_rule",
+    "run",
     "validate_expression",
 ]
 
@@ -1001,3 +1005,101 @@ class _Interpreter:
             else:
                 self._names.pop(name, None)
         return results
+
+
+# ---------------------------------------------------------------------------
+# Worker entry point.
+#
+# Everything below runs inside the IDA process, reached through the single
+# ``run`` function that ``vulfi_mcp.ida_adapter`` binds with
+# ``RemoteModule(..., codec="json")``. IDA is imported inside the operation
+# bodies only, so this module still imports standalone on a host without IDA.
+# ---------------------------------------------------------------------------
+
+
+class OperationError(Exception):
+    """A worker operation was rejected before it touched the database."""
+
+
+class UnknownOperationError(OperationError):
+    """No operation is registered under the requested name."""
+
+
+def run(operation: str, payload: dict[str, object]) -> dict[str, object]:
+    """Dispatch one named operation against the database this worker has open.
+
+    ``payload`` and the returned dictionary are JSON-native throughout: the
+    adapter normalizes both, and the ``json`` codec carries nothing else.
+
+    Every result carries its ``operation`` and a ``mutated`` flag. ``mutated``
+    is the only signal the adapter has that the IDB must be saved, so an
+    operation that writes to the database MUST report ``True``.
+    """
+    if not isinstance(operation, str):
+        raise OperationError(
+            f"operation must be a string, got {type(operation).__name__}"
+        )
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise OperationError(
+            f"{operation}: payload must be a JSON object,"
+            f" got {type(payload).__name__}"
+        )
+    handler = _OPERATIONS.get(operation)
+    if handler is None:
+        known = ", ".join(sorted(_OPERATIONS))
+        raise UnknownOperationError(
+            f"unknown IDA operation: {operation!r}; known operations: {known}"
+        )
+    result = handler(payload)
+    result["operation"] = operation
+    result.setdefault("mutated", False)
+    return result
+
+
+def _database_summary(payload: dict[str, object]) -> dict[str, object]:
+    """Report what IDA loaded and what its analysis found.
+
+    ``name_limit`` caps how many function names travel back; the count is
+    always exact and ``names_truncated`` says whether the list is complete.
+    """
+    import ida_funcs
+    import ida_hexrays
+    import ida_loader
+    import ida_nalt
+    import idautils
+
+    limit = _int_option(payload, "name_limit", 100)
+    names: list[str] = []
+    total = 0
+    for address in idautils.Functions():
+        total += 1
+        if len(names) < limit:
+            names.append(ida_funcs.get_func_name(address))
+    digest = ida_nalt.retrieve_input_file_sha256()
+    return {
+        "mutated": False,
+        "idb_path": ida_loader.get_path(ida_loader.PATH_TYPE_IDB),
+        "input_file": ida_nalt.get_root_filename(),
+        "input_sha256": digest.hex() if digest else None,
+        "function_count": total,
+        "function_names": names,
+        "names_truncated": total > len(names),
+        "decompiler": bool(ida_hexrays.init_hexrays_plugin()),
+    }
+
+
+def _int_option(payload: dict[str, object], name: str, default: int) -> int:
+    """Read one optional non-negative integer option out of a payload."""
+    value = payload.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise OperationError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+#: Every operation ``run`` accepts, by name. Each takes the JSON payload and
+#: returns a JSON-native dictionary.
+_OPERATIONS: Final[dict[str, Callable[[dict[str, object]], dict[str, object]]]] = {
+    "database_summary": _database_summary,
+}

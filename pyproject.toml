@@ -8,6 +8,7 @@ dependencies = [
     "ida-mcp==20260924.0.3",
     "ida-nexus==0.13.0",
     "ida-domain==0.5.1",
+    "idapro==0.0.10",
 ]
 
 [dependency-groups]
