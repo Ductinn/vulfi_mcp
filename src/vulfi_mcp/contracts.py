@@ -18,7 +18,6 @@ __all__ = [
     "RuleCoverage",
     "ScanCoverage",
     "ScanResult",
-    "ScopeSummary",
     "SyncState",
     "TriageResult",
     "TriageStatus",
@@ -90,9 +89,11 @@ class ScanResult(TypedDict):
     ``scope_total`` counts the scope and ``target_total`` counts every
     available store for the target, with ``target_total_complete`` false when
     a store is unavailable. ``status_counts`` maps a backend name (plus
-    ``"aggregate"``) to triage status counts, and counts findings rather than
-    deduplicated vulnerabilities. ``store_health`` says which stores answered,
-    so a store that is absent is never read as an empty one.
+    ``"aggregate"``) to triage status counts over the same rows
+    ``target_total`` counts — every stored row of the target, across every
+    scope of that backend, not this scan's own findings — and counts findings
+    rather than deduplicated vulnerabilities. ``store_health`` says which
+    stores answered, so a store that is absent is never read as an empty one.
     """
 
     path: str
@@ -115,23 +116,6 @@ class ScanResult(TypedDict):
     store_health: dict[str, object]
     sync_state: SyncState
     warnings: list[str]
-
-
-class ScopeSummary(TypedDict):
-    """One stored scope, as the store reports it alongside a page.
-
-    ``stale`` counts rows the scope's last scan did not observe again: a
-    partial scan keeps them rather than retiring a call site it never looked
-    at, so they are reported, and labelled, instead of silently dropped.
-    """
-
-    scope: str
-    backend: Backend
-    scan_id: str | None
-    scanned_at: str | None
-    coverage: ScanCoverage | None
-    total: int
-    stale: int
 
 
 class FindingsPage(TypedDict):
@@ -163,6 +147,9 @@ class TriageResult(TypedDict):
 
     ``triage_revision`` counts accepted updates to this one finding; a
     rejected update writes nothing and leaves it where it was.
+    ``target_total`` and ``status_counts`` cover every stored row of the
+    target, as they do on a scan or a page, and ``target_total_complete`` is
+    false while one of the target's stores is unavailable.
     """
 
     path: str
@@ -170,6 +157,7 @@ class TriageResult(TypedDict):
     finding: Finding
     triage_revision: int
     target_total: int
+    target_total_complete: bool
     status_counts: dict[str, dict[str, int]]
     store_health: dict[str, object]
     sync_state: SyncState

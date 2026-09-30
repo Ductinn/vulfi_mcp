@@ -220,6 +220,10 @@ def test_independent_assessments_survive_reopen(
     assert assessed["triage_revision"] == 1
     assert assessed["finding"]["status"] == "Vulnerable"
     assert assessed["finding"]["assessed_at"].endswith("Z")
+    # The triage result qualifies its target total exactly as a page does:
+    # Plan 3's catalog is not here, so the total is explicitly incomplete.
+    assert assessed["target_total"] == 5
+    assert assessed["target_total_complete"] is False
     assert cleared["triage_revision"] == 1
     assert cleared["finding"]["status"] == "False Positive"
 

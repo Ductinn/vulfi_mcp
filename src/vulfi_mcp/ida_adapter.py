@@ -246,8 +246,9 @@ def scan_ida(
     an earlier assessment forward by exact finding ID, a ``complete`` scan
     retires a row whose call site is gone, and a ``partial`` one keeps it and
     marks it stale instead. Evaluation happens on the host between the two
-    worker calls, but both run under one lease and the record's whole
-    read/modify/write happens inside the second of them.
+    worker calls, but both run under one lease, the record's whole
+    read/modify/write happens inside the second of them, and one save at the
+    end of the lease commits whatever either of them changed.
 
     ``decompiler="disabled"`` runs the same disassembly-only extraction IDA
     falls back to when Hex-Rays is absent. ``limits`` may only tighten
@@ -326,10 +327,12 @@ def triage_ida(
 ) -> TriageResult:
     """Assess one stored finding, by its exact ID.
 
-    The status, the rationale and the ID's shape are checked here, before a
-    database is opened; the ID itself can only be checked against the record,
-    and an unknown one is refused there. Either way a refused update writes
-    nothing: the record keeps its bytes and ``triage_revision`` its value.
+    The status and the rationale are checked here, before a database is
+    opened, and so is the ID being a non-empty string. Its shape is not:
+    composing and parsing a finding ID is the record's own business, and an
+    ID the record does not hold is refused there whatever it looks like.
+    Either way a refused update writes nothing: the record keeps its bytes
+    and ``triage_revision`` its value.
     """
     if not isinstance(finding_id, str) or not finding_id:
         raise ValueError("finding_id must be a non-empty string")
@@ -351,6 +354,9 @@ def triage_ida(
         "finding": finding,
         "triage_revision": int(stored.get("triage_revision") or 0),
         "target_total": int(stored.get("target_total") or 0),
+        # Plan 3's catalog is the other store; an absent store is unavailable,
+        # never zero, so this total is explicitly incomplete.
+        "target_total_complete": False,
         "status_counts": _status_counts(stored),
         "store_health": _store_health(stored),
         "sync_state": SYNC_STATE,
@@ -533,14 +539,22 @@ class _Worker:
     it needs both of them to see the same open database: a second lease would
     reopen the IDB, and could find it owned by somebody else by then. Holding
     one lease keeps the evidence and the record it is stored in consistent.
+
+    What the session mutated reaches disk through :meth:`save`, once, after
+    its last operation. Saving per operation would pack and rewrite the whole
+    database twice for one scan — a prototyping scan mutates the analysis and
+    the record that follows it mutates the netnode — and the second write
+    contains everything the first one did, so the first is pure I/O
+    proportional to the size of the IDB.
     """
 
     def __init__(self, handle: DatabaseHandle, database: Path) -> None:
         self._handle = handle
         self._database = database
+        self._unsaved = False
 
     def run(self, operation: str, payload: dict[str, object]) -> dict[str, object]:
-        """Run one operation, and save the database when it reports a mutation."""
+        """Run one operation, and note a mutation for this session to save."""
         if not isinstance(operation, str) or not operation:
             raise ValueError("operation must be a non-empty string")
         request = _json_value(payload if payload is not None else {}, "payload")
@@ -555,15 +569,33 @@ class _Worker:
                 f"{operation} returned {type(result).__name__}, expected a JSON object"
             )
         if normalized.get("mutated"):
-            # A netnode write that is not saved is not durable, and IDA offers
-            # no transaction: a failed save is reported, never swallowed.
-            _require_saved(self._handle.save_database(), self._database)
+            self._unsaved = True
         return normalized
+
+    def save(self) -> None:
+        """Commit what this session mutated, while the lease still holds it.
+
+        A netnode write that is not saved is not durable, and IDA offers no
+        transaction: a failed save is reported, never swallowed. Deferring the
+        write does not weaken that — the save runs inside the lease, before
+        the database is closed, and its failure reaches the caller instead of
+        a result that looks durable.
+        """
+        if not self._unsaved:
+            return
+        self._unsaved = False
+        _require_saved(self._handle.save_database(), self._database)
 
 
 @contextmanager
 def _session(idb_path: str) -> Iterator[_Worker]:
-    """Open one managed IDB under one lease, for one or more operations."""
+    """Open one managed IDB under one lease, for one or more operations.
+
+    The session saves once, when its body has finished and the lease still
+    holds the database. A body that raised saves nothing: the operation it
+    failed in never returned a result claiming durability, and a lease this
+    process owns discards what an abandoned session left in memory.
+    """
     database = Path(idb_path).expanduser()
     if database.suffix.lower() not in IDB_SUFFIXES:
         # Opening a binary here would analyze it in place, next to a file this
@@ -573,7 +605,9 @@ def _session(idb_path: str) -> Iterator[_Worker]:
         raise FileNotFoundError(f"no such IDA database: {database}")
     options = DatabaseOpenOptions(worker_cwd=str(database.parent))
     with _lease(database, options) as handle:
-        yield _Worker(handle, database)
+        worker = _Worker(handle, database)
+        yield worker
+        worker.save()
 
 
 @contextmanager

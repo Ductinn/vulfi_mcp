@@ -3029,6 +3029,12 @@ def _rows(record: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _scope_summary(name: str, stored: dict[str, Any]) -> dict[str, object]:
+    """One stored scope, as every record operation reports it.
+
+    ``stale`` counts rows the scope's last scan did not observe again: a
+    partial scan keeps them rather than retiring a call site it never looked
+    at, so they are reported, and labelled, instead of silently dropped.
+    """
     scan_id = stored.get("scan_id")
     findings = stored["findings"]
     return {
