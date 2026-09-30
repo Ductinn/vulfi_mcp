@@ -8,14 +8,16 @@ in the managed IDB netnode. This module deliberately imports nothing from
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict
 
 __all__ = [
     "Backend",
     "Finding",
     "FindingsPage",
+    "JsonValue",
     "Priority",
     "RuleCoverage",
+    "RuleState",
     "ScanCoverage",
     "ScanResult",
     "SyncState",
@@ -23,15 +25,38 @@ __all__ = [
     "TriageStatus",
 ]
 
-Backend = Literal["ida", "ghidra", "r2"]
-Priority = Literal["High", "Medium", "Low", "Info"]
-TriageStatus = Literal["Not Checked", "False Positive", "Suspicious", "Vulnerable"]
-ScanCoverage = Literal["complete", "partial"]
+#: One arbitrary JSON value. Spelled ``Any`` rather than ``object`` because
+#: the MCP schema generator these contracts are published through maps
+#: ``object`` to ``{"type": "object"}`` — "this value must itself be a JSON
+#: object" — which the integers, strings and booleans the free-form fields
+#: below really carry would violate. ``Any`` publishes the empty schema,
+#: which is the truth about them: any JSON value at all.
+JsonValue: TypeAlias = Any
 
-#: How an IDA row and its reviewer-linked external partner stand. Plan 4
-#: creates links; until then every stored row is ``unlinked``, which is not
-#: the same claim as ``synchronized``.
-SyncState = Literal["unlinked", "pending", "synchronized", "conflict", "paused"]
+# The closed value sets below are ``Literal`` for a type checker and plain
+# ``str`` at run time, and that split is deliberate. ``zeromcp`` derives each
+# tool's advertised ``outputSchema`` from these annotations at run time, and
+# maps every construct it does not recognise — ``Literal`` among them — to
+# ``{"type": "object"}``. Publishing the ``Literal`` itself therefore
+# advertises that ``backend`` must be a JSON *object* while every payload
+# sends the string ``"ida"``, so a client that validates structured results,
+# as MCP 2025-06-18 says it should, rejects every successful call. ``str``
+# publishes ``{"type": "string"}``, which is what these fields are; the
+# enumeration stays here for every reader and every type checker. Nothing
+# inspects these aliases at run time.
+if TYPE_CHECKING:
+    Backend = Literal["ida", "ghidra", "r2"]
+    Priority = Literal["High", "Medium", "Low", "Info"]
+    TriageStatus = Literal["Not Checked", "False Positive", "Suspicious", "Vulnerable"]
+    ScanCoverage = Literal["complete", "partial"]
+    RuleState = Literal["evaluated", "unsupported", "failed"]
+
+    #: How an IDA row and its reviewer-linked external partner stand. Plan 4
+    #: creates links; until then every stored row is ``unlinked``, which is not
+    #: the same claim as ``synchronized``.
+    SyncState = Literal["unlinked", "pending", "synchronized", "conflict", "paused"]
+else:
+    Backend = Priority = TriageStatus = ScanCoverage = RuleState = SyncState = str
 
 
 class Finding(TypedDict):
@@ -65,7 +90,7 @@ class Finding(TypedDict):
     link_revision: int | None
     last_seen_scan_id: str
     stale: bool
-    evidence: dict[str, object]
+    evidence: dict[str, JsonValue]
 
 
 class RuleCoverage(TypedDict):
@@ -78,7 +103,7 @@ class RuleCoverage(TypedDict):
 
     rule_index: int
     backend: Backend
-    state: Literal["evaluated", "unsupported", "failed"]
+    state: RuleState
     reason: str | None
 
 
@@ -112,8 +137,8 @@ class ScanResult(TypedDict):
     target_total: int
     target_total_complete: bool
     status_counts: dict[str, dict[str, int]]
-    scope_health: dict[str, object]
-    store_health: dict[str, object]
+    scope_health: dict[str, JsonValue]
+    store_health: dict[str, JsonValue]
     sync_state: SyncState
     warnings: list[str]
 
@@ -137,7 +162,7 @@ class FindingsPage(TypedDict):
     target_total_complete: bool
     stale_total: int
     status_counts: dict[str, dict[str, int]]
-    store_health: dict[str, object]
+    store_health: dict[str, JsonValue]
     sync_state: SyncState
     warnings: list[str]
 
@@ -159,6 +184,6 @@ class TriageResult(TypedDict):
     target_total: int
     target_total_complete: bool
     status_counts: dict[str, dict[str, int]]
-    store_health: dict[str, object]
+    store_health: dict[str, JsonValue]
     sync_state: SyncState
     warnings: list[str]

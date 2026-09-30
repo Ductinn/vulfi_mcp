@@ -8,7 +8,7 @@ VulFi-style vulnerability-hunting rules for the official Hex-Rays IDA MCP server
 
 - **`vulfi_rule_template`** — the rule schema, worked examples, the restricted expression language a `mark_if` branch may use, and its limits.
 - **`vulfi_scan`** — scans a binary or a saved `.i64`/`.idb`. The target is copied into a managed workspace and only the copy is ever analyzed or written; the supplied file is left untouched. Omitting `rules` runs the 24 stock VulFi rules in scope `default`; a nonempty list runs only those rules in scope `custom:<scan_name>`. Every rule is validated in full *before* any database is created, and expressions are interpreted from a restricted syntax tree — never with Python `eval` or `exec`. Each rule comes back `evaluated`, `unsupported`, or `failed` with a reason, so a rule whose facts IDA could not establish is never reported as a clean negative.
-- **`vulfi_findings`** — pages stored rows without rescanning, in one stable order across every scope of the IDA backend.
+- **`vulfi_findings`** — pages stored rows in one stable order across every scope of the IDA backend. It evaluates no rule and rewrites no row, but it is only cheap once the target has a managed database: the rows live in that database, so the first call for a target that was never scanned analyzes the binary in full before returning an empty page.
 - **`vulfi_triage`** — records one assessment (`Not Checked`, `False Positive`, `Suspicious`, `Vulnerable`) against a finding's exact id, with a nonempty rationale. A refused update writes nothing.
 
 Findings and assessments live in the managed IDB's own netnode, so they survive closing and reopening the database and restarting the server. Rescanning a scope preserves earlier assessments by exact finding id.

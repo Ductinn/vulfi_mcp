@@ -29,7 +29,7 @@ from typing import Annotated, Final
 
 from ida_mcp.mcp import serve_stdio, tool
 
-from vulfi_mcp.contracts import ScanResult
+from vulfi_mcp.contracts import FindingsPage, JsonValue, ScanResult, TriageResult
 from vulfi_mcp.ida_adapter import (
     ensure_managed_idb,
     findings_ida,
@@ -122,7 +122,7 @@ def _scope_and_rules(
 
 
 @tool(title="Describe the VulFi rule format", read_only=True)
-def vulfi_rule_template() -> dict[str, object]:
+def vulfi_rule_template() -> dict[str, JsonValue]:
     """Describe the VulFi rule format: the schema one rule object must follow,
     worked examples, the restricted expression language a `mark_if` branch may
     use, its limits, and what the scanner reports when a rule cannot be
@@ -202,14 +202,17 @@ def vulfi_findings(
     ] = None,
     offset: Annotated[int, "Zero-based index of the first row to return."] = 0,
     limit: Annotated[int, "Rows to return; 1 to 200."] = 100,
-) -> dict[str, object]:
-    """Read the VulFi findings already stored for a target, without rescanning
-    anything. Returns one page of rows across every scope of the IDA backend in
-    one stable order (address space, then location, then finding ID), together
-    with the target's triage counts, how many rows a later partial scan did not
-    observe again, and which stores answered — a store that is absent is
-    reported unavailable, never as zero rows. The payload is a
-    `vulfi_mcp.contracts.FindingsPage`.
+) -> FindingsPage:
+    """Read the VulFi findings already stored for a target: no rule is
+    evaluated and no stored row is rewritten. Returns one page of rows across
+    every scope of the IDA backend in one stable order (address space, then
+    location, then finding ID), together with the target's triage counts, how
+    many rows a later partial scan did not observe again, and which stores
+    answered — a store that is absent is reported unavailable, never as zero
+    rows. Reading a target that was never scanned is not cheap: the rows live
+    in the target's managed IDA database, so the first call for such a target
+    analyzes the binary in full before returning an empty page. Once that
+    database exists this is a read, and cheaper than vulfi_scan.
     """
     _require_no_external_store(binary_path, "vulfi_findings")
     # Refused before a database can exist, so an out-of-range page never
@@ -245,15 +248,14 @@ def vulfi_triage(
         " store. That store is not implemented in this build, so any value is"
         " refused rather than silently ignored.",
     ] = None,
-) -> dict[str, object]:
+) -> TriageResult:
     """Record an assessment of one stored VulFi finding, by its exact id. The
     status, the rationale and the id are all checked before any database is
     opened, and a refused update writes nothing at all. An accepted one is
     committed to the managed IDB and survives reopening it; it returns the
     finding exactly as the store committed it, its assessment revision, and the
     target's triage counts. Assessments in this build are unlinked: they update
-    the IDA row's own authority and nothing else. The payload is a
-    `vulfi_mcp.contracts.TriageResult`.
+    the IDA row's own authority and nothing else.
     """
     _require_no_external_store(binary_path, "vulfi_triage")
     # Refused before a database can exist, for the same reason vulfi_findings
