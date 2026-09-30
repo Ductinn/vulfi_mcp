@@ -592,9 +592,10 @@ def _session(idb_path: str) -> Iterator[_Worker]:
     """Open one managed IDB under one lease, for one or more operations.
 
     The session saves once, when its body has finished and the lease still
-    holds the database. A body that raised saves nothing: the operation it
-    failed in never returned a result claiming durability, and a lease this
-    process owns discards what an abandoned session left in memory.
+    holds the database. A body that raised saves nothing, and nothing it
+    changed reaches disk either: the operation it failed in never returned a
+    result claiming durability, and a lease this process owns ends with a
+    discarding shutdown whether or not the body raised.
     """
     database = Path(idb_path).expanduser()
     if database.suffix.lower() not in IDB_SUFFIXES:
@@ -641,11 +642,19 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     nested in its own ``try``: the close is the one step that must happen
     whatever else does, because ``DatabaseHandle`` has no finalizer and a lease
     left open keeps the worker process alive on the managed ``.i64`` for the
-    rest of this process's life, wedging every later open of that database. The
-    error still reaches the outer handler, so the release wait is still skipped.
+    rest of this process's life, wedging every later open of that database.
 
-    A failure while closing is only reported when the work itself succeeded, so
-    it can never mask the real error.
+    All of it runs whether or not the body raised. Releasing the last lease of
+    a managed worker marks a shutdown that still saves (Nexus clears that flag
+    only for an explicit discarding shutdown), so a lease that skipped its own
+    teardown after a failure had the worker write the very mutation the failed
+    operation never confirmed — and the next lease opened while that worker was
+    still writing. A failed operation must leave the database exactly as it
+    found it, and the next one must not race the process that held it.
+
+    What differs on a failing path is only whose error is reported: the body's,
+    always. A teardown that then fails travels with it as a note instead of
+    replacing it or vanishing.
     """
     prior = _prior_owner(target, options.output_database)
     handle = DatabaseHandle.open(str(target), options=options)
@@ -657,24 +666,25 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
         and prior is not _AMBIGUOUS
         and prior != instance.record_id
     )
-    failed = False
+    failure: BaseException | None = None
     try:
         yield handle
-    except BaseException:
-        failed = True
+    except BaseException as error:
+        failure = error
         raise
     finally:
         try:
             try:
-                if not failed and ours:
+                if ours:
                     handle.shutdown_database(save=False)
             finally:
                 handle.close(wait_for_database=True)
-            if not failed and ours:
+            if ours:
                 _await_released(instance)
-        except Exception:
-            if not failed:
+        except Exception as teardown:
+            if failure is None:
                 raise
+            failure.add_note(f"while ending the lease on {target}: {teardown!r}")
 
 
 def _prior_owner(target: Path, output_database: str | Path | None) -> object:

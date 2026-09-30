@@ -18,6 +18,7 @@ from ida_nexus import DatabaseOpenOptions, RemoteError
 from vulfi_mcp.contracts import Finding
 from vulfi_mcp.ida_adapter import (
     _lease,
+    _session,
     ensure_managed_idb,
     findings_ida,
     scan_ida,
@@ -346,6 +347,45 @@ def test_partial_rescan_keeps_stale_until_complete(
     assert page["findings"] == []
     assert page["stale_total"] == 0
     assert page["status_counts"]["aggregate"]["Suspicious"] == 0
+
+
+def test_a_session_that_raises_after_mutating_persists_nothing(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # Releasing the last lease of a managed worker marks a shutdown that still
+    # saves, so a session that mutated and then raised used to have its
+    # mutation written by the worker on its way out — a write no
+    # `save_database()` ever confirmed. An operation that failed leaves the
+    # record exactly as it found it.
+    managed = ensure_managed_idb(str(compiled_calls))
+    scan_ida(managed, (BUFFER_OVERFLOW,), "default", path=str(compiled_calls))
+    before = findings_ida(managed, 0, 100, path=str(compiled_calls))
+    digest = _digest(before)
+    target = before["findings"][0]
+
+    abandoned = RuntimeError("the host failed after the record was written")
+    with pytest.raises(RuntimeError) as raised:
+        with _session(managed) as worker:
+            written = worker.run(
+                "triage",
+                {
+                    "finding_id": target["id"],
+                    "status": "Vulnerable",
+                    "rationale": "assessed inside a session that then failed",
+                },
+            )
+            # The worker really did write the record in its own memory.
+            assert written["mutated"] is True
+            assert written["triage_revision"] == 1
+            raise abandoned
+    # The body's error is the one the caller sees, not a teardown's.
+    assert raised.value is abandoned
+
+    after = findings_ida(managed, 0, 100, path=str(compiled_calls))
+    assert _digest(after) == digest
+    assert [row["status"] for row in after["findings"]] == ["Not Checked"] * 2
+    assert [row["triage_revision"] for row in after["findings"]] == [0, 0]
+    assert [row["rationale"] for row in after["findings"]] == ["", ""]
 
 
 def test_unknown_id_bad_status_empty_rationale_and_bad_page_do_not_write(
