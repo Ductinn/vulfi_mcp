@@ -167,3 +167,19 @@ def test_a_shared_database_is_not_waited_on(
 
     assert result["function_count"] > 0
     assert elapsed < RELEASE_TIMEOUT
+
+
+def test_a_read_only_operation_leaves_the_database_alone(
+    compiled_calls: Path, managed_data_dir: Path
+) -> None:
+    # A worker saves its database on close by default, so every lease used to
+    # rewrite the packed .i64 even when nothing was mutated. Those repeated
+    # rewrites are what eventually left a managed database unopenable.
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+    before = _digest(managed)
+
+    first = invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
+    second = invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
+
+    assert first["function_count"] == second["function_count"]
+    assert _digest(managed) == before

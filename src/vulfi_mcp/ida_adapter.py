@@ -102,8 +102,14 @@ IDB_SUFFIXES: Final = (".i64", ".idb")
 #: Seconds one worker operation may run before the lease gives up on it.
 WORKER_TIMEOUT: Final = 600.0
 
-#: Seconds to wait for IDA to repack a database once its lease closed.
+#: Seconds to wait for a worker to exit and leave its database packed.
 RELEASE_TIMEOUT: Final = 120.0
+
+#: Process table, when this platform has one; the fallback is ``os.kill``.
+_PROC: Final = Path("/proc")
+
+#: "Several live instances answer for this target", so this lease owns none.
+_AMBIGUOUS: Final = object()
 
 #: File states of a supplied IDB that make copying it unsafe.
 _UNSAFE_STATES: Final = {
@@ -572,31 +578,43 @@ def _session(idb_path: str) -> Iterator[_Worker]:
 
 @contextmanager
 def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandle]:
-    """Hold exactly one Nexus lease, release it, and see our own worker go.
+    """Hold exactly one Nexus lease and shut our own worker down behind us.
 
-    An IDB is unpacked while a worker holds it, and the worker keeps the packed
-    file open until it exits, so a caller that returns earlier would hand out a
-    path whose bytes are still moving. ``close(wait_for_database=True)`` is
-    asked for that wait but only performs it when its ``/release_lease`` call
-    reported ``shutdown_pending``, and that call is a two-second best effort
-    that reports ``False`` on any timeout or transport error. The observed
-    release is therefore the authority, not the close.
+    A worker closes its database with ``save=True`` by default, so *every*
+    close rewrote the packed ``.i64``, even for a read-only operation that
+    changed nothing an agent asked for. That rewrite is the exposure behind the
+    managed databases that turned permanently unopenable after a few dozen
+    leases (``idapro.open_database`` then answers ``rc 4`` while
+    ``probe_database_state`` still calls the file ``packed``). Durability here
+    comes from one place only — the explicit ``save_database()`` the mutating
+    operation already did, and whose failure is reported — so a lease we own
+    ends with an explicit discarding shutdown and the file is left alone.
 
-    That wait is only ours to make when this lease spawned the worker. Nexus
-    attaches to any live instance that already owns the target instead of
-    spawning one, and such an instance's lifetime lock belongs to whoever owns
-    it — a GUI session or a sibling lease. Waiting on that lock would stall
-    until somebody else's session ends and then fail an operation that already
-    completed, and possibly already saved, which is why a database somebody
-    else already owns is left on Nexus's own semantics.
+    The close is then asked to wait for that shutdown, but only performs the
+    wait when its ``/release_lease`` call reported ``shutdown_pending``, and
+    that call is a two-second best effort reporting ``False`` on any timeout or
+    transport error. The observed release is therefore the authority.
+
+    Both are only ours to do when this lease spawned the worker: Nexus attaches
+    to any live instance that already owns the target instead of spawning one,
+    and that instance belongs to a GUI session or a sibling lease. Shutting it
+    down would end somebody else's session, and waiting on its lifetime lock
+    would stall until that session ended and then fail an operation that has
+    already completed.
 
     A failure while closing is only reported when the work itself succeeded, so
     it can never mask the real error.
     """
-    alone = _opens_alone(target, options.output_database)
+    prior = _prior_owner(target, options.output_database)
     handle = DatabaseHandle.open(str(target), options=options)
     instance = handle.instance
-    ours = alone and instance.managed
+    # Not "nobody owned it before": the instance this lease actually got. A
+    # stale owner seen a moment ago must not disown a worker we then spawned.
+    ours = (
+        instance.managed
+        and prior is not _AMBIGUOUS
+        and prior != instance.record_id
+    )
     failed = False
     try:
         yield handle
@@ -605,6 +623,8 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
         raise
     finally:
         try:
+            if not failed and ours:
+                handle.shutdown_database(save=False)
             handle.close(wait_for_database=True)
             if not failed and ours:
                 _await_released(instance)
@@ -613,27 +633,49 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
                 raise
 
 
-def _opens_alone(target: Path, output_database: str | Path | None) -> bool:
-    """Whether opening ``target`` spawns a worker instead of attaching to one."""
+def _prior_owner(target: Path, output_database: str | Path | None) -> object:
+    """The record id of a live instance already owning ``target``, if any."""
     try:
         owner = ida_nexus.find_database_owner(
             str(target), output_database=output_database
         )
     except NexusError:
-        # Several live candidates: somebody else is running, so this lease is
-        # not the one that will own the worker either way.
-        return False
-    return owner is None
+        # Several live candidates: this lease cannot claim what it will get.
+        return _AMBIGUOUS
+    return owner.record_id if owner is not None else None
 
 
 def _await_released(instance: DatabaseInstance) -> None:
-    """Wait for the worker to let go of its database and finish repacking it."""
+    """Wait for our worker to exit and leave a finished database behind.
+
+    Three separate facts, in this order, and none of them implies the next:
+    the instance released its registry lifetime lock; the worker process is
+    gone; the database is packed. The process matters because IDA rewrites the
+    packed ``.i64`` as it shuts down and deregisters before it exits, so a lease
+    that returned on the registry signal alone handed the next open a file the
+    previous worker was still writing — which corrupts it beyond repair while
+    ``probe_database_state`` still calls it ``packed``.
+
+    A worker that never goes fails loudly rather than hanging. Anything the
+    operation saved was confirmed durable by ``_require_saved`` before this
+    wait started, and the error says so, because the database on disk is not
+    what failed here.
+    """
     database = Path(instance.idb_path)
+    deadline = time.monotonic() + RELEASE_TIMEOUT
     if not ida_nexus.wait_database_released(instance, timeout=RELEASE_TIMEOUT):
         raise ManagedDatabaseError(
-            f"{database} was still held {RELEASE_TIMEOUT:g}s after its lease closed"
+            f"{database} was still held {RELEASE_TIMEOUT:g}s after its lease"
+            " closed; anything this operation saved is already on disk"
         )
-    deadline = time.monotonic() + RELEASE_TIMEOUT
+    while not _worker_exited(instance.pid):
+        if time.monotonic() >= deadline:
+            raise ManagedDatabaseError(
+                f"IDA worker {instance.pid} for {database} was still running"
+                f" {RELEASE_TIMEOUT:g}s after its lease closed; anything this"
+                " operation saved is already on disk"
+            )
+        time.sleep(0.02)
     while True:
         state = ida_nexus.probe_database_state(database)["state"]
         if state == "packed":
@@ -644,6 +686,30 @@ def _await_released(instance: DatabaseInstance) -> None:
                 " closed; IDA never repacked it"
             )
         time.sleep(0.05)
+
+
+def _worker_exited(pid: int) -> bool:
+    """Whether an IDA worker process is gone.
+
+    A worker spawned by Nexus is a child of this process, so once it exits it
+    stays visible as a zombie until :mod:`subprocess` reaps it; that counts as
+    gone, because a zombie holds no files open.
+    """
+    if _PROC.is_dir():
+        try:
+            stat = (_PROC / str(pid) / "stat").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return True
+        return stat.rpartition(") ")[2][:1] == "Z"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 @lru_cache(maxsize=1)
