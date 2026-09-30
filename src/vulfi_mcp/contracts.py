@@ -89,7 +89,7 @@ class ScanResult(TypedDict):
     binary_sha256: str | None
     analysis_id: str | None
     preparation_revision: int | None
-    backend: str
+    backend: Backend
     scope: str
     scan_id: str
     scanned_at: str

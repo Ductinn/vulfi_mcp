@@ -2,7 +2,9 @@
 
 The stock rules and prototypes in ``data/`` are copied verbatim from
 Accenture/VulFi commit ``0bb7fdf8ccb906600cc209c35daf05774172acc8`` and remain
-under the Apache-2.0 license in ``THIRD_PARTY_LICENSES/Accenture-VulFi-LICENSE``.
+under the Apache-2.0 license shipped beside them as
+``vulfi_mcp/data/Accenture-VulFi-LICENSE`` (``THIRD_PARTY_LICENSES/`` links to it
+in the source tree).
 
 Nothing in this module imports IDA.
 """

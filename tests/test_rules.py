@@ -137,6 +137,19 @@ def test_validate_rules_does_not_mutate_or_deduplicate_input() -> None:
     assert raw[0]["function_names"] == ["strcpy"]
 
 
+def test_empty_mark_if_branch_is_accepted_as_never_matching() -> None:
+    # rule_template() publishes "" as a valid never-matching branch; keep it valid.
+    rule = make_rule(mark_if={"High": "not param[1].is_constant()", "Medium": "", "Low": ""})
+
+    validated = validate_rules([rule])
+
+    assert validated[0]["mark_if"] == {
+        "High": "not param[1].is_constant()",
+        "Medium": "",
+        "Low": "",
+    }
+
+
 def test_rule_template_example_roundtrips() -> None:
     template = rule_template()
 
@@ -179,3 +192,7 @@ def test_packaged_data_is_importable_from_the_installed_package() -> None:
     assert isinstance(prototypes, dict) and len(prototypes) == 441
     assert prototypes["strcpy"] == "char* strcpy(char* dest, char* src);"
     assert validate_rules(rules) == load_stock_rules()
+
+    license_text = data.joinpath("Accenture-VulFi-LICENSE").read_text("utf-8")
+    assert "Apache License" in license_text
+    assert "Version 2.0, January 2004" in license_text
