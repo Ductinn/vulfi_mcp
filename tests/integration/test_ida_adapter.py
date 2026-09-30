@@ -206,10 +206,13 @@ def test_a_failed_shutdown_still_closes_the_lease(
     def boom(self: DatabaseHandle, *, save: bool = True) -> None:
         raise NexusConnectionError("injected shutdown failure")
 
-    monkeypatch.setattr(DatabaseHandle, "shutdown_database", boom)
-    with pytest.raises(NexusConnectionError):
-        invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
-    monkeypatch.undo()
+    # Scoped: a bare `undo()` would pop the whole stack, including the
+    # `VULFI_MCP_DATA_DIR` redirect `managed_data_dir` pushed, and everything
+    # below would then write into the operator's real data directory.
+    with monkeypatch.context() as patched:
+        patched.setattr(DatabaseHandle, "shutdown_database", boom)
+        with pytest.raises(NexusConnectionError):
+            invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
 
     # The lease skips its release wait when the shutdown failed, so this test
     # does the waiting instead: the registry entry is gone and the worker has
