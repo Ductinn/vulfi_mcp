@@ -131,8 +131,14 @@ def test_all_stock_expressions_validate() -> None:
             reachable_from_names=("main",),
         ),
     )
-    for rule in stock:
-        assert evaluate_rule(rule, context) in {"High", "Medium", "Low", None}
+    # Pinned verdicts: a change that silently turns a match into a non-match
+    # (or the reverse) has to fail here, not pass a "did not raise" check.
+    assert [evaluate_rule(rule, context) for rule in stock] == [
+        "High", "High", "High", "High", "High", None,
+        "Low", "High", "Medium", "High", "High", "Medium",
+        "Medium", "Medium", "High", "Medium", "Low", None,
+        "High", "High", "High", "High", "High", "High",
+    ]
 
 
 REJECTED = InvalidExpressionError
@@ -315,10 +321,90 @@ def test_expression_budgets_are_pinned() -> None:
     with pytest.raises(ExpressionBudgetError, match="iterat"):
         evaluate_rule(over_budget, make_context(Param(constant=True)))
 
+    # range() build, comprehension items and any() items are all charged, so a
+    # quarter of the budget per stage still fits.
+    quarter = MAX_COMPREHENSION_ITERATIONS // 4
     inside_budget = make_rule(
-        High=f"any([not param[0].is_constant() for i in range({MAX_COMPREHENSION_ITERATIONS})])"
+        High=f"any([not param[0].is_constant() for i in range({quarter})])"
     )
     assert evaluate_rule(inside_budget, make_context(Param(constant=False))) == "High"
+
+
+def test_membership_scans_and_range_builds_are_charged_to_the_budget() -> None:
+    # An `in` scan over a recovered string's parts costs one charge per element,
+    # so scanning 601 parts twice exceeds the 1000 element budget.
+    parts = Param(string="%" * 600)
+    one_scan = make_rule(High="'zz' in param[0].string_value().split('%')")
+    two_scans = make_rule(
+        High=(
+            "'zz' in param[0].string_value().split('%')"
+            " or 'yy' in param[0].string_value().split('%')"
+        )
+    )
+    assert evaluate_rule(one_scan, make_context(parts)) is None
+    with pytest.raises(ExpressionBudgetError, match="iterat"):
+        evaluate_rule(two_scans, make_context(parts))
+
+    # The reviewer's shape: repeated `in`-scans over freshly built ranges, inside
+    # both the character and node budgets, must not run ~7e7 comparisons.
+    scan = "1000 not in range(1000)"
+    hostile = make_rule(High=f"any([{' and '.join([scan] * 70)} for x in range(1000)])")
+    assert len(hostile["mark_if"]["High"]) < MAX_EXPRESSION_LENGTH
+    validate_expression(hostile["mark_if"]["High"])
+    with pytest.raises(ExpressionBudgetError, match="iterat"):
+        evaluate_rule(hostile, make_context(Param()))
+
+
+def test_negative_param_index_is_a_malformed_rule_not_missing_evidence() -> None:
+    recovered = make_context(Param(constant=False), Param(constant=True))
+
+    with pytest.raises(ExpressionEvaluationError, match="indexed from zero"):
+        evaluate_rule(make_rule(High="not param[-1].is_constant()"), recovered)
+    # Past the verified end stays unavailable evidence.
+    with pytest.raises(UnavailableEvidenceError):
+        evaluate_rule(make_rule(High="not param[2].is_constant()"), recovered)
+
+
+def test_unmeasured_width_is_unavailable_evidence() -> None:
+    wider = make_rule(High="param[0].size() > 8")
+
+    assert evaluate_rule(wider, make_context(Param(size_bytes=16))) == "High"
+    assert evaluate_rule(wider, make_context(Param(size_bytes=4))) is None
+    with pytest.raises(UnavailableEvidenceError) as excinfo:
+        evaluate_rule(wider, make_context(Param()))
+    assert excinfo.value.fact == "size_bytes"
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "param[0].lower()",
+        "param_count.startswith('a')",
+        "function_call.split('%')",
+        "param[0].string_value().is_constant()",
+        "param[0].number_value().lower()",
+        "[i for i in range(3)][0].lower()",
+    ],
+)
+def test_method_on_the_wrong_receiver_is_rejected_before_any_idb(
+    expression: str,
+) -> None:
+    with pytest.raises(InvalidExpressionError, match="is not a method of"):
+        validate_expression(expression)
+    with pytest.raises(ValueError, match=r"rules\[0\]: mark_if\['High'\]"):
+        rules.validate_rules([make_rule(High=expression)])
+
+
+def test_receiver_kinds_still_accept_every_stock_shape() -> None:
+    # Inference must not reject what the interpreter can actually evaluate.
+    for expression in (
+        STOCK_STRCPY_HIGH,
+        STOCK_FORMAT_MEDIUM,
+        STOCK_OBJC_HIGH,
+        "[p.is_constant() for p in param]",
+        "param[1].string_value().lower().split('%')[0].startswith('s')",
+    ):
+        assert validate_expression(expression) is None
 
 
 def test_branch_order_matches_the_rules_module() -> None:

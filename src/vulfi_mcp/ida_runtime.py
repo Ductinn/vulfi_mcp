@@ -71,8 +71,9 @@ MAX_EXPRESSION_LENGTH: Final = 2000
 #: Largest accepted syntax tree, in interpreted nodes. The largest stock
 #: expression uses 66 of them.
 MAX_EXPRESSION_NODES: Final = 500
-#: Most comprehension items one branch may produce, counting every ``range()``
-#: it builds and every item any comprehension iterates.
+#: Most elements one branch may touch: every ``range()`` it builds, every item a
+#: comprehension or ``any()`` iterates, and every element an ``in`` scan
+#: compares are charged to this one budget.
 MAX_COMPREHENSION_ITERATIONS: Final = 1000
 
 
@@ -140,7 +141,7 @@ UNAVAILABLE: Final[Unavailable] = Unavailable()
 BoolFact: TypeAlias = bool | Unavailable
 StringFact: TypeAlias = str | Unavailable
 NumberFact: TypeAlias = int | float | None | Unavailable
-SizeFact: TypeAlias = int | None | Unavailable
+SizeFact: TypeAlias = int | Unavailable
 NamesFact: TypeAlias = tuple[str, ...] | Unavailable
 ValuesFact: TypeAlias = tuple[int | float, ...] | Unavailable
 
@@ -187,7 +188,8 @@ class Param:
     number: NumberFact = UNAVAILABLE
     #: ``is_const_number()``: the argument is a numeric literal.
     const_number: BoolFact = UNAVAILABLE
-    #: ``size()``: width in bytes of the backing variable, ``None`` when unknown.
+    #: ``size()``: width in bytes of the backing variable; an unmeasured width
+    #: stays :data:`UNAVAILABLE` rather than becoming a number-less answer.
     size_bytes: SizeFact = UNAVAILABLE
     #: ``used_as_index()``: the argument indexes memory in the caller.
     indexed: BoolFact = UNAVAILABLE
@@ -200,7 +202,7 @@ class Param:
     #: ``used_in_call_after()``: callees taking this argument after the call.
     calls_after: NamesFact = UNAVAILABLE
 
-    def size(self) -> int | None:
+    def size(self) -> int:
         return _fact(self.size_bytes, "size_bytes")
 
     def used_as_index(self) -> bool:
@@ -292,35 +294,76 @@ def _string_startswith(value: str, prefix: object) -> bool:
     return value.startswith(prefix)
 
 
+#: Static value kinds, used to reject a method call on the wrong receiver before
+#: any IDB is opened. Every name is also the phrase used in the error message.
+_PARAM: Final = "a call argument"
+_CALL: Final = "the function call"
+_STR: Final = "a string"
+_INT: Final = "an integer"
+_NUMBER: Final = "a number"
+_BOOL: Final = "a boolean"
+_NONE: Final = "None"
+_PARAMS: Final = "the argument list"
+_STR_LIST: Final = "a list of strings"
+_INT_LIST: Final = "a list of integers"
+_LIST: Final = "a list"
+_UNKNOWN: Final = "an unknown value"
+
+
 @dataclass(frozen=True)
 class _MethodSpec:
     call: Callable[..., object]
     min_args: int
     max_args: int
+    result: str
 
 
 _METHODS: Final[dict[type, dict[str, _MethodSpec]]] = {
     Param: {
-        "size": _MethodSpec(Param.size, 0, 0),
-        "used_as_index": _MethodSpec(Param.used_as_index, 0, 0),
-        "is_constant": _MethodSpec(Param.is_constant, 0, 0),
-        "is_const_number": _MethodSpec(Param.is_const_number, 0, 0),
-        "is_sign_compared": _MethodSpec(Param.is_sign_compared, 0, 0),
-        "set_to_null_after_call": _MethodSpec(Param.set_to_null_after_call, 0, 0),
-        "string_value": _MethodSpec(Param.string_value, 0, 0),
-        "number_value": _MethodSpec(Param.number_value, 0, 0),
-        "used_in_call_before": _MethodSpec(Param.used_in_call_before, 1, 1),
-        "used_in_call_after": _MethodSpec(Param.used_in_call_after, 1, 1),
+        "size": _MethodSpec(Param.size, 0, 0, _INT),
+        "used_as_index": _MethodSpec(Param.used_as_index, 0, 0, _BOOL),
+        "is_constant": _MethodSpec(Param.is_constant, 0, 0, _BOOL),
+        "is_const_number": _MethodSpec(Param.is_const_number, 0, 0, _BOOL),
+        "is_sign_compared": _MethodSpec(Param.is_sign_compared, 0, 0, _BOOL),
+        "set_to_null_after_call": _MethodSpec(
+            Param.set_to_null_after_call, 0, 0, _BOOL
+        ),
+        "string_value": _MethodSpec(Param.string_value, 0, 0, _STR),
+        "number_value": _MethodSpec(Param.number_value, 0, 0, _NUMBER),
+        "used_in_call_before": _MethodSpec(Param.used_in_call_before, 1, 1, _BOOL),
+        "used_in_call_after": _MethodSpec(Param.used_in_call_after, 1, 1, _BOOL),
     },
     FunctionCall: {
-        "reachable_from": _MethodSpec(FunctionCall.reachable_from, 1, 1),
-        "return_value_checked": _MethodSpec(FunctionCall.return_value_checked, 0, 1),
+        "reachable_from": _MethodSpec(FunctionCall.reachable_from, 1, 1, _BOOL),
+        "return_value_checked": _MethodSpec(
+            FunctionCall.return_value_checked, 0, 1, _BOOL
+        ),
     },
     str: {
-        "lower": _MethodSpec(_string_lower, 0, 0),
-        "split": _MethodSpec(_string_split, 0, 1),
-        "startswith": _MethodSpec(_string_startswith, 1, 1),
+        "lower": _MethodSpec(_string_lower, 0, 0, _STR),
+        "split": _MethodSpec(_string_split, 0, 1, _STR_LIST),
+        "startswith": _MethodSpec(_string_startswith, 1, 1, _BOOL),
     },
+}
+
+#: Receiver kinds that carry methods, mapped to their table in ``_METHODS``.
+_RECEIVER_TYPES: Final[dict[str, type]] = {
+    _PARAM: Param,
+    _CALL: FunctionCall,
+    _STR: str,
+}
+#: Kind of one element of an indexable or iterable kind.
+_ELEMENT_KINDS: Final[dict[str, str]] = {
+    _PARAMS: _PARAM,
+    _STR_LIST: _STR,
+    _INT_LIST: _INT,
+}
+#: Kind of a list built out of elements of a given kind.
+_LIST_KINDS: Final[dict[str, str]] = {_STR: _STR_LIST, _INT: _INT_LIST}
+_BUILTIN_RESULTS: Final[dict[str, str]] = {
+    "any": _BOOL,
+    "len": _INT,
+    "range": _INT_LIST,
 }
 
 
@@ -333,7 +376,17 @@ def _merged_arities() -> dict[str, tuple[int, int]]:
     return merged
 
 
+def _merged_results() -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for table in _METHODS.values():
+        for name, spec in table.items():
+            agreed = merged.get(name, spec.result) == spec.result
+            merged[name] = spec.result if agreed else _UNKNOWN
+    return merged
+
+
 _METHOD_ARITIES: Final[dict[str, tuple[int, int]]] = _merged_arities()
+_METHOD_RESULTS: Final[dict[str, str]] = _merged_results()
 _BUILTIN_ARITIES: Final[dict[str, tuple[int, int]]] = {
     "any": (1, 1),
     "len": (1, 1),
@@ -448,8 +501,73 @@ def _compile(expression: str) -> ast.Expression:
         raise InvalidExpressionError(
             f"expression could not be parsed as a single expression: {error.msg}"
         ) from None
-    _Validator().check(tree, frozenset())
+    _Validator().check(tree, {})
     return tree
+
+
+def _element_kind(node: ast.expr, bound: dict[str, str]) -> str:
+    """Static kind of one element of ``node``, or ``_UNKNOWN``."""
+    return _ELEMENT_KINDS.get(_infer_kind(node, bound), _UNKNOWN)
+
+
+def _list_kind(element: str) -> str:
+    """Static kind of a list whose elements are all of kind ``element``."""
+    return _LIST_KINDS.get(element, _LIST)
+
+
+def _infer_kind(node: ast.expr, bound: dict[str, str]) -> str:
+    """Infer what kind of value an expression produces, without any facts.
+
+    Receivers in this language are a closed set, so an unmistakable kind lets
+    :class:`_Validator` reject a method call on the wrong receiver before any
+    IDB is opened. Anything not inferable is ``_UNKNOWN`` and stays permissive.
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool):
+            return _BOOL
+        if isinstance(value, str):
+            return _STR
+        if isinstance(value, int):
+            return _INT
+        if isinstance(value, float):
+            return _NUMBER
+        return _NONE
+    if isinstance(node, ast.Name):
+        if node.id == "param":
+            return _PARAMS
+        if node.id == "param_count":
+            return _INT
+        if node.id == "function_call":
+            return _CALL
+        return bound.get(node.id, _UNKNOWN)
+    if isinstance(node, ast.Subscript):
+        return _element_kind(node.value, bound)
+    if isinstance(node, ast.List):
+        kinds = {_infer_kind(element, bound) for element in node.elts}
+        return _list_kind(kinds.pop()) if len(kinds) == 1 else _LIST
+    if isinstance(node, ast.ListComp):
+        inner = dict(bound)
+        for generator in node.generators:
+            if isinstance(generator.target, ast.Name):
+                inner[generator.target.id] = _element_kind(generator.iter, bound)
+        return _list_kind(_infer_kind(node.elt, inner))
+    if isinstance(node, (ast.BoolOp, ast.Compare)):
+        return _BOOL
+    if isinstance(node, ast.UnaryOp):
+        return _BOOL if isinstance(node.op, ast.Not) else _NUMBER
+    if isinstance(node, ast.BinOp):
+        return _NUMBER
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name):
+            return _BUILTIN_RESULTS.get(func.id, _UNKNOWN)
+        if isinstance(func, ast.Attribute):
+            table = _METHODS.get(_RECEIVER_TYPES.get(_infer_kind(func.value, bound)))
+            if table is not None and func.attr in table:
+                return table[func.attr].result
+            return _METHOD_RESULTS.get(func.attr, _UNKNOWN)
+    return _UNKNOWN
 
 
 class _Validator:
@@ -460,7 +578,7 @@ class _Validator:
     def __init__(self) -> None:
         self._nodes = 0
 
-    def check(self, node: ast.AST, bound: frozenset[str]) -> None:
+    def check(self, node: ast.AST, bound: dict[str, str]) -> None:
         self._count()
         if isinstance(node, ast.Expression):
             self.check(node.body, bound)
@@ -518,7 +636,7 @@ class _Validator:
         if not isinstance(node.ctx, ast.Load):
             _reject("assignment to", node)
 
-    def _check_name(self, node: ast.Name, bound: frozenset[str]) -> None:
+    def _check_name(self, node: ast.Name, bound: dict[str, str]) -> None:
         self._check_load(node)
         if node.id not in bound and node.id not in _BOUND_NAMES:
             raise InvalidExpressionError(
@@ -526,7 +644,7 @@ class _Validator:
                 f" {', '.join(sorted(_BOUND_NAMES))} are bound"
             )
 
-    def _check_comprehension(self, node: ast.ListComp, bound: frozenset[str]) -> None:
+    def _check_comprehension(self, node: ast.ListComp, bound: dict[str, str]) -> None:
         if len(node.generators) != 1:
             _reject("a comprehension with more than one 'for' clause", node)
         generator = node.generators[0]
@@ -540,12 +658,12 @@ class _Validator:
                 f"a comprehension target may not shadow {target.id!r}: {_source(node)}"
             )
         self.check(generator.iter, bound)
-        inner = bound | {target.id}
+        inner = {**bound, target.id: _element_kind(generator.iter, bound)}
         for condition in generator.ifs:
             self.check(condition, inner)
         self.check(node.elt, inner)
 
-    def _check_call(self, node: ast.Call, bound: frozenset[str]) -> None:
+    def _check_call(self, node: ast.Call, bound: dict[str, str]) -> None:
         if node.keywords:
             _reject("a keyword argument", node)
         for argument in node.args:
@@ -567,7 +685,19 @@ class _Validator:
                 raise InvalidExpressionError(
                     f"unknown method {func.attr!r} in: {_source(node)}"
                 )
-            self._check_arity(func.attr, _METHOD_ARITIES[func.attr], node)
+            receiver = _infer_kind(func.value, bound)
+            table = _METHODS.get(_RECEIVER_TYPES.get(receiver))
+            spec = table.get(func.attr) if table is not None else None
+            if spec is None and receiver != _UNKNOWN:
+                raise InvalidExpressionError(
+                    f"{func.attr}() is not a method of {receiver}: {_source(node)}"
+                )
+            arity = (
+                (spec.min_args, spec.max_args)
+                if spec is not None
+                else _METHOD_ARITIES[func.attr]
+            )
+            self._check_arity(func.attr, arity, node)
             self.check(func.value, bound)
         else:
             _reject(f"a call of {_label(func)}", node)
@@ -602,6 +732,15 @@ class _Interpreter:
 
     def evaluate(self, tree: ast.Expression) -> bool:
         return self._truth(self._eval(tree.body), tree.body)
+
+    def _charge(self, items: int = 1) -> None:
+        """Charge scanned or built elements to this branch's iteration budget."""
+        self._iterations += items
+        if self._iterations > MAX_COMPREHENSION_ITERATIONS:
+            raise ExpressionBudgetError(
+                f"expression is over the {MAX_COMPREHENSION_ITERATIONS}"
+                f" iteration budget"
+            )
 
     def _eval(self, node: ast.expr) -> object:
         if isinstance(node, ast.Constant):
@@ -735,7 +874,11 @@ class _Interpreter:
                 )
             return item in container
         if isinstance(container, _CONTAINER_TYPES):
-            return any(item == element for element in container)
+            for element in container:
+                self._charge()
+                if item == element:
+                    return True
+            return False
         raise ExpressionEvaluationError(
             f"{_source(container_node)} is not a string or list"
         )
@@ -758,7 +901,12 @@ class _Interpreter:
 
     def _argument(self, index: int, node: ast.Subscript) -> Param:
         params = self._params(node)
-        if not 0 <= index < len(params):
+        if index < 0:
+            raise ExpressionEvaluationError(
+                f"param is indexed from zero, so {index} is never an argument"
+                f" in: {_source(node)}"
+            )
+        if index >= len(params):
             raise UnavailableEvidenceError(
                 f"argument {index} is not available: this call site has"
                 f" {len(params)} recovered argument(s)",
@@ -808,7 +956,11 @@ class _Interpreter:
                 raise ExpressionEvaluationError(
                     f"any() expects a list: {_source(node)}"
                 )
-            return any(self._truth(value, node) for value in values)
+            for value in values:
+                self._charge()
+                if self._truth(value, node):
+                    return True
+            return False
         bounds = [
             self._index(value, argument)
             for value, argument in zip(arguments, node.args)
@@ -816,11 +968,7 @@ class _Interpreter:
         if len(bounds) == 3 and bounds[2] == 0:
             raise ExpressionEvaluationError("range() step must not be zero")
         span = range(*bounds)
-        if len(span) > MAX_COMPREHENSION_ITERATIONS:
-            raise ExpressionBudgetError(
-                f"range() would iterate {len(span)} items, over the"
-                f" {MAX_COMPREHENSION_ITERATIONS} iteration budget"
-            )
+        self._charge(len(span))
         return span
 
     def _comprehension(self, node: ast.ListComp) -> list[object]:
@@ -840,12 +988,7 @@ class _Interpreter:
         results: list[object] = []
         try:
             for item in iterable:
-                self._iterations += 1
-                if self._iterations > MAX_COMPREHENSION_ITERATIONS:
-                    raise ExpressionBudgetError(
-                        f"expression is over the {MAX_COMPREHENSION_ITERATIONS}"
-                        f" comprehension iteration budget"
-                    )
+                self._charge()
                 self._names[name] = item
                 if all(
                     self._truth(self._eval(condition), condition)

@@ -7,9 +7,11 @@ under the Apache-2.0 license shipped beside them as
 in the source tree).
 
 Every ``mark_if`` branch is preflighted through
-:func:`vulfi_mcp.ida_runtime.validate_expression`, so a rule is only ever
-accepted when all three of its expressions are interpretable. Nothing in this
-module imports IDA.
+:func:`vulfi_mcp.ida_runtime.validate_expression`, so a branch whose syntax,
+names, methods, call arities, receiver kinds or size fall outside the
+interpreted language is rejected before any binary or IDB is opened. Operand
+types that only exist at evaluation time are still reported per call site.
+Nothing in this module imports IDA.
 """
 
 from __future__ import annotations
