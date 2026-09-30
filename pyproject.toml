@@ -11,6 +11,9 @@ dependencies = [
     "idapro==0.0.10",
 ]
 
+[project.scripts]
+vulfi-mcp = "vulfi_mcp.server:main"
+
 [dependency-groups]
 dev = ["pytest>=8"]
 

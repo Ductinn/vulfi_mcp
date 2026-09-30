@@ -1,22 +1,62 @@
 # VulFi MCP
 
-A design-stage project for preparing binaries, running VulFi-style vulnerability rules through the official Hex-Rays IDA MCP or a configured Ghidra/radare2 MCP fallback, and triaging findings across backends.
+VulFi-style vulnerability-hunting rules for the official Hex-Rays IDA MCP server. Importing this package's entry point registers four VulFi tools on the server `ida-mcp` already owns, so one stdio connection serves the six stock IDA tools and the four VulFi tools from a single process. It is not a second MCP server and not a fork of the official one.
 
-**Status:** Architecture specification only. There is no runnable MCP server, scanner, extension, or packaged rule set in this repository yet. The tool contracts below describe planned behavior, not available commands.
+**Status: internal IDA-only milestone, not a release.** The tools below work end to end against real IDA; the preparation pass, the external Ghidra/radare2 providers, and reviewer-linked triage described in the design documents are **not implemented**, and the tools refuse the parameters that would need them instead of answering as if they existed.
 
-## Proposed architecture
+## What works today
 
-- A Python 3.11+ entry point extends the official `ida-mcp` registry without forking it; its six stock IDA tools remain available.
-- Preparation discovers candidate hidden strings/functions, recovers safe functions, and infers data structures and pointer tables **before** rule scans. It records evidence and gaps rather than claiming to find every hidden object.
-- IDA analysis uses headless `idalib` through `ida-nexus`. When IDA cannot decompile or open a target, vetted Ghidra/radare2 MCP adapters provide supported preparation and rule evidence. Unsupported rules are listed explicitly; no decompiler-text guess is counted as a structural match.
-- The 24 stock VulFi rules and agent-supplied rules use a restricted expression interpreter, not Python `eval` or `exec`. The existing agent may propose RE improvements, but an operator must review them before they change managed analysis artifacts.
-- IDA findings and assessments persist in a managed IDB netnode; fallback findings and preparation records persist in SQLite outside the repository. Reviewer-linked matching findings synchronize assessments with a durable, conflict-aware journal.
-- An optional OMP TypeScript extension presents preparation, per-backend triage, and human review without changing OMP's native todo list.
+- **`vulfi_rule_template`** — the rule schema, worked examples, the restricted expression language a `mark_if` branch may use, and its limits.
+- **`vulfi_scan`** — scans a binary or a saved `.i64`/`.idb`. The target is copied into a managed workspace and only the copy is ever analyzed or written; the supplied file is left untouched. Omitting `rules` runs the 24 stock VulFi rules in scope `default`; a nonempty list runs only those rules in scope `custom:<scan_name>`. Every rule is validated in full *before* any database is created, and expressions are interpreted from a restricted syntax tree — never with Python `eval` or `exec`. Each rule comes back `evaluated`, `unsupported`, or `failed` with a reason, so a rule whose facts IDA could not establish is never reported as a clean negative.
+- **`vulfi_findings`** — pages stored rows without rescanning, in one stable order across every scope of the IDA backend.
+- **`vulfi_triage`** — records one assessment (`Not Checked`, `False Positive`, `Suspicious`, `Vulnerable`) against a finding's exact id, with a nonempty rationale. A refused update writes nothing.
 
-The seven planned VulFi tools are `vulfi_rule_template`, `vulfi_prepare`, `vulfi_preparation`, `vulfi_propose_recovery`, `vulfi_scan`, `vulfi_findings`, and `vulfi_triage`. Local operator review/link commands are separate from agent-callable MCP tools.
+Findings and assessments live in the managed IDB's own netnode, so they survive closing and reopening the database and restarting the server. Rescanning a scope preserves earlier assessments by exact finding id.
 
-Read the [MCP, fallback, and data design](docs/superpowers/specs/2026-09-28-vulfi-ida-mcp-design.md) and the [RE preparation design](docs/superpowers/specs/2026-09-29-vulfi-re-preparation-design.md). Both describe proposed contracts and verification gates, not available commands. Implementation and installation instructions will follow when the software exists.
+## Not implemented in this milestone
+
+- **Preparation.** There is no hidden-string/function/structure recovery pass, so `vulfi_scan`'s `analysis_id` is refused: no revision exists to reuse.
+- **External backends.** `backend` accepts `ida` or `auto`; `ghidra` and `r2` are refused by name. No Ghidra or radare2 provider is built.
+- **Linked triage and the external catalog.** `binary_path` is refused on `vulfi_findings` and `vulfi_triage`. Every stored row reports `sync_state: "unlinked"`, and `target_total_complete` is `false` because the second store is absent — absent, not empty.
+
+## Requirements
+
+- Python >= 3.11.
+- IDA >= 9.4 with an activated `idalib` license. Analysis runs headless through `ida-nexus`; no IDA GUI session is attached and no database is opened in place.
+- Hex-Rays for rules that need argument recovery. Without a decompiler, scans still run against disassembly and report `partial` coverage with the affected rules `unsupported`.
+- `gcc` only to build the test fixtures.
+
+## Install and run
+
+```sh
+uv sync
+uv run --python 3.11 vulfi-mcp
+```
+
+`vulfi-mcp` speaks MCP over stdio and writes nothing else to stdout — stdout is the transport. Point an MCP client at it the way you would at any stdio server:
+
+```json
+{
+  "mcpServers": {
+    "vulfi": { "command": "vulfi-mcp", "args": [] }
+  }
+}
+```
+
+## Managed workspace
+
+Everything this server writes lives under one root: `$VULFI_MCP_DATA_DIR` when set, otherwise `$XDG_DATA_HOME/vulfi-mcp` (`~/.local/share/vulfi-mcp` by default). Managed databases are created under `databases/<name>-<hash>/`, one deterministic directory per target, and the same file at the same path always resolves to the same managed database instead of being analyzed again.
+
+## Tests
+
+```sh
+uv run --python 3.11 pytest -q
+```
+
+Tests that need IDA, or `gcc`, skip when the prerequisite is missing. Set `VULFI_REQUIRE_LIVE=1` to turn any such skip into a failure, which is how the live coverage is verified.
 
 ## Upstream projects
 
-This proposal builds on [Hex-Rays IDA MCP](https://github.com/HexRaysSA/ida-mcp), [IDA Nexus](https://github.com/HexRaysSA/ida-nexus), [Accenture VulFi](https://github.com/Accenture/VulFi), the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk), [radareorg radare2-mcp](https://github.com/radareorg/radare2-mcp), a [headless-capable Ghidra MCP candidate](https://github.com/bethington/ghidra-mcp), and [Oh My Pi](https://github.com/can1357/oh-my-pi). No upstream source code or rules are distributed in this design-stage repository. The official IDA MCP still requires an IDA installation; IDA's decompiler-dependent rules require an appropriate license, while fallback providers have their own prerequisites.
+Built on [Hex-Rays IDA MCP](https://github.com/HexRaysSA/ida-mcp), [IDA Nexus](https://github.com/HexRaysSA/ida-nexus), and [ida-domain](https://github.com/HexRaysSA/ida-domain). The 24 stock rules and the function-prototype table in `src/vulfi_mcp/data/` are derived from [Accenture VulFi](https://github.com/Accenture/VulFi) and are redistributed under its Apache-2.0 licence, a copy of which ships beside them and in `THIRD_PARTY_LICENSES/`. The rule evaluator is an independent implementation: it interprets a restricted syntax tree rather than executing rule expressions as Python.
+
+The full architecture, including the parts this milestone does not implement, is described in the [MCP, fallback, and data design](docs/superpowers/specs/2026-09-28-vulfi-ida-mcp-design.md) and the [RE preparation design](docs/superpowers/specs/2026-09-29-vulfi-re-preparation-design.md). Both describe proposed contracts, not available commands.
