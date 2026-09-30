@@ -12,7 +12,14 @@ import time
 from pathlib import Path
 
 import pytest
-from ida_nexus import DatabaseBusyError, DatabaseHandle, RemoteError
+from ida_nexus import (
+    DatabaseBusyError,
+    DatabaseHandle,
+    NexusConnectionError,
+    RemoteError,
+    find_database_owner,
+    probe_database_state,
+)
 
 from vulfi_mcp.ida_adapter import (
     RELEASE_TIMEOUT,
@@ -183,3 +190,40 @@ def test_a_read_only_operation_leaves_the_database_alone(
 
     assert first["function_count"] == second["function_count"]
     assert _digest(managed) == before
+
+
+def test_a_failed_shutdown_still_closes_the_lease(
+    compiled_calls: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The discarding shutdown is a fallible RPC (transport error, its own
+    # timeout, a dead worker, a 409 from a sibling). If it could skip the
+    # close, the lease would never be released and its worker would hold the
+    # managed .i64 for the rest of this process's life, wedging every later
+    # open of that database. The error is injected at the handle boundary
+    # because what is under test is this module's ordering, not IDA.
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+
+    def boom(self: DatabaseHandle, *, save: bool = True) -> None:
+        raise NexusConnectionError("injected shutdown failure")
+
+    monkeypatch.setattr(DatabaseHandle, "shutdown_database", boom)
+    with pytest.raises(NexusConnectionError):
+        invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
+    monkeypatch.undo()
+
+    # The lease skips its release wait when the shutdown failed, so this test
+    # does the waiting instead: the registry entry is gone and the worker has
+    # repacked the database it held, which is what "closed" has to mean here.
+    deadline = time.monotonic() + RELEASE_TIMEOUT
+    while find_database_owner(str(managed)) is not None:
+        assert time.monotonic() < deadline, "the lease outlived the failed shutdown"
+        time.sleep(0.05)
+    while probe_database_state(managed)["state"] != "packed":
+        assert time.monotonic() < deadline, "the worker never released the database"
+        time.sleep(0.05)
+
+    # The two entry points the wedged worker used to break: the release gate
+    # ensure_managed_idb applies to a supplied IDB, and a later lease.
+    clone = ensure_managed_idb(str(managed))
+    assert Path(clone).is_file()
+    assert invoke_ida(str(managed), SUMMARY, {"name_limit": 5})["function_count"] > 0

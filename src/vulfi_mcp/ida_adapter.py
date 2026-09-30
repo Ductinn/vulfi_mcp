@@ -602,6 +602,14 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
     would stall until that session ended and then fail an operation that has
     already completed.
 
+    The discarding shutdown is a fallible RPC — a transport error, its own
+    five-second timeout, a worker that died, or a 409 from a sibling — so it is
+    nested in its own ``try``: the close is the one step that must happen
+    whatever else does, because ``DatabaseHandle`` has no finalizer and a lease
+    left open keeps the worker process alive on the managed ``.i64`` for the
+    rest of this process's life, wedging every later open of that database. The
+    error still reaches the outer handler, so the release wait is still skipped.
+
     A failure while closing is only reported when the work itself succeeded, so
     it can never mask the real error.
     """
@@ -623,9 +631,11 @@ def _lease(target: Path, options: DatabaseOpenOptions) -> Iterator[DatabaseHandl
         raise
     finally:
         try:
-            if not failed and ours:
-                handle.shutdown_database(save=False)
-            handle.close(wait_for_database=True)
+            try:
+                if not failed and ours:
+                    handle.shutdown_database(save=False)
+            finally:
+                handle.close(wait_for_database=True)
             if not failed and ours:
                 _await_released(instance)
         except Exception:
