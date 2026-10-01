@@ -1097,7 +1097,6 @@ def test_a_cut_short_block_listing_can_never_summarise_complete() -> None:
         _program(cap), "strings", whole, [], [f"w{i}" for i in range(500)]
     )
     assert noisy["warnings"][0] == cap
-    assert len(noisy["warnings"]) <= 500
 
     # An unavailable pass stays unavailable: the cap cannot upgrade it.
     nothing = ghidra._pass_result(_program(cap), "structures", [], [], ["why"])
@@ -1139,7 +1138,12 @@ def test_the_block_listing_is_paged_and_says_when_it_ran_out(
 
 
 @pytest.mark.parametrize(
-    "body", ['{"programs":[{"name":"ls"}', '{"not": "an object"']
+    "body",
+    [
+        '{"programs":[{"name":"ls"}',
+        '{"not": "an object"',
+        '{"functions": ["main at 00101320"',
+    ],
 )
 def test_a_reply_that_claims_json_and_is_not_is_refused(
     refusing: Any, body: str

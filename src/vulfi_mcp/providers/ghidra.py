@@ -624,9 +624,16 @@ async def _call(session: ProviderSession, tool: str, **arguments: Any) -> str:
     out from under us" becomes "we looked and there was nothing", which is the
     one inversion this adapter exists to prevent.
 
-    The invariant is flat and lives here rather than in each parser: *a read
-    that did not succeed never becomes an empty collection.* ``_call_json``
-    only has to parse what this already accepted.
+    What this enforces, stated exactly: *a reply that announces itself as JSON
+    and either fails to be an object or carries an ``error`` / ``success:
+    false`` is a failure here, not rows downstream.* That covers every shape
+    this server and this bridge can actually produce — `Response.err`, the
+    headless catch-all at HTTP 200, and a read cut short mid-object.
+    It does **not** cover a failure spelled as prose, wrapped in ``<log>``,
+    served as an HTML error page, or nested under ``{"result": {"error": …}}``:
+    none of those is reachable through today's provider, and each would still
+    reach a line parser and come back empty. The guarantee is one place rather
+    than one per parser, and it is this one and no wider.
     """
     pinned = PINNED_SCHEMAS.get(tool)
     if not pinned:
@@ -656,10 +663,10 @@ def _refuse_failures(tool: str, text: str) -> None:
     """Raise when ``text`` is this provider's way of spelling a failure.
 
     A body that opens with ``{`` is this provider claiming to answer in JSON.
-    If it then does not parse as an object, the reply was cut short or is not
-    what it says it is — and handing that to a line parser is the empty
-    collection this boundary exists to refuse, so it is refused here rather
-    than read as nothing.
+    If it then does not parse, the reply was cut short — and handing that to a
+    line parser is the empty collection this boundary exists to refuse, so it
+    is refused here rather than read as nothing. A failure spelled any other
+    way is not caught here; see :func:`_call`.
     """
     stripped = text.lstrip()
     if not stripped.startswith("{"):
@@ -671,11 +678,8 @@ def _refuse_failures(tool: str, text: str) -> None:
             f"the ghidra provider's {tool!r} reply begins as a JSON object and"
             f" does not parse as one: {stripped[:200]!r}"
         ) from None
-    if not isinstance(document, dict):
-        raise ProviderUnavailableError(
-            f"the ghidra provider's {tool!r} reply begins as a JSON object and"
-            f" is a {type(document).__name__}"
-        )
+    # No `isinstance(document, dict)` branch: `json.loads` on text whose
+    # `lstrip()` begins with `{` either returns a dict or raises above.
     failure = document.get("error")
     if failure is None and document.get("success") is not False:
         return
@@ -713,6 +717,12 @@ async def _call_json(
 #: report a failure this adapter has already refused to treat as a result —
 #: whether the provider is busy (skip) or broken (fail). Whether a foreign
 #: program is loaded is asked of :func:`_open_state`, not of prose.
+#:
+#: Two members of the "no program" family are excluded by name, because they
+#: are not contention at all: ``project has no program files`` is this
+#: provider saying a program is not in a project *yet*, the ordinary first-run
+#: branch, and ``No program specified`` is a missing argument — a bug to fix,
+#: not a provider to wait for. Both raise rather than skip.
 _CONTENTION: Final = re.compile(
     # "no program(s)" — but not "the project has no program files", which is
     # this provider's way of saying a program is not in a project yet, and is
