@@ -53,7 +53,6 @@ import json
 import os
 import re
 import threading
-import warnings
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -713,12 +712,22 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
             "its input schema declares no properties table, so nothing says"
             " which arguments it accepts"
         )
-    validator = _validator_for(schema, default=jsonschema.validators._LATEST_VERSION)
     try:
+        validator = _validator_for(
+            schema, default=jsonschema.validators._LATEST_VERSION
+        )
         validator.check_schema(schema)
     except Exception as error:  # noqa: BLE001 - any refusal is a refusal
         return _quote(f"its input schema is not a valid JSON Schema ({error})")
     return None
+
+
+class _UnusableDialect(Exception):
+    """A ``$schema`` that is not a dialect name. Never leaves this module."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -743,13 +752,25 @@ def _validator_for(schema: object, default: type[Any]) -> type[Any]:
     the validator evaluated in full. There is no second normalisation here to
     drift, because there is no second normalisation.
 
-    The library warns about a ``$schema`` it does not know and then falls back,
-    which is a decision this module must mirror, not second-guess: the warning
-    is silenced so the mirroring is deterministic.
+    The one thing checked before handing the schema over is that a declared
+    ``$schema`` is a string. The library assumes it is one and reaches for
+    ``.decode`` or hashes it, so a provider-supplied ``7`` or ``[]`` comes back
+    as ``AttributeError``/``TypeError`` — a raw builtin exception out of
+    :func:`provider_session`, past every ``except ProviderError`` an adapter
+    writes, because :func:`_pin` runs outside the guarded block. It fails
+    closed, but "fails closed" is not the contract; the contract is that every
+    provider defect arrives as a :class:`ProviderError` naming what was wrong.
+    The guard lives here, not at the three call sites, because they all share
+    this helper.
     """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return jsonschema.validators.validator_for(schema, default=default)
+    if isinstance(schema, Mapping):
+        declared = schema.get("$schema", "")
+        if not isinstance(declared, str):
+            raise _UnusableDialect(
+                f"it declares a {type(declared).__name__} $schema, which names"
+                " no dialect at all"
+            )
+    return jsonschema.validators.validator_for(schema, default=default)
 
 
 def _inspect_schema(schema: Mapping[str, Any]) -> _Finding:
@@ -773,6 +794,13 @@ def _inspect_schema(schema: Mapping[str, Any]) -> _Finding:
     surface being given up is empty, while the surface being closed is every
     dialect switch anyone thinks of next.
     """
+    try:
+        return _walk_schema(schema)
+    except _UnusableDialect as error:
+        return _Finding([], [], f"its input schema: {error.reason}")
+
+
+def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
     refused: set[str] = set()
     unclassified: set[str] = set()
     root = _validator_for(schema, default=jsonschema.validators._LATEST_VERSION)

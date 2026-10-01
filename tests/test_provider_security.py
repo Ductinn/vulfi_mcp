@@ -1012,8 +1012,15 @@ def test_every_dialect_the_selector_can_choose_is_classified() -> None:
             # A surplus entry is legitimate only when another keyword's
             # implementation descends into it — `if_` evaluates `then`/`else`
             # itself — and only while that keyword is in this dialect.
-            reached_by, _ = client._COMPANION_KINDS[keyword]
-            assert reached_by in validator.VALIDATORS, (validator.__name__, keyword)
+            companion = client._COMPANION_KINDS.get(keyword)
+            assert companion is not None, (
+                f"{validator.__name__} classifies {keyword!r}, which it does not"
+                " evaluate and no other keyword reaches"
+            )
+            assert companion[0] in validator.VALIDATORS, (
+                f"{validator.__name__} classifies {keyword!r}, reached only by"
+                f" {companion[0]!r}, which this dialect does not have"
+            )
 
     # The pair, not the name: the same keyword, classified differently.
     assert client.DIALECTS["Draft3Validator"].kinds["type"] == "schema"
@@ -1223,6 +1230,59 @@ def test_the_schema_deadline_is_its_own_bound_with_a_floor(
         ].limits.schema_deadline_seconds
         == MIN_SCHEMA_DEADLINE_SECONDS
     )
+
+
+def test_a_nested_value_that_is_not_a_dialect_name_stays_a_provider_error(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """Driven through the real session, because escaping it is the defect.
+
+    `validator_for` assumes `$schema` is a string and reaches for `.decode`, so
+    a provider-supplied `7` came back as a raw `AttributeError` — and `_pin`
+    runs *outside* `provider_session`'s guarded block, so it escaped the context
+    manager entirely, past every `except ProviderError` an adapter writes. It
+    failed closed, which is not the contract: the contract is that a provider
+    defect arrives as a `ProviderError` naming what was wrong.
+    """
+    config = configure(
+        _config_text(
+            variant="nested_dialect",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> str:
+        # The session itself must open: one unusable tool is one unusable
+        # capability, not a dead provider.
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            answered = await checked_call(
+                session,
+                "alpha_facts",
+                {"function": "copy"},
+                session.fingerprint("alpha_facts"),
+            )
+            assert answered["structured"]["params"][0]["constant"] is True
+            with pytest.raises(ProviderError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            assert isinstance(refused.value, CapabilityUnavailableError)
+            return str(refused.value)
+
+    reason = _run(exercise())
+    assert "int $schema" in reason
+    assert "names no dialect at all" in reason
 
 
 def test_a_vendor_annotation_is_not_mistaken_for_a_subschema(
@@ -1703,6 +1763,13 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
             "properties": {"address": {"type": "string"}, "mode": {"type": "string"}},
             "required": ["address"],
             "dependencies": {"mode": ["address"]},
+        }
+    if variant == "nested_dialect":
+        # 72 bytes. The nested value is not a dialect name at all, and the
+        # library reaches for `.decode` on it.
+        beta_schema = {
+            "type": "object",
+            "properties": {"address": {"$schema": 7, "type": "string"}},
         }
     if variant == "annotated":
         # A vendor annotation, not a subschema: nothing here is a keyword.
