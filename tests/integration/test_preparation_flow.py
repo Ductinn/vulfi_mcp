@@ -1,6 +1,6 @@
 """The public preparation tools, and the scan that prepares before it reads.
 
-Four behaviours are pinned here, each against a real compiled ELF and a real
+Five behaviours are pinned here, each against a real compiled ELF and a real
 managed IDA database.
 
 **Preparation changes what a scan can see.** The fixture below hides a
@@ -26,6 +26,12 @@ catalog on disk afterwards.
 complete leaves the earlier recorded passes exactly as they were, claims no
 new coverage, and fails the scan that needed it rather than returning a clean
 one.
+
+**A shorter run never replaces a longer one.** A pass re-run under a budget
+it cannot finish comes back ``partial`` with the addresses it never reached
+named — this design's ordinary cancellation. The complete result an earlier
+run recorded keeps its place, keeps its candidates, and is what a later
+request reuses.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ import pytest
 from conftest import missing_prerequisite, names_the_rollback
 from vulfi_mcp.catalog import CATALOG_NAME, CATALOG_UNAVAILABLE_REASON
 from vulfi_mcp.ida_adapter import ManagedDatabaseError, ensure_managed_idb, scan_ida
+from vulfi_mcp.prepare import run_ida_passes
 from vulfi_mcp.rules import validate_rules
 from vulfi_mcp.server import vulfi_prepare, vulfi_preparation, vulfi_scan
 
@@ -420,3 +427,92 @@ def _failed_save_claims_nothing(binary: Path) -> None:
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr("vulfi_mcp.ida_adapter._save_session", _refuse_to_save)
         _refused(lambda: vulfi_scan(target, rules=[COPY_RULE], scan_name=SCAN_NAME))
+
+
+#: One byte of reading, which is less than the first range of any image
+#: costs. Budget exhaustion is this design's cancellation: the run returns,
+#: reports `partial`, and names the addresses it never reached. The ceiling
+#: is this absurd on purpose — a ceiling chosen to be "small" would be a
+#: ceiling whose effect depends on how big the fixture happens to compile.
+TIGHT_BUDGET: dict[str, int] = {"bytes": 1}
+
+
+def _pass_entry(result: dict[str, Any], name: str) -> dict[str, Any]:
+    """The one record this result carries for ``name``."""
+    matches = [row for row in result["passes"] if row["pass"] == name]
+    assert len(matches) == 1, result["passes"]
+    return matches[0]
+
+
+def test_a_shortened_rerun_keeps_the_longer_result(
+    compiled_flow: Path,
+    managed_data_dir: Path,
+    durable_or_reported: Tolerance,
+) -> None:
+    with durable_or_reported() as produced, _rollback_survives_the_tool_wrapper():
+        try:
+            _shortened_rerun_keeps_what_it_could_not_beat(compiled_flow)
+        finally:
+            produced.extend(str(path) for path in _managed_databases(managed_data_dir))
+
+
+def _shortened_rerun_keeps_what_it_could_not_beat(binary: Path) -> None:
+    target = str(binary)
+
+    whole = vulfi_prepare(target, passes=["functions"])
+    complete = _pass_entry(whole, "functions")
+    assert complete["coverage"] == "complete", complete
+    assert complete["candidate_ids"], "the fixture must give `functions` work to do"
+    recovered = _hidden_candidate(whole)
+    assert recovered["state"] == "applied", recovered["reason"]
+    assert recovered["candidate_id"] in complete["candidate_ids"]
+
+    # The second request asks for one pass more, so there is nothing to reuse
+    # and `functions` runs again — this time under a budget it cannot finish.
+    ran: list[dict[str, Any]] = []
+
+    def _on_a_tight_budget(idb_path: str, passes: tuple[str, ...]) -> dict[str, Any]:
+        result = run_ida_passes(idb_path, passes, limits=TIGHT_BUDGET)
+        ran.append(result)
+        return result
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr("vulfi_mcp.prepare.run_ida_passes", _on_a_tight_budget)
+        shortened = vulfi_prepare(target, passes=["functions", "strings"])
+
+    # The re-run really was cut short, and really did cover less: without that
+    # the rest of this test would pass against anything.
+    assert len(ran) == 1, "the wider request had nothing to reuse and must re-run"
+    cut = _pass_entry(ran[0], "functions")
+    assert cut["coverage"] == "partial", cut
+    assert [span for row in cut["ranges"] for span in row["unvisited"]], cut["ranges"]
+    assert set(cut["candidate_ids"]) <= set(complete["candidate_ids"]), cut
+    assert cut["candidate_ids"] != complete["candidate_ids"], (
+        "recording this result would really have dropped candidates"
+    )
+
+    # And it was not written down: the stored record is still the complete
+    # one, with the candidates only it describes, and the skip is reported.
+    kept = _pass_entry(shortened, "functions")
+    assert kept["coverage"] == "complete", kept
+    assert kept["ranges"] == complete["ranges"]
+    assert kept["candidate_ids"] == complete["candidate_ids"]
+    assert recovered["candidate_id"] in kept["candidate_ids"]
+    assert any("kept rather than replaced" in said for said in shortened["warnings"]), (
+        shortened["warnings"]
+    )
+
+    # The catalog agrees, read back without running anything.
+    page = vulfi_preparation(target)
+    assert page["available"] is True, page["reason"]
+    assert page["analysis_id"] == whole["analysis_id"]
+    assert _pass_entry(page, "functions") == kept
+
+    # And the revision a later request reuses is the complete one, not the
+    # degraded one the shortened run would have left behind.
+    again = vulfi_prepare(target, passes=["functions"])
+    assert again["reused"] is True
+    assert again["analysis_id"] == whole["analysis_id"]
+    assert _pass_entry(again, "functions") == kept
+    assert set(whole["applied_ids"]) <= set(again["applied_ids"])
+    assert again["candidate_total"] >= whole["candidate_total"]

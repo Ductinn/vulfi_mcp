@@ -25,7 +25,7 @@ of what it stored: candidates carry the bytes or the instructions they were
 recovered from, and a pass that was cut short names the addresses it never
 reached.
 
-Four rules shape the orchestration on top of that.
+Five rules shape the orchestration on top of that.
 
 **Only two entry points may create a managed database.** ``vulfi_scan`` and
 ``vulfi_prepare``. :func:`preparation_page` is a read: it resolves the
@@ -39,6 +39,14 @@ answer "nothing was found" where the truth is "nothing has prepared this".
 Source identity, managed artifact, backend capability fingerprint and the
 requested pass coverage. Anything less re-runs preparation; a weaker result
 is never substituted for the one that was asked for.
+
+**A shorter run never replaces a longer one.** A pass is recorded unless the
+result an earlier run stored for the same revision read every address this
+one read and more besides, measured from the ranges rather than from how the
+run ended: the cancellation this design produces is an exhausted budget,
+which reports *partial* and names what it never reached. The skip is said out
+loud as a warning, and the coverage the managed record carries is read back
+from the catalog afterwards, so what a later reuse sees is what is stored.
 
 **The database carries a summary, the catalog carries the evidence.** The
 managed record holds the analysis id, the artifact revision, one coverage
@@ -1039,6 +1047,11 @@ def _record(
         # against is the stored row, so that is what this reports.
         revision = int(str(stored["revision"]))
         kept = _record_passes(catalog, analysis_id, result)
+        # Read back after recording, for the same reason: a pass this run did
+        # not beat kept its earlier result, and the summary the managed record
+        # carries — the one that decides a later reuse — has to name the
+        # coverage the catalog really holds rather than the one this run
+        # produced and did not store.
         recorded = catalog.pass_results(analysis_id)
         coverage = {str(entry["pass"]): str(entry["coverage"]) for entry in recorded}
         catalog_key = catalog.target_key
@@ -1077,12 +1090,19 @@ def _record_passes(
     the catalog replaces: re-running ``strings`` must not retire what
     ``functions`` found.
 
-    A pass that could not read its ranges at all and applied nothing does not
-    overwrite a ``complete`` result an earlier run recorded for the same
-    revision. A run that is cut short is not evidence that the thing an
-    earlier run saw has gone away, and replacing the stronger record with the
-    weaker one would lose the only description of it that exists. The skip is
-    returned as a warning rather than performed silently.
+    A pass is stored unless the result an earlier run recorded for this same
+    revision covered strictly more — read every address this run read, and
+    some this run never reached. A run that is cut short is not evidence that
+    the thing an earlier run saw has gone away, and replacing the stronger
+    record with the weaker one would delete the candidates that are the only
+    description of it. The skip is returned as a warning rather than
+    performed silently.
+
+    What is compared is what each run really covered, not how it ended. The
+    cancellation this design actually produces is an exhausted budget, which
+    reports ``partial`` and names the addresses it never reached; a rule
+    phrased on a pass that failed outright would never fire on that, which is
+    the ordinary case rather than the exotic one.
     """
     candidates = _candidates_by_id(result)
     # The caller recorded the analysis row just now, so these are the passes
@@ -1092,20 +1112,145 @@ def _record_passes(
     for entry in _entries(result.get("passes")):
         name = str(entry.get("pass"))
         previous = held.get(name)
-        if (
-            previous is not None
-            and previous["coverage"] == "complete"
-            and entry.get("coverage") == "unavailable"
-            and not entry.get("applied_ids")
-        ):
-            kept.append(
-                f"this run could not read any range of the {name!r} pass and"
-                " applied nothing, so the complete result an earlier run"
-                " recorded for this revision is kept rather than replaced"
-            )
+        if previous is not None and _covers_more(previous, entry):
+            kept.append(_kept_reason(name, previous, entry))
             continue
         catalog.record_pass(analysis_id, _pass_payload(entry, candidates))
     return kept
+
+
+#: How much of its ranges one recorded pass claims, weakest first. Only ever
+#: consulted to separate two records that read exactly the same addresses.
+_COVERAGE_RANK: Final[dict[str, int]] = {
+    "unavailable": 0,
+    "partial": 1,
+    "complete": 2,
+}
+
+
+def _covers_more(stored: dict[str, Any], fresh: dict[str, Any]) -> bool:
+    """``stored`` read every address ``fresh`` read, and more besides.
+
+    Measured from the ranges, because the coverage word cannot separate a
+    ``partial`` that stopped one segment short from a ``partial`` that
+    stopped in the first kilobyte, and both are what an exhausted budget
+    produces. The word is still the tie-break for the pass whose ranges carry
+    no addresses at all, where there is nothing to measure.
+
+    A run that applied a change the stored record does not name is always
+    stored, whatever it covered: the catalog's rows are what says which
+    changes the managed artifact now carries, and dropping that result would
+    leave a change in the artifact that nothing describes.
+    """
+    held = _visited(stored)
+    now = _visited(fresh)
+    if not _within(now, held):
+        return False
+    if not set(_strings(fresh.get("applied_ids"))) <= set(
+        _strings(stored.get("applied_ids"))
+    ):
+        return False
+    if _extent(held) > _extent(now):
+        return True
+    # Containment made the extents equal, so the two read the same addresses.
+    return _rank(stored) > _rank(fresh)
+
+
+def _kept_reason(name: str, stored: dict[str, Any], fresh: dict[str, Any]) -> str:
+    """Why this run's pass was not written down, in what it covered."""
+    return (
+        f"this run's {name!r} pass read {_extent(_visited(fresh))} bytes of the"
+        f" {_extent(_visited(stored))} the {stored.get('coverage')} result"
+        " an earlier run recorded for this revision had already read, so that"
+        " result and its candidates are kept rather than replaced by this"
+        " shorter one"
+    )
+
+
+def _rank(entry: dict[str, Any]) -> int:
+    return _COVERAGE_RANK.get(str(entry.get("coverage")), 0)
+
+
+def _visited(entry: dict[str, Any]) -> list[tuple[int, int]]:
+    """The addresses one recorded pass really read, as merged intervals.
+
+    A range is what the pass was given, ``unvisited`` is what it never got
+    to, and a range it could not read at all contributes nothing.
+    """
+    spans: list[tuple[int, int]] = []
+    for item in _entries(entry.get("ranges")):
+        bounds = _span(item)
+        if bounds is None or item.get("coverage") == "unavailable":
+            continue
+        spans.extend(_without(bounds, _entries(item.get("unvisited"))))
+    return _merged(spans)
+
+
+def _span(item: dict[str, Any]) -> tuple[int, int] | None:
+    """One ``[start, end)`` an entry describes, or ``None`` if it describes none."""
+    start = item.get("start")
+    end = item.get("end")
+    if isinstance(start, bool) or isinstance(end, bool):
+        return None
+    if not isinstance(start, int) or not isinstance(end, int) or end <= start:
+        return None
+    return start, end
+
+
+def _without(
+    bounds: tuple[int, int], holes: list[dict[str, Any]]
+) -> list[tuple[int, int]]:
+    """``bounds`` with every hole cut out of what is left of it."""
+    spans = [bounds]
+    for hole in holes:
+        cut = _span(hole)
+        if cut is None:
+            continue
+        spans = [piece for span in spans for piece in _cut(span, cut)]
+    return spans
+
+
+def _cut(span: tuple[int, int], hole: tuple[int, int]) -> list[tuple[int, int]]:
+    start, end = span
+    low, high = hole
+    if high <= start or low >= end:
+        return [span]
+    pieces: list[tuple[int, int]] = []
+    if low > start:
+        pieces.append((start, low))
+    if high < end:
+        pieces.append((high, end))
+    return pieces
+
+
+def _merged(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The same addresses, as the fewest non-touching intervals that hold them."""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            low, high = merged[-1]
+            merged[-1] = (low, max(high, end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def _within(
+    spans: list[tuple[int, int]], outer: list[tuple[int, int]]
+) -> bool:
+    """Every address of ``spans`` is an address of ``outer``.
+
+    Both sides are merged, so each span has to fit inside one interval of
+    ``outer`` rather than being spread across two that touch.
+    """
+    return all(
+        any(low <= start and end <= high for low, high in outer)
+        for start, end in spans
+    )
+
+
+def _extent(spans: list[tuple[int, int]]) -> int:
+    return sum(end - start for start, end in spans)
 
 
 def _pass_payload(
