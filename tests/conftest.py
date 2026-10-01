@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from functools import lru_cache
 from importlib.util import find_spec
 from pathlib import Path
+from typing import Final
+from urllib.parse import urlsplit
 
 import pytest
 from ida_nexus import WorkerStartError, probe_database_state
@@ -44,14 +47,27 @@ def pytest_configure(config: pytest.Config) -> None:
         "requires_ida: needs a licensed local IDA installation; skipped without"
         f" one unless {REQUIRE_LIVE_ENV}=1 is set",
     )
+    config.addinivalue_line(
+        "markers",
+        "requires_ghidra: needs a running GhidraMCP headless server and its"
+        f" bridge; skipped without one unless {REQUIRE_LIVE_ENV}=1 is set",
+    )
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
-    if item.get_closest_marker("requires_ida") is None:
-        return
-    reason = _missing_ida_prerequisite()
-    if reason is not None:
-        missing_prerequisite(reason)
+    # This hook only fires from a conftest or a plugin, which is why both live
+    # gates live here rather than beside the tests they guard: a
+    # ``pytest_runtest_setup`` defined in a test module is simply never called,
+    # and the gate it holds never runs.
+    for marker, probe in (
+        ("requires_ida", _missing_ida_prerequisite),
+        ("requires_ghidra", _missing_ghidra_prerequisite),
+    ):
+        if item.get_closest_marker(marker) is None:
+            continue
+        reason = probe()
+        if reason is not None:
+            missing_prerequisite(reason)
 
 
 def missing_prerequisite(reason: str) -> None:
@@ -89,6 +105,61 @@ def _ida_install_dir() -> Path | None:
         return None
     directory = paths.get("ida-install-dir") if isinstance(paths, dict) else None
     return Path(directory).expanduser() if isinstance(directory, str) else None
+
+
+#: Where the GhidraMCP bridge executable is, when the operator did not say.
+GHIDRA_BRIDGE_ENV: Final = "VULFI_GHIDRA_BRIDGE"
+DEFAULT_GHIDRA_BRIDGE: Final = "/tmp/vulfi-ghidra/bridge-venv/bin/bridge-mcp-ghidra"
+
+#: Where the GhidraMCP headless server listens, when the operator did not say.
+GHIDRA_URL_ENV: Final = "VULFI_GHIDRA_MCP_URL"
+DEFAULT_GHIDRA_URL: Final = "http://127.0.0.1:8192"
+
+#: How to start that server, named in the skip reason so a missing
+#: prerequisite is actionable rather than merely reported.
+GHIDRA_START_HINT: Final = (
+    "start it with /tmp/vulfi-ghidra/bin/start-headless.sh (see"
+    " .superpowers/sdd/2026-09-29-vulfi-mcp-fallback/task-2-report.md)"
+)
+
+
+def ghidra_bridge() -> str:
+    return os.environ.get(GHIDRA_BRIDGE_ENV) or DEFAULT_GHIDRA_BRIDGE
+
+
+def ghidra_url() -> str:
+    return os.environ.get(GHIDRA_URL_ENV) or DEFAULT_GHIDRA_URL
+
+
+def _missing_ghidra_prerequisite() -> str | None:
+    """Return why the live Ghidra provider cannot run here, or ``None``.
+
+    Not cached, unlike the IDA probe: an installation either is or is not
+    there, but a server is a process that can go away between two tests, and a
+    cached "it was up once" is how a dead provider turns into four failures
+    instead of one honest skip.
+    """
+    if shutil.which("gcc") is None:
+        return "gcc is not installed, so vulfi_fallback.c cannot be built"
+    bridge = Path(ghidra_bridge())
+    if not bridge.is_file() or not os.access(bridge, os.X_OK):
+        return (
+            f"the GhidraMCP bridge is not at {bridge}; set"
+            f" {GHIDRA_BRIDGE_ENV} to the executable built by"
+            " `uv pip install <ghidra-mcp checkout>`"
+        )
+    split = urlsplit(ghidra_url())
+    host, port = split.hostname or "127.0.0.1", split.port or 80
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            pass
+    except OSError as refused:
+        return (
+            f"no GhidraMCP headless server is listening on {host}:{port}"
+            f" ({refused}); {GHIDRA_START_HINT}"
+        )
+    return None
+
 
 
 @pytest.fixture

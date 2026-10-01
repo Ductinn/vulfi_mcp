@@ -109,6 +109,7 @@ __all__ = [
     "GhidraUnavailableError",
     "PINNED_SCHEMAS",
     "PreparedPass",
+    "ProviderBusyError",
     "apply_ghidra_review",
     "evidence_ghidra",
     "prepare_ghidra",
@@ -124,7 +125,7 @@ BACKEND: Final = "ghidra"
 #: script, a command or a Ghidra analyzer-script is here, and the
 #: raw-execution names are refused by the client regardless.
 #:
-#: Three tools the plan named are deliberately absent, each for a measured
+#: Four tools the plan named are deliberately absent, each for a measured
 #: reason. ``import_file`` needs the GUI plugin and the headless server
 #: refuses it (``load_program`` is the headless import, and is here).
 #: ``analyze_dataflow`` anchors on a *named* variable, and the varnodes that
@@ -132,7 +133,10 @@ BACKEND: Final = "ghidra"
 #: immediate — have no name to anchor on, so it cannot corroborate the fact
 #: that matters. ``get_metadata`` answers in plain text with exactly what
 #: ``list_open_programs`` already answers as JSON, so allowlisting it would
-#: widen the surface in exchange for a more fragile parse.
+#: widen the surface in exchange for a more fragile parse. ``add_struct_field``
+#: adds one field at a time to a type that already exists, and the only layout
+#: this adapter ever writes is a whole approved one through ``create_struct``;
+#: an allowlisted tool nothing calls is surface for nothing.
 ALLOWLIST: Final[frozenset[str]] = frozenset(
     {
         # project and program lifecycle: the managed project has to survive
@@ -159,7 +163,6 @@ ALLOWLIST: Final[frozenset[str]] = frozenset(
         # the only writes, each one checked here before it is sent
         "create_function",
         "create_struct",
-        "add_struct_field",
     }
 )
 
@@ -178,9 +181,6 @@ ALLOWLIST: Final[frozenset[str]] = frozenset(
 #: 1.30.0), reached from *this* project's pinned ``mcp==2.2.0`` client at
 #: protocol 2025-11-25.
 PINNED_SCHEMAS: Final[dict[str, str]] = {
-    "add_struct_field": (
-        "58b8a9639af451982eb1d8aab8f4ce93e9bdf94c7d4adaf1831e14525f0ad5a2"
-    ),
     "analysis_status": (
         "c897bebdd1513dd28ecb0fbcbb162006a1031e05298958368763d84242a6b24d"
     ),
@@ -261,6 +261,10 @@ MAX_PASS_CANDIDATES: Final = 256
 MAX_STRING_PAGES: Final = 64
 #: Rows one ``list_strings`` page asks for.
 STRING_PAGE: Final = 200
+#: Pages of ``get_xrefs_to`` one lookup reads.
+MAX_XREF_PAGES: Final = 16
+#: Rows one ``get_xrefs_to`` page asks for.
+XREF_PAGE: Final = 200
 #: Call sites one rule's evidence covers.
 MAX_RULE_CALL_SITES: Final = 128
 #: Steps taken while deciding what defines one varnode.
@@ -334,6 +338,18 @@ class GhidraUnavailableError(ProviderError):
     finish is a result with coverage on it, while this is "there is no
     provider to ask", which the routing layer reports as unavailable rather
     than as a clean zero.
+    """
+
+
+class ProviderBusyError(GhidraUnavailableError):
+    """Something else is driving this provider, and it is a shared process.
+
+    GhidraMCP is one JVM with one *current* program. Another client that has
+    loaded a different binary, or an analysis still running in it, makes this
+    target unanalysable right now — which is unavailability, not a result. It
+    is a subclass of :class:`GhidraUnavailableError` so every caller that
+    already re-raises unavailability re-raises this too, instead of writing it
+    down as a rule that failed.
     """
 
 
@@ -470,7 +486,7 @@ async def apply_ghidra_review(
                     " evidence it would be applied to; nothing was applied"
                 )
                 return report
-            await _apply(session, body, report)
+            await _apply(session, program, body, report)
             if not report["mutated"]:
                 return report
             saved, save_reason = await _save(session)
@@ -625,10 +641,32 @@ async def _call_json(
         )
     failure = document.get("error")
     if failure is not None or document.get("success") is False:
-        raise ProviderUnavailableError(
-            f"the ghidra provider refused {tool!r}: {failure or document}"
-        )
+        described = f"the ghidra provider refused {tool!r}: {failure or document}"
+        if _is_contention(str(failure or document)):
+            raise ProviderBusyError(described)
+        raise ProviderUnavailableError(described)
     return document
+
+
+#: What this provider says when something else is using it. Matched as prose
+#: on purpose, and only ever to decide *whether this adapter may proceed* —
+#: never to establish a fact. The difference matters: a shared JVM whose
+#: current program moved under us has to be reported as unavailable rather
+#: than written down as a rule that failed or a pass that found nothing.
+_CONTENTION: Final[tuple[str, ...]] = (
+    "no program loaded",
+    "no program is loaded",
+    "timed out",
+    "file is closed",
+    "closedexception",
+    "is being analyzed",
+    "another analysis",
+)
+
+
+def _is_contention(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _CONTENTION)
 
 
 # --------------------------------------------------------------------------
@@ -665,20 +703,33 @@ async def _open_program(
 ) -> _Program:
     """Open the managed project and the program in it, analysing it once.
 
-    The project is opened before it is created, never the other way round:
-    ``create_project`` on a name that already exists empties it, which would
-    throw away every earlier revision of this analysis.
+    The project is opened before it is created, and it is created **only**
+    when nothing says one is already there: ``create_project`` on a name that
+    already exists empties it, so treating every ``open_project`` failure as
+    "it does not exist yet" would turn a stale lock or a transient refusal
+    into the loss of every earlier revision.
     """
     parent, name = _project(config, session.binary_sha256)
     path = f"{parent}/{name}.gpr"
+    record = _load_record(session.binary_sha256)
     # By path, every time, and never by name: the project name is derived
     # from the binary's digest, so two managed workspaces holding the same
     # bytes name their projects identically. Trusting the name would reopen
     # the program out of whichever of them happened to be current.
     try:
         await _call_json(session, "open_project", path=path)
-    except ProviderUnavailableError:
+    except ProviderUnavailableError as refused:
+        existing = _existing_project(session.binary_sha256, name, record)
+        if existing is not None:
+            raise ProviderUnavailableError(
+                f"the ghidra provider could not open the managed project at"
+                f" {path} ({refused}), and {existing}. Creating it again would"
+                " empty it and take every earlier revision with it, so nothing"
+                " was created and nothing was opened"
+            ) from None
         await _call_json(session, "create_project", parentDir=parent, name=name)
+        record["project"] = name
+        _store_record(session.binary_sha256, record)
     info = await _call_json(session, "get_project_info")
     if info.get("project_name") != name:
         raise ProviderUnavailableError(
@@ -706,29 +757,51 @@ async def _open_program(
     )
 
 
+def _existing_project(sha256: str, name: str, record: Mapping[str, Any]) -> str | None:
+    """Why this adapter believes a managed project is already there, or ``None``.
+
+    Two independent witnesses, because either one can be absent: the project
+    directory on this host (when the workspace really is this host's, which it
+    is whenever the operator mapped it to itself) and this adapter's own
+    record of having created it.
+    """
+    local = _managed_root(sha256)
+    if (local / f"{name}.gpr").exists() or (local / f"{name}.rep").is_dir():
+        return f"{local / f'{name}.gpr'} is on this host"
+    if record.get("project") == name:
+        return "this server's own record says it created that project already"
+    return None
+
+
 async def _load(session: ProviderSession) -> str:
     """Get *this* program open, from the project when it is already in it.
 
-    Every program the provider is holding that is not the operator's mapped
-    file is closed first. A provider is a shared process with one current
-    program, and a session that failed before it released its own leaves one
-    behind; reusing whatever happens to be open is how an address from this
-    target would be read out of a different binary.
+    A provider holding somebody else's program is refused rather than tidied
+    up: GhidraMCP is one process with one current program, and closing a
+    program this session did not open would discard another client's unsaved
+    analysis. The refusal names what is open, which is what lets a caller —
+    and this project's live tests — tell "the provider is busy" from "the
+    adapter is wrong".
     """
     remote = session.remote_path
     stem = Path(remote).name
-    mine: str | None = None
     open_now = await _call_json(session, "list_open_programs")
     programs = open_now.get("programs")
+    foreign: list[str] = []
+    mine: str | None = None
     for entry in programs if isinstance(programs, list) else []:
         if not isinstance(entry, dict):
             continue
         if entry.get("executable_path") == remote and mine is None:
             mine = str(entry.get("path") or f"/{stem}")
             continue
-        name = entry.get("name")
-        if isinstance(name, str) and name:
-            await _call_json(session, "close_program", name=name)
+        foreign.append(str(entry.get("executable_path") or entry.get("name")))
+    if foreign:
+        raise ProviderBusyError(
+            f"the ghidra provider is holding {foreign} open, which this"
+            f" session did not open and may not close; it works against"
+            f" exactly one program and this target is {remote}"
+        )
     if mine is not None:
         return mine
     try:
@@ -749,7 +822,7 @@ async def _identity(session: ProviderSession) -> tuple[int, str]:
     open_now = await _call_json(session, "list_open_programs")
     programs = open_now.get("programs")
     if not isinstance(programs, list) or len(programs) != 1:
-        raise ProviderUnavailableError(
+        raise ProviderBusyError(
             "the ghidra provider has"
             f" {len(programs) if isinstance(programs, list) else 'no'} programs"
             " open; this adapter works against exactly one, so that an address"
@@ -762,7 +835,7 @@ async def _identity(session: ProviderSession) -> tuple[int, str]:
         )
     opened = entry.get("executable_path")
     if opened != session.remote_path:
-        raise ProviderUnavailableError(
+        raise ProviderBusyError(
             f"the ghidra provider has {opened!r} open where the operator's map"
             f" says this target is {session.remote_path!r}; nothing was read"
             " from it"
@@ -863,9 +936,43 @@ async def _functions(session: ProviderSession) -> list[dict[str, Any]]:
     ]
 
 
+class _Extents:
+    """How far each known function reaches, and which of those were measured.
+
+    An extent this pass could not measure — the budget ran out, or
+    ``analyze_control_flow`` refused — is **not** evidence that the function
+    is short. Every such entry is still given a span, running to the next
+    known entry (or the end of its block), and is recorded as unmeasured, so
+    an address inside it is treated as owned and never written over. The
+    alternative, leaving it out of the map, is what let a write land inside a
+    function this adapter exists to protect.
+    """
+
+    __slots__ = ("measured", "spans", "truncated")
+
+    def __init__(
+        self,
+        spans: dict[int, int],
+        measured: set[int],
+        truncated: str | None,
+    ) -> None:
+        self.spans = spans
+        self.measured = measured
+        self.truncated = truncated
+
+    def owner(self, address: int) -> tuple[int, int, bool] | None:
+        """The function whose body holds ``address``: entry, end, measured."""
+        for entry, end in self.spans.items():
+            if entry < address < end:
+                return entry, end, entry in self.measured
+        return None
+
+
 async def _extents(
-    session: ProviderSession, entries: Sequence[int]
-) -> tuple[dict[int, int], str | None]:
+    session: ProviderSession,
+    entries: Sequence[int],
+    blocks: Sequence[Mapping[str, Any]],
+) -> _Extents:
     """How far each function reaches, measured one function at a time.
 
     ``list_functions`` reports entries and nothing else, so the only typed
@@ -873,27 +980,59 @@ async def _extents(
     by address — never by name, because two distinct functions here really are
     both called ``printf`` and the name lookup answers for neither.
     """
-    extents: dict[int, int] = {}
-    budget = entries[:MAX_FUNCTION_EXTENTS]
-    for entry in budget:
-        try:
-            flow = await _call_json(
-                session, "analyze_control_flow", function_name=_hex(entry)
-            )
-        except ProviderError:
-            continue
-        start = _address(flow.get("entry_point"))
-        size = flow.get("size_bytes")
-        if start is None or not isinstance(size, int) or isinstance(size, bool):
-            continue
-        extents[start] = start + max(size, 1)
-    if len(entries) > len(budget):
-        return extents, (
-            f"this provider defines {len(entries)} functions and this pass"
-            f" measured the extent of the first {len(budget)}, so the rest of"
-            " the image is reported as unvisited rather than as empty"
+    ordered = sorted(entries)
+    spans: dict[int, int] = {}
+    measured: set[int] = set()
+    budget = ordered[:MAX_FUNCTION_EXTENTS]
+    for index, entry in enumerate(ordered):
+        if entry in budget:
+            flow: dict[str, Any] | None
+            try:
+                flow = await _call_json(
+                    session, "analyze_control_flow", function_name=_hex(entry)
+                )
+            except GhidraUnavailableError:
+                raise
+            except ProviderError:
+                flow = None
+            if flow is not None:
+                start = _address(flow.get("entry_point"))
+                size = flow.get("size_bytes")
+                if (
+                    start == entry
+                    and isinstance(size, int)
+                    and not isinstance(size, bool)
+                ):
+                    spans[entry] = entry + max(size, 1)
+                    measured.add(entry)
+                    continue
+        spans[entry] = _conservative_end(entry, ordered, index, blocks)
+    truncated = None
+    if len(ordered) > len(measured):
+        truncated = (
+            f"this provider defines {len(ordered)} functions and this pass"
+            f" measured the extent of {len(measured)}; the rest are treated as"
+            " reaching to the next known entry, so an address inside one of"
+            " them is described and never defined"
         )
-    return extents, None
+    return _Extents(spans, measured, truncated)
+
+
+def _conservative_end(
+    entry: int,
+    ordered: Sequence[int],
+    index: int,
+    blocks: Sequence[Mapping[str, Any]],
+) -> int:
+    """Where an unmeasured function might still reach: the widest it could be."""
+    limits = [
+        int(block["end"])
+        for block in blocks
+        if int(block["start"]) <= entry < int(block["end"])
+    ]
+    if index + 1 < len(ordered):
+        limits.append(ordered[index + 1])
+    return min(limits) if limits else entry + 1
 
 
 async def _read(
@@ -918,35 +1057,63 @@ async def _read(
         ) from None
 
 
-async def _xrefs(session: ProviderSession, address: int) -> list[dict[str, Any]]:
-    """Everything the provider says refers to one address.
+async def _xrefs(
+    session: ProviderSession, address: int
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Everything the provider says refers to one address, and what was cut off.
 
     A reference whose source is a name rather than an address — Ghidra spells
     an external entry point ``From Entry Point`` — is kept with ``address``
     ``None`` rather than dropped. It is still the provider saying something
     reaches here, and the difference between the two forms decides whether a
     write is allowed, so it has to survive into the evidence.
+
+    The listing is paged, and the second return value is non-``None`` when the
+    page budget ran out: a bounded read that is not reported as bounded reads
+    as "there is nothing more", which is the one thing this project never
+    says.
     """
     rows: list[dict[str, Any]] = []
-    for line in (
-        await _call(session, "get_xrefs_to", address=_hex(address), limit=200)
-    ).splitlines():
-        match = _XREF_LINE.match(line.strip())
-        if match is None:
-            continue
-        rows.append(
-            {
-                "address": _address(match["source"]),
-                "source": match["source"],
-                "function": match["function"],
-                "kind": match["kind"],
-            }
+    for page in range(MAX_XREF_PAGES):
+        text = await _call(
+            session,
+            "get_xrefs_to",
+            address=_hex(address),
+            limit=XREF_PAGE,
+            offset=page * XREF_PAGE,
         )
-    return rows
+        lines = [line for line in text.splitlines() if line.strip()]
+        for line in lines:
+            match = _XREF_LINE.match(line.strip())
+            if match is None:
+                continue
+            rows.append(
+                {
+                    "address": _address(match["source"]),
+                    "source": match["source"],
+                    "function": match["function"],
+                    "kind": match["kind"],
+                }
+            )
+        if len(lines) < XREF_PAGE:
+            return rows, None
+    return rows, (
+        f"the provider's reference listing for {address:#x} did not end within"
+        f" {MAX_XREF_PAGES * XREF_PAGE} rows, so what reaches that address is"
+        " described from a part of it rather than from all of it"
+    )
 
 
-async def _defined_strings(session: ProviderSession) -> set[int]:
-    """The addresses the provider already holds a string at."""
+async def _defined_strings(
+    session: ProviderSession,
+) -> tuple[set[int], str | None]:
+    """The addresses the provider already holds a string at, and what was cut off.
+
+    A capped listing matters here in a specific way: this pass reports what
+    the provider *left behind*, so a string it does hold but that fell past
+    the cap would be reported as recovered. The cap is therefore named rather
+    than left to be inferred from the candidate list.
+    """
     defined: set[int] = set()
     for page in range(MAX_STRING_PAGES):
         text = await _call(
@@ -961,8 +1128,12 @@ async def _defined_strings(session: ProviderSession) -> set[int]:
             if address is not None:
                 defined.add(address)
         if len(lines) < STRING_PAGE:
-            break
-    return defined
+            return defined, None
+    return defined, (
+        f"the provider's string listing did not end within"
+        f" {MAX_STRING_PAGES * STRING_PAGE} rows, so a run this pass reports as"
+        " left behind may be one the provider already holds past that cap"
+    )
 
 
 async def _function_pcode(session: ProviderSession, entry: int) -> dict[str, Any]:
@@ -998,6 +1169,11 @@ async def _run_pass(
         if name == "strings":
             return await _strings_pass(session, program)
         return await _functions_pass(session, program, record)
+    except GhidraUnavailableError:
+        # Something else is driving this provider, or there is none. Neither is
+        # a pass that ran and found little, and recording it as one would turn
+        # "we could not look" into "we looked and there was nothing".
+        raise
     except ProviderError as refused:
         return _pass_result(
             program,
@@ -1017,14 +1193,26 @@ async def _strings_pass(
     listing's own opinion. The provider's string listing is read only to
     separate what it already holds from what it left behind.
     """
-    defined = await _defined_strings(session)
+    defined, capped = await _defined_strings(session)
     entries = {row["entry"] for row in await _functions(session)}
     ranges: list[AddressRange] = []
     candidates: list[Candidate] = []
-    warnings: list[str] = []
+    warnings: list[str] = [capped] if capped else []
     budget = MAX_PASS_READ_BYTES
     for block in program.segments:
         if any(block["start"] <= entry < block["end"] for entry in entries):
+            # A block holding code is not swept for text, and is named here
+            # rather than left out: a pass that summarises only the ranges it
+            # chose to visit can report `complete` over an image it covered
+            # half of.
+            ranges.append(
+                _unreached(
+                    block,
+                    "raw_bytes",
+                    "this block holds code the provider already defines, so"
+                    " this pass did not read it for text",
+                )
+            )
             continue
         entry_range = _range(block, "raw_bytes")
         read, failure = await _sweep(session, block, entry_range, budget)
@@ -1060,8 +1248,8 @@ async def _functions_pass(
     """
     functions = await _functions(session)
     entries = {row["entry"]: row["name"] for row in functions}
-    extents, truncated = await _extents(session, sorted(entries))
-    warnings: list[str] = [truncated] if truncated else []
+    extents = await _extents(session, sorted(entries), program.segments)
+    warnings: list[str] = [extents.truncated] if extents.truncated else []
     ranges: list[AddressRange] = []
     candidates: list[Candidate] = []
     examined: dict[int, int] = {}
@@ -1096,7 +1284,9 @@ async def _functions_pass(
             break
         if target in entries and target not in defined_here:
             continue
-        records = await _xrefs(session, target)
+        records, capped = await _xrefs(session, target)
+        if capped is not None and capped not in warnings:
+            warnings.append(capped)
         referenced = [
             row["address"]
             for row in records
@@ -1116,7 +1306,7 @@ async def _functions_pass(
             warnings.append(f"the bytes at {target:#x} could not be read: {refused}")
             continue
         examined[target] = len(raw)
-        owner = _owner(extents, target)
+        owner = extents.owner(target)
         candidates.append(
             await _function_candidate(
                 session,
@@ -1147,7 +1337,7 @@ async def _function_candidate(
     referenced: list[int],
     named: list[str],
     raw: bytes,
-    owner: tuple[int, int] | None,
+    owner: tuple[int, int, bool] | None,
     owner_name: str | None,
     already: bool,
 ) -> Candidate:
@@ -1163,7 +1353,12 @@ async def _function_candidate(
         "referenced_by": named,
         "bytes": raw.hex(),
         "already_defined": already,
-        "owner": {"entry": owner[0], "end": owner[1], "name": owner_name}
+        "owner": {
+            "entry": owner[0],
+            "end": owner[1],
+            "name": owner_name,
+            "measured": owner[2],
+        }
         if owner
         else None,
     }
@@ -1185,12 +1380,21 @@ async def _function_candidate(
             " earlier run of this pass"
         )
         return row
-    if owner is not None:
+    if owner is not None and owner[2]:
         row["reason"] = (
             f"{target:#x} is inside {owner_name or 'a function'} at"
             f" {owner[0]:#x}..{owner[1]:#x}, which this provider already"
             " defines; defining a function there would split it, so this"
             " stays a candidate"
+        )
+        return row
+    if owner is not None:
+        row["reason"] = (
+            f"{target:#x} falls inside {owner_name or 'a function'} at"
+            f" {owner[0]:#x}, whose extent this pass could not measure, so"
+            f" {owner[0]:#x}..{owner[1]:#x} is the widest it could reach. An"
+            " unmeasured extent is not evidence that the address is outside"
+            " it, so this stays a candidate"
         )
         return row
     if slot not in referenced:
@@ -1358,7 +1562,6 @@ def _is_text(text: str) -> bool:
     )
 
 
-
 def _block_of(program: _Program, address: int) -> dict[str, Any] | None:
     for block in program.segments:
         if block["start"] <= address < block["end"]:
@@ -1366,17 +1569,9 @@ def _block_of(program: _Program, address: int) -> dict[str, Any] | None:
     return None
 
 
-def _owner(extents: Mapping[int, int], address: int) -> tuple[int, int] | None:
-    """The function whose body holds ``address``, when one does."""
-    for entry, end in extents.items():
-        if entry < address < end:
-            return entry, end
-    return None
-
-
 def _code_ranges(
     program: _Program,
-    extents: Mapping[int, int],
+    extents: _Extents,
     examined: Mapping[int, int],
     entries: Mapping[int, str],
 ) -> list[AddressRange]:
@@ -1389,7 +1584,7 @@ def _code_ranges(
     ranges: list[AddressRange] = []
     for block in program.segments:
         inside = [
-            (entry, extents.get(entry, entry + 1))
+            (entry, extents.spans.get(entry, entry + 1))
             for entry in entries
             if block["start"] <= entry < block["end"]
         ]
@@ -1449,6 +1644,20 @@ def _range(block: Mapping[str, Any], stage: str) -> AddressRange:
         "unvisited": [],
         "reason": None,
     }
+
+
+def _unreached(block: Mapping[str, Any], stage: str, reason: str) -> AddressRange:
+    """A range the pass never started, named rather than left out.
+
+    The same shape the IDA side uses for the same reason: "the pass found
+    nothing here" and "the pass never got here" are different answers, and
+    only one of them is evidence.
+    """
+    entry = _range(block, stage)
+    entry["coverage"] = "partial"
+    entry["unvisited"] = [{"start": int(block["start"]), "end": int(block["end"])}]
+    entry["reason"] = reason
+    return entry
 
 
 def _stop(
@@ -1521,6 +1730,24 @@ def _requested(passes: object) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
+def _unreachable_site(entry: int, reason: str) -> AddressRange:
+    """One address a rule's evidence could not read, named with why.
+
+    A bounded read, a reference with no address, and a call-site budget that
+    ran out are all the same thing to a reader of the result: somewhere this
+    rule did not look. Each one gets a range rather than silence.
+    """
+    return {
+        "name": f"{entry:#x}",
+        "stage": "instructions",
+        "start": entry,
+        "end": entry + 1,
+        "coverage": "unavailable",
+        "unvisited": [{"start": entry, "end": entry + 1}],
+        "reason": reason,
+    }
+
+
 async def _rule_evidence(
     session: ProviderSession, program: _Program, rule: Rule, rule_index: int
 ) -> RuleEvidence:
@@ -1540,10 +1767,36 @@ async def _rule_evidence(
     sites: list[dict[str, Any]] = []
     ranges: list[AddressRange] = []
     for row in targets:
-        for reference in await _xrefs(session, row["entry"]):
+        references, capped = await _xrefs(session, row["entry"])
+        if capped is not None:
+            ranges.append(_unreachable_site(row["entry"], capped))
+        for reference in references:
             if reference["kind"] not in CALL_REFERENCES:
                 continue
+            if reference["address"] is None:
+                # Ghidra spells some reference sources as a name rather than
+                # an address (``From Entry Point``, and anything in a space
+                # with no numeric address in this program's). A call site with
+                # no address is one nothing here can read instructions at, so
+                # it is named and never resolved.
+                ranges.append(
+                    _unreachable_site(
+                        row["entry"],
+                        f"the provider reports a {reference['kind']} reference"
+                        f" to {row['entry']:#x} from {reference['source']!r},"
+                        " which is not an address in this program's space, so"
+                        " no call site could be read at it",
+                    )
+                )
+                continue
             if len(sites) >= MAX_RULE_CALL_SITES:
+                ranges.append(
+                    _unreachable_site(
+                        row["entry"],
+                        f"this rule reached {MAX_RULE_CALL_SITES} call sites and"
+                        " stopped; the references past that one were not read",
+                    )
+                )
                 break
             owner = _containing(entries, reference["address"])
             if owner is None or _normalize(names.get(owner, "")) in wanted:
@@ -1557,7 +1810,15 @@ async def _rule_evidence(
                 }
             )
     if not sites:
-        return _evidence(rule_index, [], [], "evaluated", None)
+        return _evidence(
+            rule_index,
+            [],
+            ranges,
+            "evaluated" if not ranges else "failed",
+            None
+            if not ranges
+            else "; ".join(str(item["reason"]) for item in ranges[:4]),
+        )
 
     contexts: list[dict[str, Any]] = []
     unresolved: list[str] = []
@@ -1947,10 +2208,19 @@ def _return_checked(
     outright. A result that no comparison was found for is left unstated: this
     walk follows the operations the provider reported and nothing says it saw
     all of them, so "not checked" would be a claim about what is absent.
+
+    And nothing is stated at all when the varnode cannot be told apart from
+    another. This reply identifies a varnode by space, offset and size, which
+    two distinct SSA values share whenever two calls return in the same
+    register — and a comparison on the second one would otherwise be credited
+    to the first, which is a check on a call that was never checked. The same
+    ambiguity :func:`_constant_value` already refuses is refused here.
     """
     output = _varnode(call.get("output"))
     if output is None:
         return {"return_checked": False, "return_check_values": []}
+    if not _uniquely_defined(operations, output):
+        return None
     reached = {output}
     values: list[int | float] = []
     for _ in range(MAX_VARNODE_DEPTH):
@@ -1973,12 +2243,28 @@ def _return_checked(
                 }
             if mnemonic in _TRANSPARENT or mnemonic in {"MULTIEQUAL", "INDIRECT"}:
                 successor = _varnode(operation.get("output"))
-                if successor is not None and successor not in reached:
+                if successor is None:
+                    continue
+                if not _uniquely_defined(operations, successor):
+                    # The value moved into something two definitions share, so
+                    # from here on a comparison cannot be attributed to this
+                    # call rather than to the other one.
+                    return None
+                if successor not in reached:
                     reached.add(successor)
                     grown = True
         if not grown:
             break
     return None
+
+
+def _uniquely_defined(
+    operations: Sequence[Mapping[str, Any]], node: tuple[str, int, int]
+) -> bool:
+    """Whether exactly one reported operation produces this varnode."""
+    return (
+        sum(1 for item in operations if _varnode(item.get("output")) == node) == 1
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1988,12 +2274,13 @@ def _return_checked(
 
 async def _apply(
     session: ProviderSession,
+    program: _Program,
     body: Mapping[str, Any],
     report: dict[str, object],
 ) -> None:
     kind = str(body["kind"])
     if kind == "function_boundary":
-        await _apply_boundary(session, body, report)
+        await _apply_boundary(session, program, body, report)
         return
     if kind == "structure_field":
         await _apply_layout(session, body, report)
@@ -2006,12 +2293,15 @@ async def _apply(
 
 
 async def _apply_boundary(
-    session: ProviderSession, body: Mapping[str, Any], report: dict[str, object]
+    session: ProviderSession,
+    program: _Program,
+    body: Mapping[str, Any],
+    report: dict[str, object],
 ) -> None:
     entry = int(body["start"])
     functions = await _functions(session)
     entries = {row["entry"]: row["name"] for row in functions}
-    extents, _ = await _extents(session, sorted(entries))
+    extents = await _extents(session, sorted(entries), program.segments)
     report["site"] = {"entry": entry, "end": int(body["end"])}
     if entry in entries:
         report["reason"] = (
@@ -2019,13 +2309,22 @@ async def _apply_boundary(
             " so there is nothing to define and nothing was applied"
         )
         return
-    owner = _owner(extents, entry)
-    if owner is not None:
+    owner = extents.owner(entry)
+    if owner is not None and owner[2]:
         report["reason"] = (
             f"{entry:#x} is inside {entries.get(owner[0], 'a function')!r} at"
             f" {owner[0]:#x}..{owner[1]:#x}; this provider's create_function"
             " would split that function rather than refuse, so this adapter"
             " refuses instead and nothing was applied"
+        )
+        return
+    if owner is not None:
+        report["reason"] = (
+            f"{entry:#x} falls inside {entries.get(owner[0], 'a function')!r}"
+            f" at {owner[0]:#x}, whose extent this session could not measure"
+            f" ({extents.truncated}), so {owner[0]:#x}..{owner[1]:#x} is the"
+            " widest it could reach. An unmeasured extent is not evidence that"
+            " the address is outside it; nothing was applied"
         )
         return
     try:
@@ -2051,7 +2350,16 @@ async def _apply_layout(
     report["site"] = {"type_name": name, "fields": len(fields)}
     try:
         spelled = [
-            {"name": str(field["name"]), "type": _FIELD_TYPES[int(field["width"])]}
+            {
+                "name": str(field["name"]),
+                "type": _FIELD_TYPES[int(field["width"])],
+                # The offset the operator approved, not the one a width
+                # sequence happens to imply. A validated layout covers its
+                # bytes from zero with no gap and no overlap, so these two
+                # agree today — and if a future layout ever lets them differ,
+                # dropping the offset would write a structure nobody approved.
+                "offset": int(field["offset"]),
+            }
             for field in fields
         ]
     except KeyError:
