@@ -137,6 +137,7 @@ def _config_text(
     sentinel: Path,
     extra: str = "",
     limits: str = "",
+    call_timeout: float = 20.0,
 ) -> str:
     args = json.dumps([str(Path(__file__).resolve()), variant])
     return f"""
@@ -150,7 +151,7 @@ VULFI_TEST_SERVER_LOG = {json.dumps(str(server_log))}
 VULFI_TEST_SERVER_SENTINEL = {json.dumps(str(sentinel))}
 
 [r2.limits]
-call_timeout_seconds = 20.0
+call_timeout_seconds = {call_timeout}
 startup_timeout_seconds = 20.0
 {limits}
 
@@ -834,6 +835,153 @@ def test_a_provider_schema_is_never_run_unbounded(
     assert elapsed < 2.0, f"the schema was evaluated anyway ({elapsed:.1f}s)"
 
 
+@pytest.mark.parametrize("variant", ["ref_into_enum", "ref_doubling"])
+def test_a_reference_in_a_provider_schema_is_refused(
+    variant: str,
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """Neither of these uses a keyword a blocklist would catch.
+
+    ``ref_into_enum`` hides a ``pattern`` where a keyword scan does not look —
+    under ``enum`` — and reaches it with a JSON pointer: 39.8 s on a
+    30-character argument when it was allowed through. ``ref_doubling`` uses no
+    refused keyword anywhere, is flat, 1.6 KB at N=22, passes every size, depth
+    and ``check_schema`` bound, and did not finish in 300 s. The cost is what a
+    reference can reach, which is why references are refused outright rather
+    than audited.
+    """
+    config = configure(
+        _config_text(
+            variant=variant,
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[str, float]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            started = time.monotonic()
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "a" * 30},
+                    session.fingerprint("beta_text"),
+                )
+            return str(refused.value), time.monotonic() - started
+
+    reason, elapsed = _run(exercise())
+    assert "$ref" in reason or "$defs" in reason
+    assert "beta_text" in reason
+    assert elapsed < 2.0, f"the schema was evaluated anyway ({elapsed:.1f}s)"
+
+
+def test_a_vendor_annotation_is_not_mistaken_for_a_subschema(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    # ``x-meta`` is an annotation, not a schema position. Refusing a tool for
+    # the words inside one costs availability for nothing, and a provider that
+    # annotates its tools is not a hostile provider.
+    config = configure(
+        _config_text(
+            variant="annotated",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> dict[str, object]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            return await checked_call(
+                session,
+                "beta_text",
+                {"address": "0x1000"},
+                session.fingerprint("beta_text"),
+            )
+
+    assert "mov eax, 1" in " ".join(_run(exercise())["text"])
+
+
+def test_validation_that_will_not_finish_becomes_a_refusal(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """The second layer, exercised with the first one bypassed.
+
+    No provider can reach this through ``_pin`` any more, which is the point of
+    the pin-time refusal — so the pathological schema is installed directly on
+    a live session to prove the backstop is real. A Python thread cannot be
+    killed: the refusal arrives on the deadline and the worker is left running
+    as a daemon, which is why the assertions below are about the *caller*
+    returning, not about the thread stopping.
+    """
+    config = configure(
+        _config_text(
+            variant="honest",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+            call_timeout=2.0,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[str, float]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            pinned = session._capabilities["beta_text"]
+            pinned.input_schema = {
+                "type": "object",
+                "properties": {"address": {"type": "array", "uniqueItems": True}},
+            }
+            started = time.monotonic()
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    # O(n^2) in pure Python: ~9 s here, so the 2 s deadline
+                    # fires well before it finishes. A catastrophic regex would
+                    # not work as this test's subject, because `re` holds the
+                    # GIL and freezes the loop the deadline runs on — which is
+                    # why `pattern` is refused at pin time instead.
+                    {"address": [{"i": index} for index in range(3000)]},
+                    session.fingerprint("beta_text"),
+                )
+            elapsed = time.monotonic() - started
+            # The session is not poisoned: another capability still answers
+            # while that thread is still burning.
+            answered = await checked_call(
+                session,
+                "alpha_facts",
+                {"function": "copy"},
+                session.fingerprint("alpha_facts"),
+            )
+            assert answered["structured"]["params"][0]["constant"] is True
+            return str(refused.value), elapsed
+
+    reason, elapsed = _run(exercise())
+    assert "did not finish validating" in reason
+    assert "2.0 seconds" in reason
+    assert 1.5 < elapsed < 6.0, elapsed
+
+
 def test_an_unevaluatable_schema_is_a_refusal_not_a_foreign_exception(
     configure: Callable[[str], dict[str, ProviderConfig]],
     binary: Path,
@@ -845,6 +993,11 @@ def test_an_unevaluatable_schema_is_a_refusal_not_a_foreign_exception(
     ``jsonschema`` raises ``_WrappedReferencingError`` here, which is not a
     ``ProviderError`` and not even a public type; letting it out would hand an
     adapter something it cannot record as unsupported.
+
+    Two layers are checked. A provider that advertises the schema never gets
+    past pinning — that is the first assertion. The mapping itself is the
+    second layer, so it is exercised with the schema installed directly on a
+    live session, the way the deadline test does.
     """
     config = configure(
         _config_text(
@@ -856,23 +1009,32 @@ def test_an_unevaluatable_schema_is_a_refusal_not_a_foreign_exception(
         )
     )["r2"]
 
-    async def exercise() -> str:
+    async def exercise() -> tuple[str, str]:
         async with provider_session(
             config, str(binary), allowlist=ALLOWLIST
         ) as session:
-            with pytest.raises(ProviderError) as refused:
+            with pytest.raises(CapabilityUnavailableError) as pinned:
                 await checked_call(
                     session,
                     "beta_text",
                     {"address": "0x1000"},
                     session.fingerprint("beta_text"),
                 )
-            assert isinstance(refused.value, CapabilityUnavailableError)
-            return str(refused.value)
+            session._capabilities["beta_text"].unusable = None
+            with pytest.raises(ProviderError) as mapped:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            assert isinstance(mapped.value, CapabilityUnavailableError)
+            return str(pinned.value), str(mapped.value)
 
-    reason = _run(exercise())
-    assert "beta_text" in reason
-    assert "could not be evaluated" in reason
+    refused_at_pin, refused_at_call = _run(exercise())
+    assert "$ref" in refused_at_pin
+    assert "beta_text" in refused_at_call
+    assert "could not be evaluated" in refused_at_call
 
 
 def test_a_tool_that_declares_no_arguments_table_is_refused(
@@ -1062,6 +1224,35 @@ def test_an_unsupported_evidence_record_carries_a_reason() -> None:
     assert evidence["reason"]
 
 
+@pytest.mark.parametrize(
+    "contexts",
+    [
+        [{"params": [{"constant": "X" * 40000}], "call": {}}],
+        [{"params": [{"size_bytes": "X" * 40000}], "call": {}}],
+        [{"params": [{"X" * 40000: True}], "call": {}}],
+        [{"params": [], "call": {}, "X" * 40000: True}],
+    ],
+)
+def test_refusing_evidence_does_not_repeat_the_provider_back(
+    contexts: list[object],
+) -> None:
+    # Task 4 puts this reason in front of an agent, so the same bound the call
+    # and session paths got applies here: a provider that sends 40,000
+    # characters of anything gets 40,000 characters of nothing back.
+    evidence: RuleEvidence = {
+        "backend": "ghidra",
+        "rule_index": 0,
+        "contexts": contexts,  # type: ignore[typeddict-item]
+        "ranges": [],
+        "state": "evaluated",
+        "reason": None,
+    }
+    with pytest.raises(ProviderEvidenceError) as refused:
+        rule_contexts(evidence)
+    assert len(str(refused.value)) < 900, len(str(refused.value))
+    assert "X" * 1000 not in str(refused.value)
+
+
 # ==========================================================================
 # The hostile MCP server. Everything below this line runs in a subprocess.
 # ==========================================================================
@@ -1115,6 +1306,41 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
         }
     if variant == "no_properties":
         beta_schema = {"type": "object"}
+    if variant == "ref_into_enum":
+        # Route 1 from the round-2 measurements: the pointer lands *inside* an
+        # enum member, where a keyword scan does not look, and the validator
+        # runs the pattern it finds there. Measured at 39.8 s unrefused.
+        beta_schema = {
+            "type": "object",
+            "properties": {"address": {"$ref": "#/$defs/box/enum/0"}},
+            "required": ["address"],
+            "$defs": {"box": {"enum": [{"type": "string", "pattern": "(a+)+$"}]}},
+        }
+    if variant == "ref_doubling":
+        # Route 2: no refused keyword of its own, flat, tiny, check_schema
+        # clean — and the work doubles at every level. At N=22 (1,620 bytes)
+        # this did not finish in 300 s. N is small here: the test proves the
+        # refusal, not the hang.
+        defs: dict[str, object] = {}
+        depth = 14
+        for index in range(depth):
+            nxt = f"#/$defs/d{index + 1}"
+            defs[f"d{index}"] = {"anyOf": [{"$ref": nxt}, {"$ref": nxt}]}
+        defs[f"d{depth}"] = {"type": "integer"}
+        beta_schema = {
+            "type": "object",
+            "properties": {"address": {"anyOf": [{"$ref": "#/$defs/d0"}]}},
+            "required": ["address"],
+            "$defs": defs,
+        }
+    if variant == "annotated":
+        # A vendor annotation, not a subschema: nothing here is a keyword.
+        beta_schema = {
+            "type": "object",
+            "properties": {"address": {"type": "string"}},
+            "required": ["address"],
+            "x-meta": {"pattern": "irrelevant", "$ref": "also irrelevant"},
+        }
     note = INJECTION.format(sentinel=sentinel) if variant == "injection" else ""
     tools: list[dict[str, object]] = [
         {

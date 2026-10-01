@@ -52,6 +52,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -182,21 +183,46 @@ def tool_fingerprint(tool: types.Tool) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-#: JSON Schema keywords this module refuses to evaluate, because their cost is
-#: not bounded by the size of the schema and the size of the instance. Both are
-#: regular expressions, compiled and run by ``jsonschema`` **synchronously,
-#: inside this process's event loop, before any call is sent** — so no
-#: ``call_timeout_seconds`` applies to them. A provider-supplied ``(a+)+$``
-#: against a 29-character argument measures around twenty seconds here, and a
-#: slightly longer argument does not finish.
+#: JSON Schema keywords a provider's **input schema** may not contain. There
+#: are two different reasons in this one set, and the second is the important
+#: one:
 #:
-#: Nothing is lost by refusing them: the arguments this module sends are
-#: adapter-authored constants, never agent input, so a provider's own regular
-#: expression was never the thing keeping them honest. ``format`` is not in
-#: this list because no format checker is installed, which is what makes it
-#: inert rather than a second regular-expression engine.
-_UNBOUNDED_KEYWORDS: Final[frozenset[str]] = frozenset(
-    {"pattern", "patternProperties"}
+#: ``pattern``, ``patternProperties``
+#:     Regular expressions, compiled and run by ``jsonschema``
+#:     **synchronously, inside this process's event loop, before any call is
+#:     sent** — so no ``call_timeout_seconds`` applies. A provider-supplied
+#:     ``(a+)+$`` against a 29-character argument measures around twenty
+#:     seconds here, and a slightly longer argument does not finish.
+#:
+#: ``$ref``, ``$defs``, ``definitions``, ``$dynamicRef``, ``$recursiveRef``
+#:     **This half is not a blocklist and must not be read as one.** Reference
+#:     resolution makes a schema's *cost* independent of its text: a flat
+#:     1,620-byte schema whose ``$defs`` chain doubles at each level — using no
+#:     refused keyword at all, inside every size, depth and ``check_schema``
+#:     bound — did not finish validating in 300 seconds. Enumerating the
+#:     expensive shapes is impossible, because the expense comes from what a
+#:     pointer can *reach*, not from which words appear: a ``$ref`` into an
+#:     ``enum`` member resurrects a ``pattern`` that no keyword scan would see,
+#:     measured at 39.8 seconds. So the reachability itself is removed. Do not
+#:     "improve" this by narrowing it back to a list of bad constructs.
+#:
+#: Nothing is lost by refusing any of them: the arguments this module sends are
+#: adapter-authored constants, never agent input, so a provider's own schema
+#: was never the thing keeping them honest; and neither installed backend emits
+#: a reference — radare2-mcp 1.8.8 uses none across its 32 tools, GhidraMCP
+#: 6.0.0 none across its 222. ``format`` is not here because no format checker
+#: is installed, which is what makes it inert rather than a second
+#: regular-expression engine.
+_REFUSED_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "$defs",
+        "$dynamicRef",
+        "$recursiveRef",
+        "$ref",
+        "definitions",
+        "pattern",
+        "patternProperties",
+    }
 )
 
 
@@ -410,7 +436,12 @@ async def checked_call(
             f"the {session.backend} provider's {tool!r} tool cannot be used:"
             f" {capability.unusable}",
         )
-    _check_arguments(session.backend, capability, arguments)
+    await _check_arguments(
+        session.backend,
+        capability,
+        arguments,
+        min(SCHEMA_DEADLINE_SECONDS, session._limits.call_timeout_seconds),
+    )
     try:
         result = await session._client.call_tool(
             tool,
@@ -637,12 +668,13 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
             "its input schema nests deeper than the"
             f" {limits.max_response_depth} level depth budget"
         )
-    found = _unbounded_keywords(schema)
+    found = _refused_keywords(schema)
     if found:
         return (
-            f"its input schema uses {found}, whose cost this server cannot"
-            " bound; a provider's regular expression is run here, in this"
-            " process, before any call is sent"
+            f"its input schema uses {found}, which this server will not"
+            " evaluate: a provider's regular expression, and anything a"
+            " provider's reference can reach, runs here, in this process,"
+            " before any call is sent"
         )
     if not isinstance(schema.get("properties"), dict):
         # An empty ``properties`` table is a real answer — "this tool takes no
@@ -661,18 +693,36 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
     return None
 
 
+#: Keywords whose value is one subschema.
+_ONE_SUBSCHEMA: Final[frozenset[str]] = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+
+#: Keywords whose value is a list of subschemas. ``items`` also appears above:
+#: older drafts spell a tuple of schemas that way, so both forms are walked.
+_SUBSCHEMA_LIST: Final[frozenset[str]] = frozenset(
+    {"allOf", "anyOf", "items", "oneOf", "prefixItems"}
+)
+
 #: Keywords whose value is a table *keyed by names the author chose*, so those
 #: names are data and only the values below them are schemas. Without this, a
 #: tool with an argument honestly called ``pattern`` would be refused for using
 #: the ``pattern`` keyword it never used.
 _NAMED_SUBSCHEMAS: Final[frozenset[str]] = frozenset(
     {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
-)
-
-#: Keywords whose value is an instance, not a schema: nothing inside them is a
-#: keyword either.
-_INSTANCE_VALUES: Final[frozenset[str]] = frozenset(
-    {"enum", "const", "default", "examples", "title", "description"}
 )
 
 
@@ -695,30 +745,31 @@ def _too_deep(value: object, limit: int) -> bool:
     return False
 
 
-def _unbounded_keywords(schema: object) -> list[str]:
-    """Which :data:`_UNBOUNDED_KEYWORDS` this schema actually uses.
+def _refused_keywords(schema: object) -> list[str]:
+    """Which :data:`_REFUSED_KEYWORDS` this schema actually uses.
 
-    Position-aware: a property *name* is not a keyword, and a value under
-    ``enum`` or ``default`` is not a schema at all. Iterative, for the reason
-    :func:`_too_deep` is.
+    Only true schema positions are walked — the three tables above are the
+    whole vocabulary this descends through. A dict under an unrecognised key is
+    an annotation, not a subschema: a provider that tags its tools with
+    ``"x-meta": {"pattern": ...}`` has not used the ``pattern`` keyword, and
+    refusing it would cost a legitimate tool for nothing.
+
+    Iterative, for the reason :func:`_too_deep` is.
     """
     found: set[str] = set()
     stack: list[object] = [schema]
     while stack:
         item = stack.pop()
-        if isinstance(item, list):
-            stack.extend(item)
-            continue
         if not isinstance(item, dict):
             continue
-        found |= set(item) & _UNBOUNDED_KEYWORDS
+        found |= set(item) & _REFUSED_KEYWORDS
         for key, value in item.items():
-            if key in _INSTANCE_VALUES:
-                continue
             if key in _NAMED_SUBSCHEMAS and isinstance(value, dict):
                 stack.extend(value.values())
-                continue
-            stack.append(value)
+            elif key in _SUBSCHEMA_LIST and isinstance(value, list):
+                stack.extend(value)
+            elif key in _ONE_SUBSCHEMA or key in _SUBSCHEMA_LIST:
+                stack.append(value)
     return sorted(found)
 
 
@@ -818,9 +869,40 @@ def _quote(text: str) -> str:
 # -- arguments and responses ------------------------------------------------
 
 
-def _check_arguments(
-    backend: str, capability: _Capability, arguments: dict[str, object]
+#: Wall-clock ceiling on validating one call's arguments. Checking a handful
+#: of adapter-authored scalars against a pinned schema is a matter of
+#: microseconds, so anything near this bound is already pathological; it exists
+#: only as the second layer behind the pin-time refusal above, for a cost shape
+#: nobody has thought of yet.
+SCHEMA_DEADLINE_SECONDS: Final = 5.0
+
+
+async def _check_arguments(
+    backend: str, capability: _Capability, arguments: dict[str, object], seconds: float
 ) -> None:
+    """Refuse arguments the pinned schema does not accept, within a deadline.
+
+    The cheap structural checks run here. The schema evaluation itself runs on
+    a thread, because ``jsonschema`` is synchronous and a pathological schema
+    would otherwise stall every other task in this process — including the
+    cancellation that is supposed to rescue it.
+
+    Two limits on that, both real and both measured:
+
+    **A Python thread cannot be killed.** When the deadline expires this
+    returns a refusal and the worker is left running. It is a daemon thread, so
+    it holds up neither session teardown nor interpreter exit, and it dies with
+    the process — the cost is bounded by the process, not reclaimed.
+
+    **A thread does not bound work that holds the GIL.** ``re`` does not
+    release it, so a catastrophic ``pattern`` freezes the interpreter outright
+    and this deadline never gets to fire; running the suite with one proved it
+    by hanging. That is exactly why ``pattern`` and reference resolution are
+    refused at pin time instead of being left for a timeout to catch, and why
+    this layer is a backstop rather than the defence. What it does bound is
+    Python-level cost — ``uniqueItems`` over a large argument is the measured
+    example — where the interpreter still switches threads.
+    """
     if not isinstance(arguments, dict) or not all(
         isinstance(name, str) for name in arguments
     ):
@@ -835,26 +917,71 @@ def _check_arguments(
             f"{capability.name}: {undeclared} is not declared by the pinned"
             f" input schema, so the {backend} provider is never sent it"
         )
+    failure = await _validated(backend, capability, arguments, seconds)
+    if failure is not None:
+        raise failure
+
+
+async def _validated(
+    backend: str, capability: _Capability, arguments: dict[str, object], seconds: float
+) -> ProviderError | None:
+    """The refusal this schema produces, or ``None``; never raises by itself."""
+    loop = asyncio.get_running_loop()
+    answered: asyncio.Future[ProviderError | None] = loop.create_future()
+
+    def settle(outcome: ProviderError | None) -> None:
+        if not answered.done():
+            answered.set_result(outcome)
+
+    def work() -> None:
+        outcome = _validation_failure(backend, capability, arguments)
+        try:
+            loop.call_soon_threadsafe(settle, outcome)
+        except RuntimeError:
+            # The deadline already fired, the caller already has its refusal,
+            # and the loop has since closed. There is nobody left to tell, and
+            # a worker that outlives its loop must not raise into the void.
+            pass
+
+    threading.Thread(
+        target=work, name=f"vulfi-schema-{capability.name}", daemon=True
+    ).start()
+    try:
+        return await asyncio.wait_for(asyncio.shield(answered), seconds)
+    except (asyncio.TimeoutError, TimeoutError):
+        return CapabilityUnavailableError(
+            capability.name,
+            f"the {backend} provider's {capability.name!r} input schema did not"
+            f" finish validating one call's arguments within {seconds} seconds,"
+            " so this capability is unavailable",
+        )
+
+
+def _validation_failure(
+    backend: str, capability: _Capability, arguments: dict[str, object]
+) -> ProviderError | None:
+    """Run the pinned schema. Called on a worker thread; returns, never raises."""
     try:
         jsonschema.validate(instance=arguments, schema=capability.input_schema)
     except jsonschema.ValidationError as error:
         where = "/".join(str(part) for part in error.absolute_path) or capability.name
-        raise ProviderArgumentError(
+        return ProviderArgumentError(
             f"{capability.name}: argument {where!r} does not match the pinned"
             f" input schema: {_quote(error.message)}"
-        ) from None
-    except Exception as error:  # noqa: BLE001 - see below
+        )
+    except BaseException as error:  # noqa: BLE001 - see below
         # Anything that is not "these arguments are wrong" is "this schema
         # cannot be evaluated", and that is the provider's defect, not ours:
         # an unresolvable ``$ref`` raises ``_WrappedReferencingError``, which
         # is not even a ``jsonschema`` public type. Letting it out would hand a
         # caller a foreign exception where the contract promises a reasoned
         # refusal it can record as unsupported.
-        raise CapabilityUnavailableError(
+        return CapabilityUnavailableError(
             capability.name,
             f"the {backend} provider's {capability.name!r} input schema could"
             f" not be evaluated: {_quote(f'{type(error).__name__}: {error}')}",
-        ) from None
+        )
+    return None
 
 
 def _envelope(
@@ -1061,7 +1188,8 @@ def _context(raw: object, index: int) -> RuleContext:
     unknown = sorted(set(raw) - _CONTEXT_KEYS)
     if unknown:
         raise ProviderEvidenceError(
-            f"{where}: {unknown} is not a verified fact; a context carries"
+            f"{where}: {_quote(repr(unknown))} is not a verified fact; a"
+            f" context carries"
             f" {sorted(_CONTEXT_KEYS)} and nothing else, so decompiled text"
             " cannot travel as evidence"
         )
@@ -1111,7 +1239,8 @@ def _facts(
     unknown = sorted(set(raw) - set(known))
     if unknown:
         raise ProviderEvidenceError(
-            f"{where}: {unknown} is not a fact this server can verify;"
+            f"{where}: {_quote(repr(unknown))} is not a fact this server can"
+            " verify;"
             f" the facts a backend may state are {sorted(known)}"
         )
     return {name: _fact(name, value, known[name], where) for name, value in raw.items()}
@@ -1122,26 +1251,28 @@ def _fact(name: str, value: object, kind: str, where: str) -> Any:
     if kind == "bool":
         if not isinstance(value, bool):
             raise ProviderEvidenceError(
-                f"{place} must be a boolean, got {value!r}; a fact a backend"
-                " did not establish is left out, never guessed"
+                f"{place} must be a boolean, got {_quote(repr(value))}; a fact a"
+                " backend did not establish is left out, never guessed"
             )
         return value
     if kind == "str":
         if not isinstance(value, str):
-            raise ProviderEvidenceError(f"{place} must be a string, got {value!r}")
+            raise ProviderEvidenceError(
+                f"{place} must be a string, got {_quote(repr(value))}"
+            )
         return _sanitize(value)
     if kind == "number_or_none":
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ProviderEvidenceError(
-                f"{place} must be a number or null, got {value!r}"
+                f"{place} must be a number or null, got {_quote(repr(value))}"
             )
         return value
     if kind == "size":
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ProviderEvidenceError(
-                f"{place} must be an integer >= 0, got {value!r}"
+                f"{place} must be an integer >= 0, got {_quote(repr(value))}"
             )
         return value
     if kind == "names":
@@ -1149,7 +1280,7 @@ def _fact(name: str, value: object, kind: str, where: str) -> Any:
             isinstance(item, str) for item in value
         ):
             raise ProviderEvidenceError(
-                f"{place} must be a list of strings, got {value!r}"
+                f"{place} must be a list of strings, got {_quote(repr(value))}"
             )
         return tuple(_sanitize(item) for item in value)
     if kind == "values":
@@ -1158,7 +1289,7 @@ def _fact(name: str, value: object, kind: str, where: str) -> Any:
             for item in value
         ):
             raise ProviderEvidenceError(
-                f"{place} must be a list of numbers, got {value!r}"
+                f"{place} must be a list of numbers, got {_quote(repr(value))}"
             )
         return tuple(value)
     raise ProviderEvidenceError(  # pragma: no cover - the tables above are closed
