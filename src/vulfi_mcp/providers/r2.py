@@ -1185,6 +1185,9 @@ async def _sweep(
         try:
             chunk = await _read(session, cursor, want)
         except ProviderError as refused:
+            # A dead session, before any byte or after some. The field is
+            # what routing reads; the sentence on ``reason`` is for a human.
+            entry["refusal"] = str(refused)
             if not read:
                 entry["coverage"] = "unavailable"
                 entry["unvisited"] = [{"start": cursor, "end": end}]
@@ -1534,17 +1537,21 @@ def _unavailable_pass(image: _Image, name: str, reason: str) -> PreparedPass:
     needed it reports ``unavailable`` over every range it would have covered,
     and the passes beside it keep their results.
     """
+    ranges = []
+    for block in image.sections:
+        item = _unavailable(
+            block,
+            "code_scan" if name == "functions" else "raw_bytes",
+            f"the {name!r} pass could not be answered: {reason}",
+        )
+        # The catch that built this pass refused a call. Routing reads the
+        # field, not the sentence on the range.
+        item["refusal"] = reason
+        ranges.append(item)
     return _pass_result(
         image,
         name,
-        [
-            _unavailable(
-                block,
-                "code_scan" if name == "functions" else "raw_bytes",
-                f"the {name!r} pass could not be answered: {reason}",
-            )
-            for block in image.sections
-        ],
+        ranges,
         [],
         [*image.warnings, f"the {name!r} pass was not answered: {reason}"],
     )

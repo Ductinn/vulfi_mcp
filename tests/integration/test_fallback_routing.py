@@ -895,3 +895,225 @@ def test_an_r2_unavailable_pass_is_failed_and_not_dropped(
     ), detail
     assert reused["coverage"] != "complete", detail
     assert not (reused["state"] == "answered" and reused["attempts"] == []), detail
+
+
+
+def _own_r2mcp_pids() -> list[int]:
+    """r2mcp processes this test started, not the Ghidra JVM."""
+    me = str(os.getpid())
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        comm_end = stat.rfind(")")
+        if comm_end < 0:
+            continue
+        fields = stat[comm_end + 2 :].split()
+        if len(fields) < 2 or fields[1] != me:
+            continue
+        comm = stat[stat.find("(") + 1 : comm_end]
+        if comm == "r2mcp":
+            found.append(int(entry.name))
+    return found
+
+
+def _data_only_elf(tmp_path: Path) -> Path:
+    """An ELF whose sections are readable and none are executable.
+
+    A normal image keeps the strings pass ``partial`` when a read dies,
+    because executable sections are an intentional skip. This image has no
+    such skip, so a dead read is the whole pass.
+    """
+    source = tmp_path / "dataonly.c"
+    source.write_text('const char vulfi_only[] = "vulfi-data-only-marker";\n', encoding="utf-8")
+    script = tmp_path / "dataonly.ld"
+    script.write_text("SECTIONS { .rodata 0x400000 : { *(.rodata*) } }\n", encoding="utf-8")
+    binary = tmp_path / "dataonly"
+    completed = subprocess.run(
+        [
+            "gcc",
+            "-nostdlib",
+            "-nostartfiles",
+            "-e",
+            "0",
+            "-Wl,-T," + str(script),
+            "-o",
+            str(binary),
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"building a data-only ELF failed ({completed.returncode}):\n"
+            f"{completed.stderr.strip()}"
+        )
+    return binary
+
+
+def _r2mcp_children() -> list[int]:
+    me = str(os.getpid())
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        comm_end = stat.rfind(")")
+        if comm_end < 0:
+            continue
+        fields = stat[comm_end + 2 :].split()
+        if len(fields) < 2 or fields[1] != me:
+            continue
+        if stat[stat.find("(") + 1 : comm_end] == "r2mcp":
+            found.append(int(entry.name))
+    return found
+
+
+def _kill_r2_before_hexdump(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIGKILL this test's r2mcp child on the first read, then call through.
+
+    The session has already opened and analysed: ``_read`` is the first
+    ``hexdump``. The refusal has to be the dead child's own connection error.
+    Ghidra is not signalled.
+    """
+    import signal
+
+    import vulfi_mcp.providers.r2 as r2
+
+    real = r2._read
+
+    async def kill_then_read(session: Any, start: int, length: int) -> bytes:
+        # Each session has its own child. Kill it once, on the read that
+        # would have been hexdump, then let the real call observe the death.
+        for pid in _r2mcp_children():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+        return await real(session, start, length)
+
+    monkeypatch.setattr(r2, "_read", kill_then_read)
+
+
+def _killed_strings_row(binary: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    requested = ("strings", "structures")
+    routed = _route_passes(str(binary), ("r2",), requested)
+    strings = routing_for({"routing": routed.routing}, "strings")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    report = _record(str(binary), "r2", ("r2",), requested, routed)
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_pass(
+            report["analysis_id"],
+            {
+                "pass": "strings",
+                "backend": "ghidra",
+                "ranges": [{"start": 0x1000, "end": 0x2000}],
+                "coverage": "complete",
+                "applied_ids": [],
+                "candidate_ids": [],
+                "candidates": [],
+                "warnings": [],
+                "artifact_revision": None,
+            },
+        )
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("strings",), stored)
+    held = [
+        {
+            "backend": entry["backend"],
+            "coverage": entry["coverage"],
+            "reasons": [item.get("reason") for item in entry.get("ranges", []) if isinstance(item, dict)],
+            "warnings": entry.get("warnings"),
+        }
+        for entry in stored
+        if entry["pass"] == "strings"
+    ]
+    return {"strings": strings, "structures": structures, "held": held}, reused
+
+
+def test_a_killed_r2_read_is_failed_on_both_image_shapes(
+    compiled_calls: Path,
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dead r2mcp child during a read is failed, skip or no skip.
+
+    SIGKILL before ``hexdump``. On a data-only image every range is that
+    read, so the pass is unavailable and was recorded ``unsupported``. On a
+    normal ELF the executable sections are an intentional skip, so the same
+    kill was recorded ``answered``/``partial`` and the chain did not advance.
+    Both must be ``failed`` with the child's own refusal. ``structures`` has
+    no typed tool and stays unsupported. A later complete answer may sit
+    beside the failure and must not report ``complete``.
+    """
+    require_r2()
+    data_only = _data_only_elf(tmp_path)
+    _kill_r2_before_hexdump(monkeypatch)
+    data_rows, data_reused = _killed_strings_row(data_only)
+    # A second session, killed the same way. The patch is still installed.
+    elf_rows, elf_reused = _killed_strings_row(compiled_calls)
+    detail = (
+        f"data strings={data_rows['strings']!r}\n"
+        f"data structures={data_rows['structures']!r}\n"
+        f"data reused={data_reused!r}\n"
+        f"elf strings={elf_rows['strings']!r}\n"
+        f"elf structures={elf_rows['structures']!r}\n"
+        f"elf reused={elf_reused!r}\n"
+        f"data held={data_rows['held']!r}\n"
+        f"elf held={elf_rows['held']!r}"
+    )
+    for label, rows, reused in (
+        ("data-only", data_rows, data_reused),
+        ("elf", elf_rows, elf_reused),
+    ):
+        attempt = next(
+            item for item in rows["strings"]["attempts"] if item["backend"] == "r2"
+        )
+        assert attempt["outcome"] == "failed", detail
+        assert attempt["reason"], detail
+        assert "named no reason" not in attempt["reason"], detail
+        assert "Connection closed" in attempt["reason"] or "MCP" in attempt["reason"], detail
+        assert rows["structures"]["attempts"][0]["outcome"] == "unsupported", detail
+        assert reused["coverage"] != "complete", detail
+        assert not (reused["state"] == "answered" and reused["attempts"] == []), detail
+        assert any(
+            item["backend"] == "r2" and item["outcome"] == "failed" and item["reason"]
+            for item in reused["attempts"]
+        ), detail
+        assert label
+
+
+def test_a_read_budget_stop_is_not_a_failed_pass(
+    compiled_calls: Path,
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running out of read budget is a partial answer, not a dead session."""
+    require_r2()
+    import vulfi_mcp.providers.r2 as r2
+
+    monkeypatch.setattr(r2, "MAX_PASS_READ_BYTES", 1)
+    routed = _route_passes(str(compiled_calls), ("r2",), ("strings", "structures"))
+    strings = routing_for({"routing": routed.routing}, "strings")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    (strings_attempt,) = strings["attempts"]
+    (structures_attempt,) = structures["attempts"]
+    assert strings_attempt["outcome"] != "failed", strings
+    assert strings_attempt["outcome"] == "answered", strings
+    assert strings["coverage"] != "complete", strings
+    assert structures_attempt["outcome"] == "unsupported", structures

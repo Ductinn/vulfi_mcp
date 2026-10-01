@@ -2523,11 +2523,12 @@ def _route_passes(
     The loop below is the whole of per-pass routing, and every branch in it
     is one of the five outcomes :data:`vulfi_mcp.contracts.AttemptOutcome`
     names. A pass a backend produced a result for is answered and is never
-    asked of another backend. A pass whose coverage is ``unavailable`` is
-    one of two facts, and they are not collapsed: no typed tool is
-    ``unsupported`` and the chain advances; a session that opened and could
-    not finish that one pass is ``failed``, recorded, and the chain advances
-    past that pass alone. A backend that could not be reached advances the
+    asked of another backend, unless a catch marked ``refusal`` on the pass
+    or on any of its ranges. That mark is a call the session opened and
+    could not finish — failed, for that pass alone, even when a sibling
+    range is an intentional skip and the coverage word is ``partial``.
+    ``unavailable`` without the mark is no typed tool: ``unsupported``, and
+    the chain advances. A backend that could not be reached advances the
     chain too. A backend that opened a session and failed the call outright
     advances it as well — and its failure stays in ``attempts``, is carried
     into the stored revision's warnings, and keeps the pass from being read
@@ -2586,20 +2587,17 @@ def _route_passes(
                 attempts[name].append(_attempt(backend, "failed", missing))
                 extra.append((_failed_pass(name, backend, missing), {}))
                 continue
+            # A refused call is failed even when coverage is partial: an
+            # intentional skip on a sibling range must not launder a dead
+            # provider into an answered row. The field is set at the catch.
+            # Warning prose is not consulted — the next catch would speak a
+            # sentence this has not heard.
+            refusal = _call_refusal(entry)
+            if refusal is not None:
+                attempts[name].append(_attempt(backend, "failed", refusal))
+                extra.append((_failed_pass(name, backend, refusal), {}))
+                continue
             if str(entry.get("coverage")) == "unavailable":
-                # Two shapes share this coverage, and they are not the same
-                # fact. A pass with no typed tool says so before any call and
-                # stays unsupported. A session that opened and then could not
-                # finish — schema drift, a refused call, a killed child — is
-                # failed, for this pass alone, and the refusal is what is
-                # stored so a later answer cannot erase it.
-                unfinished = _unfinished_reason(entry)
-                if unfinished is not None:
-                    attempts[name].append(
-                        _attempt(backend, "failed", unfinished)
-                    )
-                    extra.append((_failed_pass(name, backend, unfinished), {}))
-                    continue
                 attempts[name].append(
                     _attempt(backend, "unsupported", _range_reason(entry))
                 )
@@ -2709,38 +2707,22 @@ def _unavailable_error(backend: str) -> type[BaseException]:
     )
 
 
-def _unfinished_reason(entry: Mapping[str, Any]) -> str | None:
-    """The refusal of a pass a session opened and could not finish.
+def _call_refusal(entry: Mapping[str, Any]) -> str | None:
+    """The provider's refusal, if a catch marked this pass or any range.
 
-    Two adapter shapes, kept distinct from "no typed tool". Ghidra's
-    ``_run_pass`` catches ``ProviderError`` and returns empty ranges with the
-    refusal only in a warning, ``the {pass!r} pass could not finish: ...``.
-    radare2's ``_unavailable_pass`` puts ``the {pass!r} pass could not be
-    answered: ...`` on every range, and the same refusal in a warning. A
-    ``_NO_SOURCE`` pass uses neither spelling and is not this: it is a
-    capability the backend states it does not have, which stays
-    ``unsupported``.
-
-    The text returned is the provider's own refusal, without the adapter's
-    prefix, so a stored attempt quotes what was refused rather than "named
-    no reason".
+    Adapters set ``refusal`` at the catch that saw ``ProviderError``. This
+    does not read warning prose. One marked range fails the pass even when
+    a sibling range is an intentional skip and the coverage word is
+    ``partial``. A missing tool, a budget stop, and a short read that is
+    not a provider error do not set the field, and are not this.
     """
-    name = entry.get("pass")
-    if not isinstance(name, str) or not name:
-        return None
-    finish = f"the {name!r} pass could not finish: "
-    for warning in _strings(entry.get("warnings")):
-        if warning.startswith(finish):
-            return warning[len(finish) :]
-    unanswered = f"the {name!r} pass could not be answered: "
+    refusal = entry.get("refusal")
+    if isinstance(refusal, str) and refusal:
+        return refusal
     for item in _entries(entry.get("ranges")):
-        reason = item.get("reason")
-        if isinstance(reason, str) and reason.startswith(unanswered):
-            return reason[len(unanswered) :]
-    noted = f"the {name!r} pass was not answered: "
-    for warning in _strings(entry.get("warnings")):
-        if warning.startswith(noted):
-            return warning[len(noted) :]
+        refusal = item.get("refusal")
+        if isinstance(refusal, str) and refusal:
+            return refusal
     return None
 
 

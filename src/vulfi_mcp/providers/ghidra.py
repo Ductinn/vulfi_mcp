@@ -1365,13 +1365,16 @@ async def _run_pass(
         # "we could not look" into "we looked and there was nothing".
         raise
     except ProviderError as refused:
-        return _pass_result(
+        result = _pass_result(
             program,
             name,
             [],
             [],
             [f"the {name!r} pass could not finish: {refused}"],
         )
+        # No range to hang the refusal on. The pass itself carries it.
+        result["refusal"] = str(refused)
+        return result
 
 
 async def _strings_pass(
@@ -1659,6 +1662,9 @@ async def _sweep(
         try:
             chunk = await _read(session, cursor, want)
         except ProviderError as refused:
+            # A dead session, before any byte or after some. The field is
+            # what routing reads; the sentence on ``reason`` is for a human.
+            entry["refusal"] = str(refused)
             if not read:
                 entry["coverage"] = "unavailable"
                 entry["unvisited"] = [{"start": cursor, "end": end}]

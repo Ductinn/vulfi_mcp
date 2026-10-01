@@ -8,7 +8,7 @@ in the managed IDB netnode. This module deliberately imports nothing from
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict
 
 __all__ = [
     "AddressGap",
@@ -308,6 +308,12 @@ class AddressRange(TypedDict):
     coverage: RangeCoverage
     unvisited: list[AddressGap]
     reason: str | None
+    #: Present only when a session was open and a call that would have read
+    #: this range was refused. The value is the provider's own refusal.
+    #: A budget stop, an intentional skip, and a short read that is not a
+    #: provider error do not set it. Routing reads this field; it does not
+    #: parse ``reason`` or warnings.
+    refusal: NotRequired[str]
 
 
 class Candidate(TypedDict):
@@ -377,7 +383,9 @@ class RuleEvidence(TypedDict):
 #: ``complete`` over a range it stopped in the middle of. ``applied_ids`` and
 #: ``candidate_ids`` both name rows in ``candidates``; a candidate id that is
 #: not in ``applied_ids`` changed nothing. ``artifact_revision`` is the
-#: managed artifact's revision these results describe.
+#: managed artifact's revision these results describe. ``refusal`` is
+#: set only when a session was open and a call was refused before this
+#: pass had a range to name; routing reads that field, not warning prose.
 PassResult = TypedDict(
     "PassResult",
     {
@@ -389,6 +397,7 @@ PassResult = TypedDict(
         "candidate_ids": list[str],
         "warnings": list[str],
         "artifact_revision": int | None,
+        "refusal": NotRequired[str],
     },
 )
 

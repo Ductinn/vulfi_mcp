@@ -1167,6 +1167,7 @@ def test_unfinished_pass_shapes_stay_failed_and_missing_tools_do_not(
         [],
         [f"the {'strings'!r} pass could not finish: {refusal}"],
     )
+    ghidra_failed["refusal"] = refusal
     ghidra_missing = ghidra_pass(
         program, "structures", [], [], [GHIDRA_NO_SOURCE["structures"]]
     )
@@ -1274,3 +1275,75 @@ def test_unfinished_pass_shapes_stay_failed_and_missing_tools_do_not(
         if entry["pass"] == "strings" and entry["backend"] == "ghidra"
     )
     assert _failure_reason(held) == refusal
+
+    # A refused read beside an intentional skip is still failed. A budget
+    # stop, which does not set the field, is not.
+    skipped = {
+        "name": ".text",
+        "stage": "raw_bytes",
+        "start": 0x401000,
+        "end": 0x402000,
+        "coverage": "partial",
+        "unvisited": [{"start": 0x401000, "end": 0x402000}],
+        "reason": (
+            "this range holds code the provider's analysis already defines,"
+            " so this pass did not read it for text"
+        ),
+    }
+    dead = {
+        "name": ".rodata",
+        "stage": "raw_bytes",
+        "start": 0x403000,
+        "end": 0x404000,
+        "coverage": "unavailable",
+        "unvisited": [{"start": 0x403000, "end": 0x404000}],
+        "reason": "this range could not be read: MCPError: Connection closed",
+        "refusal": "the r2 provider failed to answer 'hexdump': MCPError: Connection closed",
+    }
+    budget = {
+        "name": ".data",
+        "stage": "raw_bytes",
+        "start": 0x405000,
+        "end": 0x406000,
+        "coverage": "partial",
+        "unvisited": [{"start": 0x405010, "end": 0x406000}],
+        "reason": "this pass's read budget ran out",
+    }
+
+    async def mixed(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        produced = {
+            "strings": {
+                "pass": "strings",
+                "backend": "r2",
+                "ranges": [skipped, dead],
+                "coverage": "partial",
+                "applied_ids": [],
+                "candidate_ids": [],
+                "warnings": ["a read died"],
+                "artifact_revision": None,
+                "candidates": [],
+            },
+            "functions": {
+                "pass": "functions",
+                "backend": "r2",
+                "ranges": [budget],
+                "coverage": "partial",
+                "applied_ids": [],
+                "candidate_ids": [],
+                "warnings": [],
+                "artifact_revision": None,
+                "candidates": [],
+            },
+        }
+        return tuple(produced[name] for name in passes)
+
+    monkeypatch.setitem(prepare._PREPARE, "r2", mixed)
+    mixed_routed = _route_passes(str(binary), ("r2",), ("strings", "functions"))
+    mixed_rows = {row["pass"]: row for row in mixed_routed.routing}
+    (dead_attempt,) = mixed_rows["strings"]["attempts"]
+    assert dead_attempt["outcome"] == "failed"
+    assert "Connection closed" in (dead_attempt["reason"] or "")
+    assert mixed_rows["strings"]["state"] != "answered"
+    (budget_attempt,) = mixed_rows["functions"]["attempts"]
+    assert budget_attempt["outcome"] == "answered"
+    assert budget_attempt["outcome"] != "failed"
