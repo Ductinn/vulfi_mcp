@@ -28,7 +28,8 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -435,8 +436,11 @@ def test_decompiler_unavailable_runs_real_fallback(
 
 @pytest.mark.requires_ida
 def test_provider_timeout_and_hash_mismatch_preserve_assessments(
-    compiled_calls: Path, tmp_path: Path, managed_data_dir: Path,
+    compiled_calls: Path,
+    tmp_path: Path,
+    managed_data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    durable_or_reported: Callable[[], AbstractContextManager[list[str]]],
 ) -> None:
     """A provider that cannot be reached never retires a stored row.
 
@@ -445,86 +449,97 @@ def test_provider_timeout_and_hash_mismatch_preserve_assessments(
     pointing at a same-named file with different bytes, which is an identity
     refusal rather than a capability one. Neither may delete a row, and the
     IDA scope they sit beside is untouched by both.
+
+    This scans one target three times, so it saves the managed database three
+    times, and IDA 9.4.260714's open bad-pack defect applies — see
+    ``tests/conftest.py``. The body runs under the repository's own tolerance
+    for that one named vendor defect: either every assertion below stood, or
+    the loss was reported *and* the rolled-back database is still internally
+    consistent. Do not delete the tolerance to make this test look tidier.
     """
-    rules = load_stock_rules()
-    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(tmp_path / "absent.toml"))
-    # The decompiler is off, so some rules really do fall through to the
-    # providers — which is the only way an unreachable provider can be
-    # observed deciding anything.
-    first = scan_target(
-        str(compiled_calls),
-        rules,
-        "custom:probe",
-        backend="auto",
-        decompiler="disabled",
-    )
-    ida_rows = {row["id"] for row in first["findings"] if row["backend"] == "ida"}
-    routed = {row["rule_index"]: row for row in rule_routing(first)}
-    reached = [
-        row
-        for row in routed.values()
-        if any(item["backend"] != "ida" for item in row["attempts"])
-    ]
-    assert reached, routed
-    for row in reached:
-        for attempt in row["attempts"]:
-            if attempt["backend"] == "ida":
-                continue
-            assert attempt["outcome"] == "unavailable", (row["rule_index"], attempt)
-            assert "is configured" in str(attempt["reason"])
-
-    # Now give Ghidra a map that resolves to a same-named, different-bytes
-    # file. The refusal is an identity failure, and the chain stops there
-    # rather than letting radare2 answer for a binary nobody matched.
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / compiled_calls.name).write_bytes(b"\x7fELFnot the same image")
-    config = tmp_path / "providers.toml"
-    config.write_text(
-        "\n".join(
-            (
-                "[ghidra]",
-                'transport = "stdio"',
-                'command = "/bin/false"',
-                "args = []",
-                "",
-                "[[ghidra.binaries]]",
-                f'local = "{compiled_calls.parent}"',
-                f'remote = "{elsewhere}"',
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(config))
-    second = scan_target(
-        str(compiled_calls),
-        rules,
-        "custom:probe",
-        backend="auto",
-        decompiler="disabled",
-    )
-    routed = {row["rule_index"]: row for row in rule_routing(second)}
-    refused = [
-        row
-        for row in routed.values()
-        if any(item["outcome"] == "unverified" for item in row["attempts"])
-    ]
-    assert refused, routed
-    for row in refused:
-        assert row["state"] == "unverified"
-        assert "does not hash to the same bytes" in str(row["reason"])
-        assert [item["backend"] for item in row["attempts"]][-1] == "ghidra", (
-            "an identity refusal must stop the chain, not advance past it"
+    with durable_or_reported() as produced:
+        rules = load_stock_rules()
+        monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(tmp_path / "absent.toml"))
+        # The decompiler is off, so some rules really do fall through to the
+        # providers — which is the only way an unreachable provider can be
+        # observed deciding anything.
+        first = scan_target(
+            str(compiled_calls),
+            rules,
+            "custom:probe",
+            backend="auto",
+            decompiler="disabled",
         )
+        managed = existing_managed_idb(str(compiled_calls))
+        assert managed is not None
+        produced.append(managed)
+        ida_rows = {row["id"] for row in first["findings"] if row["backend"] == "ida"}
+        routed = {row["rule_index"]: row for row in rule_routing(first)}
+        reached = [
+            row
+            for row in routed.values()
+            if any(item["backend"] != "ida" for item in row["attempts"])
+        ]
+        assert reached, routed
+        for row in reached:
+            for attempt in row["attempts"]:
+                if attempt["backend"] == "ida":
+                    continue
+                assert attempt["outcome"] == "unavailable", (row["rule_index"], attempt)
+                assert "is configured" in str(attempt["reason"])
 
-    # The IDA scope is exactly where it was. Nothing an unreachable or
-    # unverifiable provider did touched it.
-    page = findings_across_backends(str(compiled_calls), None, 0, 200)
-    assert {row["id"] for row in page["findings"] if row["backend"] == "ida"} >= (
-        ida_rows
-    )
-    assert page["store_health"]["ida"]["available"] is True
+        # Now give Ghidra a map that resolves to a same-named, different-bytes
+        # file. The refusal is an identity failure, and the chain stops there
+        # rather than letting radare2 answer for a binary nobody matched.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / compiled_calls.name).write_bytes(b"\x7fELFnot the same image")
+        config = tmp_path / "providers.toml"
+        config.write_text(
+            "\n".join(
+                (
+                    "[ghidra]",
+                    'transport = "stdio"',
+                    'command = "/bin/false"',
+                    "args = []",
+                    "",
+                    "[[ghidra.binaries]]",
+                    f'local = "{compiled_calls.parent}"',
+                    f'remote = "{elsewhere}"',
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(config))
+        second = scan_target(
+            str(compiled_calls),
+            rules,
+            "custom:probe",
+            backend="auto",
+            decompiler="disabled",
+        )
+        routed = {row["rule_index"]: row for row in rule_routing(second)}
+        refused = [
+            row
+            for row in routed.values()
+            if any(item["outcome"] == "unverified" for item in row["attempts"])
+        ]
+        assert refused, routed
+        for row in refused:
+            assert row["state"] == "unverified"
+            assert "does not hash to the same bytes" in str(row["reason"])
+            assert [item["backend"] for item in row["attempts"]][-1] == "ghidra", (
+                "an identity refusal must stop the chain, not advance past it"
+            )
+
+        # The IDA scope is exactly where it was. Nothing an unreachable or
+        # unverifiable provider did touched it.
+        page = findings_across_backends(str(compiled_calls), None, 0, 200)
+        assert {row["id"] for row in page["findings"] if row["backend"] == "ida"} >= (
+            ida_rows
+        )
+        assert page["store_health"]["ida"]["available"] is True
 
 
 @pytest.mark.requires_ghidra
