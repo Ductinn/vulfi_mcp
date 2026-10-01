@@ -14,6 +14,14 @@ fingerprint or a segment-byte association. A matching file name is not
 evidence, and this module refuses to treat it as evidence through either
 entry point.
 
+The reverse join — a caller presenting raw bytes and the database it just
+built from them — is accepted, because that is how preparation works, but it
+is recorded as :data:`ASSOCIATION_ASSERTED` rather than as proof, and
+``Catalog.source_association`` says so. A later database-only read inherits
+that identity knowing nobody compared any bytes, and
+:meth:`Catalog.attach_source` can still upgrade it to
+:data:`ASSOCIATION_VERIFIED`.
+
 **Creating is not reading.** :func:`open_catalog` is the mutation path and may
 bring the database into existence. :func:`get_catalog` is read-only, opens
 SQLite in ``mode=ro``, and never creates a file or a directory; when there is
@@ -42,6 +50,8 @@ from vulfi_mcp.ida_adapter import IDB_SUFFIXES, data_dir
 from vulfi_mcp.ida_runtime import OperationError, utc_now, validate_page
 
 __all__ = [
+    "ASSOCIATION_ASSERTED",
+    "ASSOCIATION_VERIFIED",
     "CATALOG_NAME",
     "CATALOG_UNAVAILABLE_REASON",
     "MIN_SEGMENT_PROOF_BYTES",
@@ -78,9 +88,10 @@ CATALOG_UNAVAILABLE_REASON: Final = (
 HASH_CHUNK: Final = 1 << 20
 
 #: Smallest segment-byte association this module will accept as proof that a
-#: database and a file describe the same image. A handful of matching bytes is
-#: a coincidence; a quarter of a kilobyte landing exactly where the database
-#: says it does is not.
+#: database and a file describe the same image, counted over *distinct* file
+#: offsets. A handful of matching bytes is a coincidence; a quarter of a
+#: kilobyte landing exactly where the database says it does is not — but only
+#: if the spans are distinct, since one span repeated proves only itself.
 MIN_SEGMENT_PROOF_BYTES: Final = 256
 
 #: Bounds on a supplied association, so a "proof" cannot become a denial of
@@ -112,9 +123,25 @@ BACKENDS: Final = frozenset({"ida", "ghidra", "r2"})
 #: the dashed spelling of the same value.
 _ID_CHARACTERS: Final = frozenset("0123456789abcdefABCDEF-")
 
+#: How a target's database and its original bytes came to be joined.
+#: ``verified`` means :meth:`Catalog.attach_source` checked the bytes on disk
+#: against a proof read out of the database. ``asserted`` means a caller handed
+#: both identities to :func:`open_catalog` in one breath and this module took
+#: its word for it, which is right for the flow that just built the database
+#: from those very bytes and is nothing at all for a caller that merely says
+#: so. The distinction is stored, so a later database-only read can tell them
+#: apart instead of inheriting an identity it cannot check.
+ASSOCIATION_VERIFIED: Final = "verified"
+ASSOCIATION_ASSERTED: Final = "asserted"
+
 #: Proof kinds the spec names for joining a provisional target to raw bytes.
 _FINGERPRINT: Final = "input_fingerprint"
 _SEGMENT_BYTES: Final = "segment_bytes"
+
+#: What is written to ``targets.source_proof`` for an asserted join. It is not
+#: a proof and does not pretend to be one: it records that the join rests on
+#: the caller's say-so, and when.
+_ASSERTED_KIND: Final = "asserted_by_caller"
 
 #: One schema, created once, in one transaction. The last five tables belong to
 #: Plans 3 and 4; they are created here so there is one versioned schema rather
@@ -380,7 +407,13 @@ def get_catalog(path: str, managed_idb_id: str | None = None) -> Catalog | None:
 class _Target:
     """The identity a :class:`Catalog` answers for."""
 
-    __slots__ = ("key", "managed_idb_id", "present", "source_sha256")
+    __slots__ = (
+        "association",
+        "key",
+        "managed_idb_id",
+        "present",
+        "source_sha256",
+    )
 
     def __init__(
         self,
@@ -389,10 +422,14 @@ class _Target:
         managed_idb_id: str | None,
         *,
         present: bool,
+        association: str | None = None,
     ) -> None:
         self.key = key
         self.source_sha256 = source_sha256
         self.managed_idb_id = managed_idb_id
+        #: ``verified``, ``asserted`` or ``None`` when there is no join between
+        #: a database and raw bytes to describe.
+        self.association = association
         #: Whether a row for this target is actually stored. A read of a target
         #: nothing has prepared is an empty catalog, not a missing one, and
         #: must not write the row it did not find.
@@ -447,6 +484,20 @@ class Catalog:
     def managed_idb_id(self) -> str | None:
         """The provisional identity minted in the managed database's netnode."""
         return self._target.managed_idb_id
+
+    @property
+    def source_association(self) -> str | None:
+        """How the database and the original bytes came to be joined.
+
+        :data:`ASSOCIATION_VERIFIED` when :meth:`attach_source` checked bytes
+        on disk against a proof read out of the database,
+        :data:`ASSOCIATION_ASSERTED` when a caller presented both identities
+        together and this store took its word for it, and ``None`` when the
+        target carries only one of the two identities and so has no join to
+        describe. A caller that reports a database-only target's
+        ``source_sha256`` as established fact must look here first.
+        """
+        return self._target.association
 
     @property
     def writable(self) -> bool:
@@ -507,6 +558,18 @@ class Catalog:
         sha256 = str(verified["sha256"])
 
         if self._target.source_sha256 == sha256:
+            if self._target.association == ASSOCIATION_ASSERTED:
+                # The bytes were already joined to this database on a caller's
+                # word; the same bytes now carry proof, so the record stops
+                # being an assertion.
+                with self._transaction() as connection:
+                    self._ensure_target(connection)
+                    connection.execute(
+                        "UPDATE targets SET source_proof = ?, updated_at = ?"
+                        " WHERE target_key = ?",
+                        (stored_proof, utc_now(), self._target.key),
+                    )
+                self._target.association = ASSOCIATION_VERIFIED
             return self._identity_payload()
         if self._target.source_sha256 is not None:
             raise CatalogError(
@@ -530,6 +593,9 @@ class Catalog:
                 (sha256, stored_proof, utc_now(), self._target.key),
             )
         self._target.source_sha256 = sha256
+        self._target.association = (
+            ASSOCIATION_VERIFIED if self._target.managed_idb_id else None
+        )
         return self._identity_payload()
 
     # -- writes -------------------------------------------------------------
@@ -542,12 +608,18 @@ class Catalog:
         not the candidates it had already described.
 
         Re-running a pass replaces that pass's own candidates and nothing else:
-        a second run of ``strings`` does not retire what ``functions`` found. A
-        result that carries no ``candidates`` list restates the pass without
-        restating its findings, and the rows it recorded earlier stay as they
-        are. Either way the stored ``candidate_ids`` names the candidate rows
-        this store actually holds, so a declared list that does not match them
-        is refused rather than written down as a claim nothing backs.
+        a second run of ``strings`` does not retire what ``functions`` found,
+        and a candidate the new run still names is updated in place rather than
+        deleted and recreated. That distinction is load-bearing: ``proposals``
+        cascade from ``candidates``, so a re-run that recreated an unchanged
+        candidate would destroy every decision recorded against it. Only the
+        candidates the new result no longer names are deleted, and their
+        proposals go with them. A result that carries no ``candidates`` list
+        restates the pass without restating its findings, and the rows it
+        recorded earlier stay as they are. Either way the stored
+        ``candidate_ids`` names the candidate rows this store actually holds,
+        so a declared list that does not match them is refused rather than
+        written down as a claim nothing backs.
         """
         self._require_writable()
         identifier = _validate_id(analysis_id, "analysis_id")
@@ -603,17 +675,53 @@ class Catalog:
                 ),
             )
             if parsed["replaces_candidates"]:
-                connection.execute(
-                    "DELETE FROM candidates WHERE analysis_id = ?"
-                    " AND pass_name = ? AND backend = ?",
-                    (identifier, parsed["pass"], parsed["backend"]),
-                )
+                keep = set(stored_ids)
+                held = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT candidate_id FROM candidates WHERE analysis_id"
+                        " = ? AND pass_name = ? AND backend = ?"
+                        " ORDER BY candidate_id",
+                        (identifier, parsed["pass"], parsed["backend"]),
+                    )
+                ]
+                for candidate_id in held:
+                    if candidate_id in keep:
+                        continue
+                    connection.execute(
+                        "DELETE FROM candidates WHERE analysis_id = ?"
+                        " AND candidate_id = ?",
+                        (identifier, candidate_id),
+                    )
             for row in rows:
+                owner = connection.execute(
+                    "SELECT pass_name, backend FROM candidates WHERE"
+                    " analysis_id = ? AND candidate_id = ?",
+                    (identifier, row["candidate_id"]),
+                ).fetchone()
+                if owner is not None and tuple(owner) != (
+                    parsed["pass"],
+                    parsed["backend"],
+                ):
+                    raise CatalogError(
+                        f"candidate {row['candidate_id']!r} is already held by"
+                        f" pass {owner[0]!r} on backend {owner[1]!r} of this"
+                        f" analysis, so a {parsed['pass']!r} result may not"
+                        " take it over: one candidate id names one finding"
+                    )
                 connection.execute(
                     "INSERT INTO candidates (analysis_id, candidate_id,"
                     " pass_name, backend, kind, address_space, address,"
                     " evidence, confidence, state, reason, recorded_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(analysis_id, candidate_id) DO UPDATE SET"
+                    " kind = excluded.kind,"
+                    " address_space = excluded.address_space,"
+                    " address = excluded.address,"
+                    " evidence = excluded.evidence,"
+                    " confidence = excluded.confidence,"
+                    " state = excluded.state, reason = excluded.reason,"
+                    " recorded_at = excluded.recorded_at",
                     (
                         identifier,
                         row["candidate_id"],
@@ -691,6 +799,7 @@ class Catalog:
             "target_key": self._target.key,
             "source_sha256": self._target.source_sha256,
             "managed_idb_id": self._target.managed_idb_id,
+            "source_association": self._target.association,
         }
 
     def _require_writable(self) -> None:
@@ -714,13 +823,26 @@ class Catalog:
         if self._target.present:
             return
         now = utc_now()
+        proof = (
+            _dump_json(
+                {
+                    "kind": _ASSERTED_KIND,
+                    "managed_idb_id": self._target.managed_idb_id,
+                    "source_sha256": self._target.source_sha256,
+                    "asserted_at": now,
+                }
+            )
+            if self._target.association == ASSOCIATION_ASSERTED
+            else None
+        )
         connection.execute(
             "INSERT INTO targets (target_key, source_sha256, managed_idb_id,"
-            " source_proof, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)",
+            " source_proof, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 self._target.key,
                 self._target.source_sha256,
                 self._target.managed_idb_id,
+                proof,
                 now,
                 now,
             ),
@@ -839,11 +961,18 @@ def _resolve_target(
     The one join this refuses is the dangerous one: raw bytes arriving for a
     stored target that was never shown to come from them. That is what
     :meth:`Catalog.attach_source` is for, and it wants evidence.
+
+    The other direction — a database id arriving for bytes this store already
+    knows — is the flow that just built that database from those very bytes, so
+    it is accepted, but nothing here has checked it. It is written down as
+    :data:`ASSOCIATION_ASSERTED` rather than as proof, so a later
+    database-only read is told the identity it inherits rests on a caller's
+    word and not on bytes anyone compared.
     """
     by_sha = (
         connection.execute(
-            "SELECT target_key, source_sha256, managed_idb_id FROM targets"
-            " WHERE source_sha256 = ?",
+            "SELECT target_key, source_sha256, managed_idb_id, source_proof"
+            " FROM targets WHERE source_sha256 = ?",
             (source_sha256,),
         ).fetchone()
         if source_sha256 is not None
@@ -851,8 +980,8 @@ def _resolve_target(
     )
     by_id = (
         connection.execute(
-            "SELECT target_key, source_sha256, managed_idb_id FROM targets"
-            " WHERE managed_idb_id = ?",
+            "SELECT target_key, source_sha256, managed_idb_id, source_proof"
+            " FROM targets WHERE managed_idb_id = ?",
             (managed_idb_id,),
         ).fetchone()
         if managed_idb_id is not None
@@ -866,17 +995,53 @@ def _resolve_target(
                 f" {by_id[0]}, but these bytes belong to {by_sha[0]}"
             )
         if by_id is None and managed_idb_id is not None and create:
-            # The caller built this database from these very bytes, so the
-            # direction of the association is established; recording it lets a
-            # later database-only read find the same target.
+            if by_sha[2] is not None:
+                # by_id is None, so this is a *different* database claiming
+                # bytes that already answer for one. Overwriting would re-home
+                # every row recorded under the old id without saying so.
+                raise UnverifiedAssociationError(
+                    f"these bytes answer for managed database {by_sha[2]} as"
+                    f" target {by_sha[0]}, and {managed_idb_id} is a different"
+                    " database: one target records one managed database"
+                )
+            now = utc_now()
+            asserted = _dump_json(
+                {
+                    "kind": _ASSERTED_KIND,
+                    "managed_idb_id": managed_idb_id,
+                    "source_sha256": source_sha256,
+                    "asserted_at": now,
+                }
+            )
+            # Written as an assertion, not as proof: nothing here compared the
+            # database against the bytes. The guard keeps a verified proof
+            # from ever being downgraded to one.
             _write_once(
                 connection,
-                "UPDATE targets SET managed_idb_id = ?, updated_at = ?"
-                " WHERE target_key = ?",
-                (managed_idb_id, utc_now(), by_sha[0]),
+                "UPDATE targets SET managed_idb_id = ?, source_proof = ?,"
+                " updated_at = ? WHERE target_key = ?"
+                " AND managed_idb_id IS NULL AND source_proof IS NULL",
+                (managed_idb_id, asserted, now, by_sha[0]),
             )
-            return _Target(by_sha[0], by_sha[1], managed_idb_id, present=True)
-        return _Target(by_sha[0], by_sha[1], by_sha[2], present=True)
+            stored = connection.execute(
+                "SELECT target_key, source_sha256, managed_idb_id, source_proof"
+                " FROM targets WHERE target_key = ?",
+                (by_sha[0],),
+            ).fetchone()
+            return _Target(
+                stored[0],
+                stored[1],
+                stored[2],
+                present=True,
+                association=_association(stored[1], stored[2], stored[3]),
+            )
+        return _Target(
+            by_sha[0],
+            by_sha[1],
+            by_sha[2],
+            present=True,
+            association=_association(by_sha[1], by_sha[2], by_sha[3]),
+        )
 
     if by_id is not None:
         if source_sha256 is not None and by_id[1] != source_sha256:
@@ -888,20 +1053,69 @@ def _resolve_target(
                 " through attach_source and a verified fingerprint or"
                 " segment-byte association, never because a name matches"
             )
-        return _Target(by_id[0], by_id[1], by_id[2], present=True)
+        return _Target(
+            by_id[0],
+            by_id[1],
+            by_id[2],
+            present=True,
+            association=_association(by_id[1], by_id[2], by_id[3]),
+        )
 
     key = f"sha256:{source_sha256}" if source_sha256 else f"idb:{managed_idb_id}"
-    target = _Target(key, source_sha256, managed_idb_id, present=False)
+    now = utc_now()
+    proof = (
+        _dump_json(
+            {
+                "kind": _ASSERTED_KIND,
+                "managed_idb_id": managed_idb_id,
+                "source_sha256": source_sha256,
+                "asserted_at": now,
+            }
+        )
+        if source_sha256 is not None and managed_idb_id is not None
+        else None
+    )
+    target = _Target(
+        key,
+        source_sha256,
+        managed_idb_id,
+        present=False,
+        association=_association(source_sha256, managed_idb_id, proof),
+    )
     if create:
-        now = utc_now()
         _write_once(
             connection,
             "INSERT INTO targets (target_key, source_sha256, managed_idb_id,"
-            " source_proof, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)",
-            (key, source_sha256, managed_idb_id, now, now),
+            " source_proof, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (key, source_sha256, managed_idb_id, proof, now, now),
         )
         target.present = True
     return target
+
+
+def _association(
+    source_sha256: str | None, managed_idb_id: str | None, proof: str | None
+) -> str | None:
+    """How this row's database and its original bytes came to be joined.
+
+    ``None`` when there is no join to describe: a target with only one of the
+    two identities has nothing to be right or wrong about. A stored proof of a
+    kind :meth:`Catalog.attach_source` checks is ``verified``; anything else,
+    including a row that carries both identities and no proof at all, is
+    ``asserted``, because absence of evidence is not evidence.
+    """
+    if source_sha256 is None or managed_idb_id is None:
+        return None
+    try:
+        stored = json.loads(proof) if proof else None
+    except ValueError:
+        stored = None
+    if isinstance(stored, dict) and stored.get("kind") in (
+        _FINGERPRINT,
+        _SEGMENT_BYTES,
+    ):
+        return ASSOCIATION_VERIFIED
+    return ASSOCIATION_ASSERTED
 
 
 def _write_once(
@@ -973,10 +1187,26 @@ def _verify_segment_bytes(source: Path, proof: dict[str, object]) -> dict[str, o
             f" {MAX_SEGMENT_PROOF_SPANS} spans, got {len(spans)}"
         )
     checked: list[dict[str, object]] = []
+    # Every span proved so far, as half-open file ranges. The threshold below
+    # only means something if the spans cover distinct bytes: sixty-four copies
+    # of the same four bytes of ELF magic are one coincidence repeated, not a
+    # quarter of a kilobyte of agreement. At MAX_SEGMENT_PROOF_SPANS spans this
+    # comparison is at most a few thousand integer tests.
+    proved: list[tuple[int, int, int]] = []
     matched = 0
     with source.open("rb") as stream:
         for index, span in enumerate(spans):
             address, offset, expected = _span(span, index)
+            end = offset + len(expected)
+            for earlier, start, stop in proved:
+                if offset < stop and start < end:
+                    raise UnverifiedAssociationError(
+                        f"span {index} covers file offsets {max(offset, start)}"
+                        f" to {min(end, stop)} of {source}, which span {earlier}"
+                        " already proved: a segment-byte association must cover"
+                        " distinct file offsets, because repeating one span"
+                        " proves nothing beyond that one span"
+                    )
             stream.seek(offset)
             actual = stream.read(len(expected))
             if actual != expected:
@@ -986,13 +1216,14 @@ def _verify_segment_bytes(source: Path, proof: dict[str, object]) -> dict[str, o
                     " does not hold them: this database describes other bytes"
                 )
             matched += len(expected)
+            proved.append((index, offset, end))
             checked.append(
                 {"address": address, "file_offset": offset, "length": len(expected)}
             )
     if matched < MIN_SEGMENT_PROOF_BYTES:
         raise UnverifiedAssociationError(
-            f"a segment-byte association proves {matched} bytes; at least"
-            f" {MIN_SEGMENT_PROOF_BYTES} must match before a provisional"
+            f"a segment-byte association proves {matched} distinct bytes; at"
+            f" least {MIN_SEGMENT_PROOF_BYTES} must match before a provisional"
             " target adopts a file"
         )
     return {

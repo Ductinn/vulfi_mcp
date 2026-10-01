@@ -19,6 +19,8 @@ from pathlib import Path
 import pytest
 
 from vulfi_mcp.catalog import (
+    ASSOCIATION_ASSERTED,
+    ASSOCIATION_VERIFIED,
     CATALOG_NAME,
     MIN_SEGMENT_PROOF_BYTES,
     SCHEMA_VERSION,
@@ -328,6 +330,154 @@ def test_a_segment_byte_association_must_match_the_file(
         )
         assert attached["source_sha256"] == original_sha
         assert catalog.source_sha256 == original_sha
+
+
+def test_a_repeated_span_does_not_reach_the_segment_proof_threshold(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # The cheapest forgery there is: four bytes of ELF magic, which every ELF
+    # carries at offset 0, repeated until the byte count clears the threshold.
+    # Sixty-four copies of one span prove exactly what one copy proves.
+    database = tmp_path / "firmware.i64"
+    database.write_bytes(b"IDA2\x00 packed")
+    unrelated = tmp_path / "downloads" / "unrelated"
+    _write_binary(unrelated, b"\x7fELF" + b"nothing to do with that database" * 64)
+    repeated = {
+        "kind": "segment_bytes",
+        "spans": [
+            {"address": 0x401000, "file_offset": 0, "bytes": "7f454c46"}
+            for _ in range(MIN_SEGMENT_PROOF_BYTES // 4)
+        ],
+    }
+
+    with open_catalog(str(database), PROVISIONAL) as catalog:
+        with pytest.raises(UnverifiedAssociationError, match="distinct"):
+            catalog.attach_source(str(unrelated), repeated)
+        # Two spans that merely touch at one byte are the same forgery, smaller.
+        with pytest.raises(UnverifiedAssociationError, match="distinct"):
+            catalog.attach_source(
+                str(unrelated),
+                {
+                    "kind": "segment_bytes",
+                    "spans": [
+                        {
+                            "address": 0x401000,
+                            "file_offset": 0,
+                            "bytes": unrelated.read_bytes()[:200].hex(),
+                        },
+                        {
+                            "address": 0x401000 + 199,
+                            "file_offset": 199,
+                            "bytes": unrelated.read_bytes()[199:300].hex(),
+                        },
+                    ],
+                },
+            )
+        assert catalog.source_sha256 is None
+        assert catalog.source_association is None
+
+    # Nothing was joined, and the unrelated binary is still its own target.
+    assert _targets(catalog_path()) == [(f"idb:{PROVISIONAL}", None, PROVISIONAL)]
+
+
+def test_distinct_spans_may_abut_without_overlapping(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    database = tmp_path / "firmware.i64"
+    database.write_bytes(b"IDA2\x00 packed")
+    payload = b"\x7fELF" + bytes(range(256)) * 16
+    original = tmp_path / "original" / "firmware"
+    original_sha = _write_binary(original, payload)
+    half = MIN_SEGMENT_PROOF_BYTES // 2
+
+    with open_catalog(str(database), PROVISIONAL) as catalog:
+        attached = catalog.attach_source(
+            str(original),
+            {
+                "kind": "segment_bytes",
+                "spans": [
+                    {
+                        "address": 0x400100,
+                        "file_offset": 0x100,
+                        "bytes": payload[0x100 : 0x100 + half].hex(),
+                    },
+                    {
+                        "address": 0x400100 + half,
+                        "file_offset": 0x100 + half,
+                        "bytes": payload[0x100 + half : 0x100 + 2 * half].hex(),
+                    },
+                ],
+            },
+        )
+        assert attached["source_sha256"] == original_sha
+        assert attached["source_association"] == ASSOCIATION_VERIFIED
+
+
+def test_an_unseen_database_id_is_recorded_as_asserted_not_verified(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Preparation hands open_catalog the binary and the database it just built
+    # from it. That join is taken on the caller's word, so it is stored as an
+    # assertion: a later database-only read inherits the identity and can see
+    # that nobody compared any bytes.
+    binary = tmp_path / "service"
+    binary_sha = _write_binary(binary, b"\x7fELF" + b"the prepared image" * 512)
+    with open_catalog(str(binary)) as first:
+        assert first.source_association is None
+        first.record_pass("analysis-bytes", _pass_result())
+    with open_catalog(str(binary), OTHER_PROVISIONAL) as joined:
+        assert joined.target_key == f"sha256:{binary_sha}"
+        assert joined.managed_idb_id == OTHER_PROVISIONAL
+        assert joined.source_association == ASSOCIATION_ASSERTED
+
+    database = tmp_path / "unrelated.i64"
+    database.write_bytes(b"IDA2\x00 some other packed database entirely")
+    with open_catalog(str(database), OTHER_PROVISIONAL) as by_database:
+        # The digest still comes back, because that is what the row says, but
+        # it is flagged as asserted rather than passed off as verified.
+        assert by_database.source_sha256 == binary_sha
+        assert by_database.source_association == ASSOCIATION_ASSERTED
+        page = by_database.page_candidates("analysis-bytes", 0, 10)
+        assert page["source_association"] == ASSOCIATION_ASSERTED
+
+    stored = sqlite3.connect(f"file:{catalog_path()}?mode=ro", uri=True)
+    try:
+        proof = stored.execute(
+            "SELECT source_proof FROM targets WHERE target_key = ?",
+            (f"sha256:{binary_sha}",),
+        ).fetchone()[0]
+    finally:
+        stored.close()
+    assert json.loads(proof)["kind"] == "asserted_by_caller"
+
+
+def test_an_asserted_join_is_upgraded_by_a_real_proof(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    binary = tmp_path / "service"
+    binary_sha = _write_binary(binary, b"\x7fELF" + b"the prepared image" * 512)
+    with open_catalog(str(binary), OTHER_PROVISIONAL) as asserted:
+        assert asserted.source_association == ASSOCIATION_ASSERTED
+        upgraded = asserted.attach_source(
+            str(binary), {"kind": "input_fingerprint", "sha256": binary_sha}
+        )
+        assert upgraded["source_association"] == ASSOCIATION_VERIFIED
+    with open_catalog(str(binary), OTHER_PROVISIONAL) as reopened:
+        assert reopened.source_association == ASSOCIATION_VERIFIED
+
+
+def test_bytes_that_answer_for_one_database_do_not_answer_for_another(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    binary = tmp_path / "service"
+    binary_sha = _write_binary(binary, b"\x7fELF" + b"one image" * 512)
+    with open_catalog(str(binary), PROVISIONAL) as first:
+        assert first.managed_idb_id == PROVISIONAL
+    with pytest.raises(UnverifiedAssociationError, match="different database"):
+        open_catalog(str(binary), OTHER_PROVISIONAL)
+    assert _targets(catalog_path()) == [
+        (f"sha256:{binary_sha}", binary_sha, PROVISIONAL)
+    ]
 
 
 def test_two_targets_cannot_claim_the_same_original_bytes(
@@ -687,6 +837,118 @@ def test_re_recording_a_pass_replaces_only_its_own_candidates(
         )
         assert applied["state"] == "applied"
         assert applied["confidence"] == 0.95
+
+
+def _record_proposal(store: Path, analysis_id: str, candidate_id: str) -> None:
+    """One approved proposal, of the shape Plan 4 will write."""
+    connection = sqlite3.connect(store)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO proposals (proposal_id, analysis_id, candidate_id,"
+            " kind, address_space, address, value, rationale, state,"
+            " expected_revision, decided_at, decided_by, decision_reason,"
+            " created_at) VALUES (?, ?, ?, 'rename', 'image', 4198400,"
+            " 'parse_header', 'the string at 0x401000 names it', 'approved',"
+            " 1, '2026-01-01T00:00:00Z', 'operator', 'looks right',"
+            " '2026-01-01T00:00:00Z')",
+            (f"prop-{candidate_id}", analysis_id, candidate_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _proposals(store: Path) -> list[tuple[str, str, str]]:
+    connection = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+    try:
+        return sorted(
+            connection.execute(
+                "SELECT proposal_id, candidate_id, state FROM proposals"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+
+def test_re_recording_a_pass_keeps_decisions_on_candidates_it_still_names(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # proposals cascade from candidates. A pass that is re-run with the same
+    # candidate must update that row, not delete and recreate it, or every
+    # decision an operator recorded against it is destroyed in silence.
+    binary = tmp_path / "service"
+    _write_binary(binary, b"\x7fELFrerun decisions")
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_pass("analysis-1", _pass_result("strings"))
+    _record_proposal(catalog_path(), "analysis-1", "cand-1")
+    _record_proposal(catalog_path(), "analysis-1", "cand-2")
+    assert len(_proposals(catalog_path())) == 2
+
+    with open_catalog(str(binary)) as catalog:
+        # The second run keeps cand-1 with a new confidence and drops cand-2.
+        catalog.record_pass(
+            "analysis-1",
+            _pass_result(
+                "strings",
+                candidates=[
+                    {
+                        "candidate_id": "cand-1",
+                        "kind": "string",
+                        "backend": "ida",
+                        "address_space": "image",
+                        "address": 0x401000,
+                        "evidence": {"bytes": "68656c6c6f", "encoding": "ascii"},
+                        "confidence": 0.95,
+                        "state": "applied",
+                        "reason": None,
+                    }
+                ],
+            ),
+        )
+        page = catalog.page_candidates("analysis-1", 0, 100)
+        assert [row["candidate_id"] for row in page["candidates"]] == ["cand-1"]
+        assert page["candidates"][0]["confidence"] == 0.95
+        assert page["candidates"][0]["state"] == "applied"
+
+    # The surviving candidate keeps its decision; the dropped one takes its
+    # own with it, which is what dropping a finding means.
+    assert _proposals(catalog_path()) == [("prop-cand-1", "cand-1", "approved")]
+
+
+def test_a_candidate_id_held_by_one_pass_is_not_taken_over_by_another(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    binary = tmp_path / "service"
+    _write_binary(binary, b"\x7fELFownership")
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_pass("analysis-1", _pass_result("strings"))
+        with pytest.raises(CatalogError, match="already held by"):
+            catalog.record_pass(
+                "analysis-1",
+                _pass_result(
+                    "functions",
+                    candidates=[
+                        {
+                            "candidate_id": "cand-1",
+                            "kind": "function",
+                            "backend": "ida",
+                            "address_space": "image",
+                            "address": 0x402000,
+                            "evidence": {"xrefs": [1]},
+                            "confidence": 0.8,
+                            "state": "candidate",
+                            "reason": None,
+                        }
+                    ],
+                ),
+            )
+        page = catalog.page_candidates("analysis-1", 0, 100)
+        assert [row["candidate_id"] for row in page["candidates"]] == [
+            "cand-1",
+            "cand-2",
+        ]
+        assert all(row["pass"] == "strings" for row in page["candidates"])
 
 
 def test_a_rejected_pass_leaves_no_half_written_rows(
