@@ -9,6 +9,9 @@ dependencies = [
     "ida-nexus==0.13.0",
     "ida-domain==0.5.1",
     "idapro==0.0.10",
+    "mcp==2.2.0",
+    "jsonschema>=4.26",
+    "httpx2>=2.13",
 ]
 
 [project.scripts]

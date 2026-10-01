@@ -28,6 +28,7 @@ __all__ = [
     "Priority",
     "RangeCoverage",
     "RuleCoverage",
+    "RuleEvidence",
     "RuleState",
     "ScanCoverage",
     "ScanResult",
@@ -280,6 +281,38 @@ class Candidate(TypedDict):
     evidence: dict[str, JsonValue]
     confidence: float
     state: CandidateState
+    reason: str | None
+
+
+class RuleEvidence(TypedDict):
+    """What one backend established about one rule, before it is evaluated.
+
+    This is the shape an external provider hands back, and it carries facts
+    rather than verdicts: :mod:`vulfi_mcp.ida_runtime`'s ``evaluate_rule`` is
+    still the only thing that turns facts into a priority, so a second backend
+    cannot reach a different conclusion from the same evidence.
+
+    ``contexts`` is one validated fact dictionary per call site, in the shape
+    :func:`vulfi_mcp.providers.rule_contexts` converts to a
+    :class:`vulfi_mcp.ida_runtime.RuleContext`. A fact that is absent from the
+    dictionary is absent from the context, which is not the same as ``False``:
+    a predicate that needs it refuses to answer. Nothing may be inferred from
+    decompiled text here — a provider that only has pseudocode has no
+    contexts, and says so with ``state`` and ``reason``.
+
+    ``ranges`` is what the provider actually looked at, so a rule evaluated
+    over half an image is not reported as if it had been evaluated over all of
+    it. ``state`` is ``evaluated`` only when every context in it was proven;
+    ``unsupported`` when this backend cannot establish the facts this rule
+    needs, ``failed`` when it tried and could not finish, and ``reason`` says
+    which in both cases.
+    """
+
+    backend: Backend
+    rule_index: int
+    contexts: list[dict[str, JsonValue]]
+    ranges: list[AddressRange]
+    state: RuleState
     reason: str | None
 
 
