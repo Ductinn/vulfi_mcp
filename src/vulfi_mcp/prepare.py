@@ -2523,11 +2523,13 @@ def _route_passes(
     The loop below is the whole of per-pass routing, and every branch in it
     is one of the five outcomes :data:`vulfi_mcp.contracts.AttemptOutcome`
     names. A pass a backend produced a result for is answered and is never
-    asked of another backend, unless a catch marked ``refusal`` on the pass
-    or on any of its ranges. That mark is a call the session opened and
+    asked of another backend, unless a catch marked ``refusal`` on a pass that had not yet measured
+    a range, or on any of its ranges. That mark is a call the session opened and
     could not finish — failed, for that pass alone, even when a sibling
     range is an intentional skip and the coverage word is ``partial``.
-    ``unavailable`` without the mark is no typed tool: ``unsupported``, and
+    A refusal on a pass that already measured bytes is the same failed
+    attempt, kept beside those bytes: the chain does not advance over a
+    read that succeeded. ``unavailable`` without the mark is no typed tool: ``unsupported``, and
     the chain advances. A backend that could not be reached advances the
     chain too. A backend that opened a session and failed the call outright
     advances it as well — and its failure stays in ``attempts``, is carried
@@ -2592,6 +2594,20 @@ def _route_passes(
             # provider into an answered row. The field is set at the catch.
             # Warning prose is not consulted — the next catch would speak a
             # sentence this has not heard.
+            # Two shapes, one field. A sweep that established nothing is
+            # replaced and the chain advances. A later call that refused
+            # after bytes were already read keeps those bytes, records the
+            # attempt, and does not advance.
+            corroboration = _corroboration_refusal(entry)
+            if corroboration is not None:
+                attempts[name].append(_attempt(backend, "failed", corroboration))
+                _stick_failure(entry, corroboration)
+                attempts[name].append(_attempt(backend, "answered", None))
+                answered[name] = entry
+                owners[name] = candidates
+                if backend not in answered_by:
+                    answered_by.append(backend)
+                continue
             refusal = _call_refusal(entry)
             if refusal is not None:
                 attempts[name].append(_attempt(backend, "failed", refusal))
@@ -2705,6 +2721,73 @@ def _unavailable_error(backend: str) -> type[BaseException]:
         f"the {backend} adapter declares no unavailability type, so a provider"
         " that is simply absent could not be told from one that failed"
     )
+
+
+
+def _whole_skip(item: Mapping[str, Any]) -> bool:
+    """Whether this range names itself unvisited and nothing else.
+
+    An intentional skip and a range that was never started both look like
+    this. A range some bytes of which were read does not.
+    """
+    start = item.get("start")
+    end = item.get("end")
+    unvisited = item.get("unvisited")
+    if not isinstance(unvisited, list) or len(unvisited) != 1:
+        return False
+    hole = unvisited[0]
+    return (
+        isinstance(hole, dict)
+        and hole.get("start") == start
+        and hole.get("end") == end
+    )
+
+
+def _measured_pass(entry: Mapping[str, Any]) -> bool:
+    """Whether this pass kept a read, not only a skip or a dead range."""
+    if _strings(entry.get("candidate_ids")) or _entries(entry.get("candidates")):
+        return True
+    for item in _entries(entry.get("ranges")):
+        if item.get("refusal"):
+            continue
+        coverage = item.get("coverage")
+        if coverage == "complete":
+            return True
+        if coverage == "partial" and not _whole_skip(item):
+            return True
+    return False
+
+
+def _corroboration_refusal(entry: Mapping[str, Any]) -> str | None:
+    """A later call refused after this pass had already measured something.
+
+    A refusal on a range is the sweep's own tool, and a pass-level refusal
+    with nothing measured is a sweep that never started. Both still advance.
+    This one does not: the bytes are already in hand.
+    """
+    for item in _entries(entry.get("ranges")):
+        marked = item.get("refusal")
+        if isinstance(marked, str) and marked:
+            return None
+    refusal = entry.get("refusal")
+    if not isinstance(refusal, str) or not refusal or not _measured_pass(entry):
+        return None
+    return refusal
+
+
+def _stick_failure(entry: dict[str, Any], reason: str) -> None:
+    """Put the failed attempt where a restart can read it back.
+
+    The catalog has no attempts column. The measured row is the only row
+    this pass of this backend can store, so the failure rides on its
+    warning, beside the ranges, rather than on a synthetic row that would
+    overwrite them.
+    """
+    note = f"{FAILED_ATTEMPT}{reason}"
+    warnings = list(_strings(entry.get("warnings")))
+    if note not in warnings:
+        warnings.append(note)
+    entry["warnings"] = warnings
 
 
 def _call_refusal(entry: Mapping[str, Any]) -> str | None:
@@ -2834,7 +2917,8 @@ def _reused_routing(
             failures.setdefault(name, []).append(
                 _attempt(str(entry["backend"]), "failed", reason)
             )
-            continue
+            if not _measured_pass(entry):
+                continue
         if str(entry["coverage"]) == "unavailable" and name in held:
             continue
         if name not in held or str(held[name]["coverage"]) == "unavailable":
@@ -3393,6 +3477,10 @@ def _coverage(recorded: list[dict[str, object]]) -> str:
     states = {str(entry["coverage"]) for entry in recorded}
     if not states or states == {"unavailable"}:
         return "unavailable"
+    if states == {"complete"} and any(
+        _failure_reason(entry) is not None for entry in recorded
+    ):
+        return "partial"
     if states == {"complete"}:
         return "complete"
     return "partial"

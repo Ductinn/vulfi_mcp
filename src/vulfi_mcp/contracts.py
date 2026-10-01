@@ -384,8 +384,10 @@ class RuleEvidence(TypedDict):
 #: ``candidate_ids`` both name rows in ``candidates``; a candidate id that is
 #: not in ``applied_ids`` changed nothing. ``artifact_revision`` is the
 #: managed artifact's revision these results describe. ``refusal`` is
-#: set only when a session was open and a call was refused before this
-#: pass had a range to name; routing reads that field, not warning prose.
+#: set when a session was open and a call was refused. A pass that had
+#: not yet measured a range advances; a pass that already had bytes keeps
+#: those ranges and the failed attempt, and does not advance. Routing
+#: reads that field, not warning prose.
 PassResult = TypedDict(
     "PassResult",
     {

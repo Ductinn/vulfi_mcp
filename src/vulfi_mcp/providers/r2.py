@@ -890,23 +890,25 @@ async def _symbols(session: ProviderSession) -> dict[int, dict[str, Any]]:
     return symbols
 
 
-async def _extent(session: ProviderSession, entry: int) -> int | None:
+async def _extent(session: ProviderSession, entry: int) -> tuple[int | None, str | None]:
     """How far one function reaches, as radare2's own listing measured it.
 
     ``pdf``'s signature line carries the size radare2 assigned the function.
     An address with no function answers with a logged error and no signature
-    line, and that is reported as an unmeasured extent — never as zero.
+    line, and that is reported as an unmeasured extent — never as zero. A
+    ``ProviderError`` is the second item, so the pass can mark the refusal
+    without throwing the rows away. A missing signature line is not that.
     """
     try:
         listing = await _call(session, "disassemble_function", address=_hex(entry))
-    except ProviderError:
-        return None
+    except ProviderError as refused:
+        return None, str(refused)
     for line in _rows(listing):
         matched = _EXTENT_ROW.match(line.strip())
         if matched is not None:
             size = int(matched["size"])
-            return entry + size if size > 0 else None
-    return None
+            return (entry + size if size > 0 else None), None
+    return None, None
 
 
 async def _xrefs(session: ProviderSession, address: int) -> list[dict[str, Any]]:
@@ -1088,7 +1090,12 @@ async def _strings_pass(session: ProviderSession, image: _Image) -> PreparedPass
                         " radare2 already holds a flag at its address"
                     )
             candidates.append(_string_candidate(block, found, flag, unchecked))
-    return _pass_result(image, "strings", ranges, candidates, warnings)
+    result = _pass_result(image, "strings", ranges, candidates, warnings)
+    if unchecked is not None:
+        # The bytes are already in the ranges above. Routing keeps them and
+        # records this call; it does not replace the pass with a sweep death.
+        result["refusal"] = unchecked
+    return result
 
 
 async def _functions_pass(session: ProviderSession, image: _Image) -> PreparedPass:
@@ -1126,12 +1133,15 @@ async def _functions_pass(session: ProviderSession, image: _Image) -> PreparedPa
 
     extents: dict[int, int] = {}
     unmeasured: list[int] = []
+    extent_refusal: str | None = None
     for index, row in enumerate(reported):
         entry = int(row["entry"])
         if index >= MAX_FUNCTION_EXTENTS:
             unmeasured.append(entry)
             continue
-        end = await _extent(session, entry)
+        end, refused = await _extent(session, entry)
+        if refused is not None and extent_refusal is None:
+            extent_refusal = refused
         if end is None:
             unmeasured.append(entry)
             continue
@@ -1157,7 +1167,7 @@ async def _functions_pass(session: ProviderSession, image: _Image) -> PreparedPa
             _function_candidate(block, row, extents.get(entry), symbols, references)
         )
     ranges = _code_ranges(image, extents, bool(blocked))
-    return _pass_result(
+    result = _pass_result(
         image,
         "functions",
         ranges,
@@ -1165,6 +1175,9 @@ async def _functions_pass(session: ProviderSession, image: _Image) -> PreparedPa
         warnings,
         blocked="; ".join(blocked) if blocked else None,
     )
+    if extent_refusal is not None:
+        result["refusal"] = extent_refusal
+    return result
 
 
 async def _sweep(

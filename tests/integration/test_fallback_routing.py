@@ -1117,3 +1117,461 @@ def test_a_read_budget_stop_is_not_a_failed_pass(
     assert strings_attempt["outcome"] == "answered", strings
     assert strings["coverage"] != "complete", strings
     assert structures_attempt["outcome"] == "unsupported", structures
+
+
+def _one_mapped_section_elf(tmp_path: Path) -> Path:
+    """An ELF with one mapped section, and that section is not executable.
+
+    A normal data-only link still maps ``.interp`` and the dynamic tables.
+    Killing the child on ``lookup_address`` then dies on the next section's
+    ``hexdump``, and that sweep refusal hides the corroboration catch. This
+    image has nothing after the one read.
+    """
+    source = tmp_path / "one-section.c"
+    source.write_text(
+        'const char vulfi_only[] = "vulfi-data-only-marker";\n',
+        encoding="utf-8",
+    )
+    script = tmp_path / "one-section.ld"
+    script.write_text(
+        "SECTIONS {\n"
+        "  .rodata 0x400000 : { *(.rodata*) }\n"
+        "  /DISCARD/ : { *(*) }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    binary = tmp_path / "one-section"
+    completed = subprocess.run(
+        [
+            "gcc",
+            "-nostdlib",
+            "-nostartfiles",
+            "-static",
+            "-Wl,--no-dynamic-linker",
+            "-e",
+            "0",
+            "-Wl,-T," + str(script),
+            "-o",
+            str(binary),
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"building a one-section ELF failed ({completed.returncode}):\n"
+            f"{completed.stderr.strip()}"
+        )
+    return binary
+
+
+def _kill_r2_on_lookup_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIGKILL this test's r2mcp child on the first flag lookup, then call through.
+
+    The strings have already been read. ``lookup_address`` only asks whether
+    radare2 holds a flag at an address the pass already has bytes for. The
+    refusal has to be the dead child's own connection error.
+    """
+    import signal
+
+    import vulfi_mcp.providers.r2 as r2
+
+    real = r2._call
+
+    async def kill_on_lookup(session: Any, tool: str, **arguments: Any) -> str:
+        if tool == "lookup_address":
+            for pid in _r2mcp_children():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+        return await real(session, tool, **arguments)
+
+    monkeypatch.setattr(r2, "_call", kill_on_lookup)
+
+
+def test_a_killed_lookup_on_one_section_keeps_the_read(
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dead flag lookup after a one-section read is not a clean complete.
+
+    The bytes were already read. ``lookup_address`` is corroboration, so the
+    measured strings stay, coverage is not complete, reuse carries the dead
+    child's refusal, and the chain does not discard the read or ask the next
+    backend to stand in for it.
+    """
+    require_r2()
+    import vulfi_mcp.prepare as prepare
+    from vulfi_mcp.providers.ghidra import GhidraUnavailableError
+
+    binary = _one_mapped_section_elf(tmp_path)
+    _kill_r2_on_lookup_address(monkeypatch)
+    asked: list[str] = []
+
+    async def next_backend(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        asked.extend(passes)
+        if "strings" in passes:
+            raise AssertionError(
+                "the chain advanced over a strings read that had already"
+                f" succeeded: {passes!r}"
+            )
+        raise GhidraUnavailableError(
+            "sentinel: ghidra was not asked to replace a measured strings read"
+        )
+
+    monkeypatch.setitem(prepare._PREPARE, "ghidra", next_backend)
+    requested = ("strings", "structures")
+    routed = _route_passes(str(binary), ("r2", "ghidra"), requested)
+    strings = routing_for({"routing": routed.routing}, "strings")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    report = _record(str(binary), "r2", ("r2", "ghidra"), requested, routed)
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("strings",), stored)
+    texts = [
+        str((row.get("evidence") or {}).get("text") or "")
+        for _entry, rows in routed.results
+        if _entry.get("pass") == "strings"
+        for row in rows.values()
+    ]
+    detail = (
+        f"strings={strings!r}\n"
+        f"structures={structures!r}\n"
+        f"reused={reused!r}\n"
+        f"texts={texts!r}\n"
+        f"asked={asked!r}\n"
+        f"stored={stored!r}"
+    )
+    assert any("vulfi-data-only-marker" in text for text in texts), detail
+    assert strings["state"] == "answered", detail
+    assert strings["backend"] == "r2", detail
+    assert strings["coverage"] != "complete", detail
+    assert "strings" not in asked, detail
+    failed = [item for item in strings["attempts"] if item["outcome"] == "failed"]
+    assert failed and failed[0]["backend"] == "r2", detail
+    assert failed[0]["reason"], detail
+    assert "Connection closed" in failed[0]["reason"] or "MCP" in failed[0]["reason"], detail
+    assert structures["attempts"][0]["outcome"] == "unsupported", detail
+    assert reused["state"] == "answered", detail
+    assert reused["coverage"] != "complete", detail
+    assert reused["backend"] == "r2", detail
+    assert any(
+        item["backend"] == "r2"
+        and item["outcome"] == "failed"
+        and item["reason"]
+        and ("Connection closed" in item["reason"] or "MCP" in item["reason"])
+        for item in reused["attempts"]
+    ), detail
+
+
+def _measured_rows(routed: Any, name: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [
+        (entry, rows)
+        for entry, rows in routed.results
+        if entry.get("pass") == name and rows
+    ]
+
+
+def test_an_extent_refusal_keeps_the_functions(
+    compiled_calls: Path,
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused extent is not laundered by the next call, and not a sweep death.
+
+    ``disassemble_function`` refuses. ``xrefs_to`` still answers, so the catch
+    itself has to mark the pass. The function rows stay, coverage is not
+    complete, and reuse carries the refusal.
+    """
+    require_r2()
+    import vulfi_mcp.prepare as prepare
+    import vulfi_mcp.providers.r2 as r2
+    from vulfi_mcp.providers.client import ProviderError
+    from vulfi_mcp.providers.ghidra import GhidraUnavailableError
+
+    real = r2._call
+    refusal = "disassemble_function refused: connection closed"
+
+    async def refuse_extent(session: Any, tool: str, **arguments: Any) -> str:
+        if tool == "disassemble_function":
+            raise ProviderError(refusal)
+        return await real(session, tool, **arguments)
+
+    monkeypatch.setattr(r2, "_call", refuse_extent)
+    asked: list[str] = []
+
+    async def next_backend(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        asked.extend(passes)
+        if "functions" in passes:
+            raise AssertionError(
+                "the chain advanced over function rows that were already"
+                f" measured: {passes!r}"
+            )
+        raise GhidraUnavailableError("sentinel: not standing in for functions")
+
+    monkeypatch.setitem(prepare._PREPARE, "ghidra", next_backend)
+    requested = ("functions", "structures")
+    routed = _route_passes(str(compiled_calls), ("r2", "ghidra"), requested)
+    functions = routing_for({"routing": routed.routing}, "functions")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    report = _record(str(compiled_calls), "r2", ("r2", "ghidra"), requested, routed)
+    reopened = get_catalog(str(compiled_calls))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("functions",), stored)
+    measured = _measured_rows(routed, "functions")
+    kinds = [
+        (row.get("evidence") or {}).get("reference_kinds")
+        for _entry, rows in measured
+        for row in rows.values()
+    ]
+    detail = (
+        f"functions={functions!r}\n"
+        f"structures={structures!r}\n"
+        f"reused={reused!r}\n"
+        f"asked={asked!r}\n"
+        f"candidates={len(kinds)} kinds={kinds[:4]!r}"
+    )
+    assert measured, detail
+    assert any(kind is not None for kind in kinds), detail
+    assert functions["state"] == "answered", detail
+    assert functions["backend"] == "r2", detail
+    assert functions["coverage"] != "complete", detail
+    assert "functions" not in asked, detail
+    failed = [item for item in functions["attempts"] if item["outcome"] == "failed"]
+    assert failed and failed[0]["reason"] and refusal in failed[0]["reason"], detail
+    assert structures["attempts"][0]["outcome"] == "unsupported", detail
+    assert reused["state"] == "answered", detail
+    assert reused["backend"] == "r2", detail
+    assert reused["coverage"] != "complete", detail
+    assert any(
+        item["outcome"] == "failed" and item["reason"] and refusal in item["reason"]
+        for item in reused["attempts"]
+    ), detail
+
+
+def _refuse_ghidra_tool(monkeypatch: pytest.MonkeyPatch, tool: str, refusal: str) -> None:
+    import vulfi_mcp.providers.ghidra as ghidra
+    from vulfi_mcp.providers.client import ProviderError
+
+    real = ghidra._call_json
+
+    async def refuse(session: Any, called: str, **arguments: Any) -> dict[str, Any]:
+        if called == tool:
+            raise ProviderError(refusal)
+        return await real(session, called, **arguments)
+
+    monkeypatch.setattr(ghidra, "_call_json", refuse)
+
+
+def _ghidra_kept(
+    binary: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    want_candidate_reason: str | None = None,
+) -> str:
+    """Route one live Ghidra functions pass and return a failure detail.
+
+    The next backend is a sentinel. It must not be asked for ``functions``.
+    """
+    import vulfi_mcp.prepare as prepare
+    from vulfi_mcp.providers.r2 import R2UnavailableError
+
+    asked: list[str] = []
+
+    async def next_backend(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        asked.extend(passes)
+        if "functions" in passes:
+            raise AssertionError(
+                "the chain advanced over a functions pass that had already"
+                f" measured something: {passes!r}"
+            )
+        raise R2UnavailableError("sentinel: not standing in for functions")
+
+    monkeypatch.setitem(prepare._PREPARE, "r2", next_backend)
+    requested = ("functions", "structures")
+    routed = _route_passes(str(binary), ("ghidra", "r2"), requested)
+    functions = routing_for({"routing": routed.routing}, "functions")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    report = _record(str(binary), "ghidra", ("ghidra", "r2"), requested, routed)
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("functions",), stored)
+    measured = [
+        (entry, rows)
+        for entry, rows in routed.results
+        if entry.get("pass") == "functions" and entry.get("ranges")
+    ]
+    reasons = [
+        row.get("reason")
+        for _entry, rows in routed.results
+        if _entry.get("pass") == "functions"
+        for row in rows.values()
+    ]
+    detail = (
+        f"functions={functions!r}\n"
+        f"structures={structures!r}\n"
+        f"reused={reused!r}\n"
+        f"asked={asked!r}\n"
+        f"ranges={len(measured)} reasons={reasons[:6]!r}"
+    )
+    assert measured, detail
+    assert functions["state"] == "answered", detail
+    assert functions["backend"] == "ghidra", detail
+    assert functions["coverage"] != "complete", detail
+    assert "functions" not in asked, detail
+    failed = [item for item in functions["attempts"] if item["outcome"] == "failed"]
+    assert failed and failed[0]["backend"] == "ghidra" and failed[0]["reason"], detail
+    assert structures["attempts"][0]["outcome"] == "unsupported", detail
+    assert reused["state"] == "answered" and reused["backend"] == "ghidra", detail
+    assert reused["coverage"] != "complete", detail
+    assert any(
+        item["outcome"] == "failed" and item["reason"] == failed[0]["reason"]
+        for item in reused["attempts"]
+    ), detail
+    if want_candidate_reason is not None:
+        assert any(
+            isinstance(reason, str) and want_candidate_reason in reason
+            for reason in reasons
+        ), detail
+    return str(failed[0]["reason"])
+
+
+@pytest.mark.requires_ghidra
+def test_a_refused_control_flow_keeps_the_measured_functions(
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``analyze_control_flow`` refusing does not erase the functions pass."""
+    refusal = "analyze_control_flow refused: connection closed"
+    _refuse_ghidra_tool(monkeypatch, "analyze_control_flow", refusal)
+    reason = _ghidra_kept(_readable_function_elf(tmp_path), monkeypatch)
+    assert refusal in reason, reason
+
+
+@pytest.mark.requires_ghidra
+def test_a_refused_sixteen_byte_read_keeps_the_measured_functions(
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The 16-byte corroboration read refusing does not erase the pass."""
+    import inspect
+
+    import vulfi_mcp.providers.ghidra as ghidra
+    from vulfi_mcp.providers.client import ProviderError
+
+    refusal = "the 16-byte read refused: connection closed"
+    real = ghidra._read
+
+    async def refuse_corroboration(session: Any, start: int, length: int) -> bytes:
+        caller = inspect.currentframe()
+        name = caller.f_back.f_code.co_name if caller is not None and caller.f_back else ""
+        if length == 16 and name == "_functions_pass":
+            raise ProviderError(refusal)
+        return await real(session, start, length)
+
+    monkeypatch.setattr(ghidra, "_read", refuse_corroboration)
+    reason = _ghidra_kept(_readable_function_elf(tmp_path), monkeypatch)
+    assert refusal in reason, reason
+
+
+def _readable_function_elf(tmp_path: Path) -> Path:
+    """A function, an unmarked entry, and a pointer, with no unreadable block.
+
+    The stock fallback image has a ``.bss`` GhidraMCP cannot read. That sweep
+    refusal fails the whole functions pass and hides the corroboration catch
+    the test is about. This image's blocks are initialized and readable.
+    """
+    compiler = shutil.which("gcc")
+    if compiler is None:
+        missing_prerequisite("gcc is not installed, so the corroboration image cannot be built")
+    source = tmp_path / "readable.c"
+    source.write_text(
+        r"""void defined(int value) {
+    int total = value + 1;
+    __asm__ volatile(".globl vulfi_tail\nvulfi_tail:");
+    total += 3;
+    (void)total;
+}
+__asm__(
+    ".section .vulfi_hidden,\"ax\",@progbits\n"
+    ".balign 16\n"
+    "  endbr64\n"
+    "  mov %edi,%eax\n"
+    "  add $0x2a,%eax\n"
+    "  ret\n"
+    ".previous\n"
+);
+__asm__(
+    ".section .vulfi_ptrs,\"aw\",@progbits\n"
+    ".balign 8\n"
+    ".globl vulfi_pointer_table\n"
+    "vulfi_pointer_table:\n"
+    "  .quad .vulfi_hidden\n"
+    "  .quad vulfi_tail\n"
+    ".previous\n"
+);
+""",
+        encoding="utf-8",
+    )
+    binary = tmp_path / "readable"
+    completed = subprocess.run(
+        [
+            str(compiler),
+            "-nostdlib",
+            "-nostartfiles",
+            "-static",
+            "-Wl,--no-dynamic-linker",
+            "-e",
+            "0",
+            "-O0",
+            "-fno-builtin",
+            "-fno-inline",
+            "-o",
+            str(binary),
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"building a readable function ELF failed ({completed.returncode}):\n"
+            f"{completed.stderr.strip()}"
+        )
+    return binary
+
+
+@pytest.mark.requires_ghidra
+def test_a_refused_create_function_keeps_the_candidate(
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``create_function`` refusing stays on the pass, and the candidate stays."""
+    refusal = "create_function refused: connection closed"
+    _refuse_ghidra_tool(monkeypatch, "create_function", refusal)
+    binary = _readable_function_elf(tmp_path)
+    reason = _ghidra_kept(
+        binary,
+        monkeypatch,
+        want_candidate_reason="the provider refused to define this entry",
+    )
+    assert refusal in reason, reason

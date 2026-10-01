@@ -1138,17 +1138,19 @@ class _Extents:
     function this adapter exists to protect.
     """
 
-    __slots__ = ("measured", "spans", "truncated")
+    __slots__ = ("measured", "refusal", "spans", "truncated")
 
     def __init__(
         self,
         spans: dict[int, int],
         measured: set[int],
         truncated: str | None,
+        refusal: str | None = None,
     ) -> None:
         self.spans = spans
         self.measured = measured
         self.truncated = truncated
+        self.refusal = refusal
 
     def owner(self, address: int) -> tuple[int, int, bool] | None:
         """The function whose body holds ``address``: entry, end, measured."""
@@ -1173,6 +1175,7 @@ async def _extents(
     ordered = sorted(entries)
     spans: dict[int, int] = {}
     measured: set[int] = set()
+    refusal: str | None = None
     budget = set(ordered[:MAX_FUNCTION_EXTENTS])
     for index, entry in enumerate(ordered):
         if entry in budget:
@@ -1183,8 +1186,10 @@ async def _extents(
                 )
             except GhidraUnavailableError:
                 raise
-            except ProviderError:
+            except ProviderError as refused:
                 flow = None
+                if refusal is None:
+                    refusal = str(refused)
             if flow is not None:
                 start = _address(flow.get("entry_point"))
                 size = flow.get("size_bytes")
@@ -1205,7 +1210,7 @@ async def _extents(
             " reaching to the next known entry, so an address inside one of"
             " them is described and never defined"
         )
-    return _Extents(spans, measured, truncated)
+    return _Extents(spans, measured, truncated, refusal)
 
 
 def _conservative_end(
@@ -1447,6 +1452,8 @@ async def _functions_pass(
     candidates: list[Candidate] = []
     examined: dict[int, int] = {}
     budget = MAX_PASS_READ_BYTES
+    read_refusal: str | None = None
+    define_refusal: str | None = None
 
     slots: dict[int, int] = {}
     for block in program.segments:
@@ -1497,27 +1504,36 @@ async def _functions_pass(
             raw = await _read(session, target, 16)
         except ProviderError as refused:
             warnings.append(f"the bytes at {target:#x} could not be read: {refused}")
+            if read_refusal is None:
+                read_refusal = str(refused)
             continue
         examined[target] = len(raw)
         owner = extents.owner(target)
-        candidates.append(
-            await _function_candidate(
-                session,
-                program,
-                record,
-                target=target,
-                slot=slots[target],
-                referenced=referenced,
-                named=named,
-                raw=raw,
-                owner=owner,
-                owner_name=entries.get(owner[0]) if owner else None,
-                already=target in entries,
-            )
+        row, defined_refused = await _function_candidate(
+            session,
+            program,
+            record,
+            target=target,
+            slot=slots[target],
+            referenced=referenced,
+            named=named,
+            raw=raw,
+            owner=owner,
+            owner_name=entries.get(owner[0]) if owner else None,
+            already=target in entries,
         )
+        if defined_refused is not None and define_refusal is None:
+            define_refusal = defined_refused
+        candidates.append(row)
 
     ranges.extend(_code_ranges(program, extents, examined, entries))
-    return _pass_result(program, "functions", ranges, candidates, warnings)
+    result = _pass_result(program, "functions", ranges, candidates, warnings)
+    # A later call refused after this pass had already measured ranges.
+    # The field keeps those ranges; it does not replace the pass.
+    refusal = extents.refusal or read_refusal or define_refusal
+    if refusal is not None:
+        result["refusal"] = refusal
+    return result
 
 
 async def _function_candidate(
@@ -1533,8 +1549,8 @@ async def _function_candidate(
     owner: tuple[int, int, bool] | None,
     owner_name: str | None,
     already: bool,
-) -> Candidate:
-    """One entry a pointer names, defined only when nothing is already there."""
+) -> tuple[Candidate, str | None]:
+    """One entry a pointer names, and the provider's refusal if the write was refused."""
     block = _block_of(program, target)
     evidence: dict[str, Any] = {
         "stage": "code_scan",
@@ -1572,7 +1588,7 @@ async def _function_candidate(
             "this entry is already defined in the managed project, by an"
             " earlier run of this pass"
         )
-        return row
+        return row, None
     if owner is not None and owner[2]:
         row["reason"] = (
             f"{target:#x} is inside {owner_name or 'a function'} at"
@@ -1580,7 +1596,7 @@ async def _function_candidate(
             " defines; defining a function there would split it, so this"
             " stays a candidate"
         )
-        return row
+        return row, None
     if owner is not None:
         row["reason"] = (
             f"{target:#x} falls inside {owner_name or 'a function'} at"
@@ -1589,7 +1605,7 @@ async def _function_candidate(
             " unmeasured extent is not evidence that the address is outside"
             " it, so this stays a candidate"
         )
-        return row
+        return row, None
     if slot not in referenced:
         row["reason"] = (
             f"the provider records {named or 'no'} reference to {target:#x}"
@@ -1597,24 +1613,24 @@ async def _function_candidate(
             " thing tying the two together is this adapter's own reading of"
             " eight bytes; that is described, never defined"
         )
-        return row
+        return row, None
     try:
         await _call_json(session, "create_function", address=_hex(target))
     except ProviderError as refused:
         row["reason"] = f"the provider refused to define this entry: {refused}"
-        return row
+        return row, str(refused)
     if target not in {item["entry"] for item in await _functions(session)}:
         row["reason"] = (
             "the provider reported this entry defined and does not list a"
             " function at it, so nothing is claimed"
         )
-        return row
+        return row, None
     row["state"] = "applied"
     evidence["already_defined"] = True
     program.mutated = True
     if target not in record["defined"]:
         record["defined"] = sorted({*record["defined"], target})
-    return row
+    return row, None
 
 
 def _string_candidate(block: Mapping[str, Any], found: Mapping[str, Any]) -> Candidate:
