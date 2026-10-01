@@ -170,6 +170,13 @@ def tool_fingerprint(tool: types.Tool) -> str:
     Name and schemas only. A provider that rewords a description has not
     changed what it promises; a provider that renames a required argument has,
     and that is exactly the change this must catch.
+
+    How much this attests depends on the provider. GhidraMCP 6.0.0 declares an
+    ``outputSchema`` on every tool, so a pin there covers the reply's declared
+    shape as well. radare2-mcp 1.8.8 declares one on **none** of its 42 tools,
+    measured, so a pin there attests the call and nothing about the answer —
+    which is the other half of why text from that backend may not become a
+    structural fact.
     """
     canonical = json.dumps(
         {
@@ -210,8 +217,9 @@ def tool_fingerprint(tool: types.Tool) -> str:
 #: Nothing is lost by refusing any of them: the arguments this module sends are
 #: adapter-authored constants, never agent input, so a provider's own schema
 #: was never the thing keeping them honest; and neither installed backend emits
-#: a reference — radare2-mcp 1.8.8 uses none across its 32 tools, GhidraMCP
-#: 6.0.0 none across its 222. ``format`` is not here because no format checker
+#: a reference — radare2-mcp 1.8.8 uses none across all 42 of its tools,
+#: GhidraMCP 6.0.0 none across its 222. ``format`` is not here because no
+#: format checker
 #: is installed, which is what makes it inert rather than a second
 #: regular-expression engine.
 _REFUSED_KEYWORDS: Final[frozenset[str]] = frozenset(
@@ -621,6 +629,15 @@ async def _connect(stack: AsyncExitStack, config: ProviderConfig) -> ClientSessi
 async def _list_tools(
     client: ClientSession, limits: ProviderLimits
 ) -> list[types.Tool]:
+    """Every tool the provider advertises, following the cursor to the end.
+
+    Paging is not optional here. radare2-mcp 1.8.8 hardcodes a page size of 32
+    (``handle_list_tools``, ``src/r2mcp.c``) and advertises **42** tools over
+    two pages, so a reader that takes the first page sees a different, smaller
+    provider than the one it is talking to — ``hexdump`` and ``lookup_address``
+    are page-two tools. Anywhere this project says "32 tools" about r2mcp, that
+    is a page count.
+    """
     tools: list[types.Tool] = []
     cursor: str | None = None
     for _ in range(limits.max_tool_pages):
@@ -891,9 +908,11 @@ UNCLASSIFIED_KEYWORDS: Final[dict[str, frozenset[str]]] = {
 #: derivation first, so a refusal is not the only thing standing between a
 #: provider and this process's event loop.
 #:
-#: Both installed backends emit modern schemas: radare2-mcp verified live across
-#: its 32 tools, GhidraMCP cross-checked across its 222. The cost of being wrong
-#: here is a provider refused with a reason naming the dialect.
+#: Both installed backends emit modern schemas: measured live, none of
+#: radare2-mcp 1.8.8's 42 tools declares a ``$schema`` at all (so they take the
+#: default below), and GhidraMCP 6.0.0 was cross-checked across its 222. The
+#: cost of being wrong here is a provider refused with a reason naming the
+#: dialect.
 SUPPORTED_DIALECTS: Final[frozenset[str]] = frozenset(
     {
         "http://json-schema.org/draft-04/schema",

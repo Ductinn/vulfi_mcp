@@ -119,17 +119,29 @@ PROVIDER_BACKENDS: Final[frozenset[str]] = frozenset({"ghidra", "r2"})
 #: a provider advertises and whatever a provider's own text asks for. These are
 #: the raw-command and scripting escapes: reaching one would hand the provider
 #: arbitrary execution with this server's arguments, which is precisely the
-#: thing the typed tool surface exists to prevent. radare2-mcp 1.8.8 mode-gates
-#: both of them off by default; this list is what keeps that true if a future
-#: build or a different server turns them back on.
+#: thing the typed tool surface exists to prevent.
+#:
+#: The radare2-mcp 1.8.8 entries are read from its own tool table
+#: (``src/tools.c`` 1542-1596), not guessed at, because the build gates them and
+#: this list is what keeps that true for a build that does not: ``run_command``
+#: and ``run_javascript`` and ``run_script`` and ``run_frida_script`` are
+#: ``TOOL_MODE_EXEC``-gated, enabled by ``r2mcp -r``; ``sql`` — "Runs an SQL
+#: query through the r2vsql plugin" — is **not** exec-gated at all
+#: (``TOOL_MODE_NORMAL | TOOL_MODE_MINI``) and is absent here only because this
+#: build lacks ``r2vsql``. Measured on the installed build: all five are absent
+#: from ``tools/list`` and ``run_command`` is refused with "not available in
+#: current mode", which is the provider's choice today and not a guarantee.
 FORBIDDEN_TOOLS: Final[frozenset[str]] = frozenset(
     {
-        "run_command",
-        "run_javascript",
+        "eval",
         "execute_command",
         "execute_script",
-        "eval",
+        "run_command",
+        "run_frida_script",
+        "run_javascript",
+        "run_script",
         "shell",
+        "sql",
     }
 )
 

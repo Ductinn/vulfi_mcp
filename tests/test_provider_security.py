@@ -720,8 +720,18 @@ def test_tool_result_injection_is_ignored(
 
 
 def test_forbidden_tools_are_refused_even_inside_an_allowlist() -> None:
-    assert "run_command" in FORBIDDEN_TOOLS
-    assert "run_javascript" in FORBIDDEN_TOOLS
+    # Every raw-execution escape radare2-mcp 1.8.8 declares in its own tool
+    # table (src/tools.c 1542-1596), not just the two the first pass noticed.
+    # `sql` is the one worth keeping in mind: it is not exec-gated at all, and
+    # is absent from this build only because it lacks the r2vsql plugin.
+    for escape in (
+        "run_command",
+        "run_javascript",
+        "run_script",
+        "run_frida_script",
+        "sql",
+    ):
+        assert escape in FORBIDDEN_TOOLS, escape
 
 
 def test_a_session_writes_nothing_to_this_servers_stdio(
