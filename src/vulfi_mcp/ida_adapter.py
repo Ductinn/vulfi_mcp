@@ -605,14 +605,39 @@ def _clone_idb(source: Path, managed: Path, workspace: Path) -> str:
     that no component files exist beside it, and the one way they could appear
     afterwards is another session opening the source: copying that session's
     live components would stage a database that probes as crashed.
+
+    This lease is deliberately not a ``rescue`` lease — a staging copy has no
+    spare of its own, and the only thing this module could put back is a file
+    it never wrote. But the bytes being opened are the *source's* bytes, so
+    the one failure that is about them is the vendor's bad pack, and leaving
+    it as a bare ``WorkerStartError`` breaks this module's one promise: the
+    caller is always told. ``.i64``s this server saved reach this path
+    routinely (``ensure_managed_idb`` on a managed database, and the
+    "operator-supplied IDB" the design is built around is normally one), and
+    a run of the suite caught exactly that — ``_clone_idb`` opening a
+    byte-identical copy of a database ``probe_database_state`` had just
+    called ``packed`` and idalib refused with "Failed to open database".
+    Nothing is written to ``source`` either way; only the error changes, from
+    an opaque launcher exit into this server naming the defect.
     """
     staging = _staging(workspace)
     try:
         copy = staging / managed.name
         shutil.copy2(source, copy)
-        with _lease(copy, DatabaseOpenOptions(worker_cwd=str(staging))) as handle:
-            produced = Path(handle.instance.idb_path)
-            _require_saved(handle.save_database(), produced)
+        try:
+            with _lease(copy, DatabaseOpenOptions(worker_cwd=str(staging))) as handle:
+                produced = Path(handle.instance.idb_path)
+                _require_saved(handle.save_database(), produced)
+        except WorkerStartError as damaged:
+            if not _refused_these_bytes(damaged, copy):
+                raise
+            raise ManagedDatabaseError(
+                f"IDA could not open the copy it made of {source}: those"
+                " bytes are a database IDA 9.4 packed and can no longer load."
+                f" Nothing was written to {source}, and no managed database"
+                " was produced from it — it has to be built again from its"
+                " source binary."
+            ) from damaged
         return _publish(produced, managed)
     finally:
         shutil.rmtree(staging, ignore_errors=True)

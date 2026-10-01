@@ -224,7 +224,24 @@ def test_a_read_only_operation_leaves_the_database_alone(
 
 
 def test_a_failed_shutdown_still_closes_the_lease(
-    compiled_calls: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    compiled_calls: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_or_reported: Tolerance,
+) -> None:
+    # One spare-backed pack, one staging pack and three reopens, the last of
+    # them a clone of the managed database; see `durable_or_reported`. A
+    # whole-suite run caught the one-in-fifty here: the clone's open of a
+    # byte-identical copy of a database that had just probed `packed` was
+    # refused with "Failed to open database", which is the vendor signature
+    # and nothing else. Every assertion below is unchanged by the tolerance.
+    with durable_or_reported() as produced:
+        produced.append(str(ensure_managed_idb(str(compiled_calls))))
+        _assert_a_failed_shutdown_still_closes(compiled_calls, monkeypatch)
+
+
+def _assert_a_failed_shutdown_still_closes(
+    compiled_calls: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The discarding shutdown is a fallible RPC (transport error, its own
     # timeout, a dead worker, a 409 from a sibling). If it could skip the

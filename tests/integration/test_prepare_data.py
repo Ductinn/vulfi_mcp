@@ -29,6 +29,7 @@ from test_prepare_code_strings import (
     _at,
     _by_kind,
     _pass,
+    _report,
     compiled_preparation,  # noqa: F401 - the fixture this module runs on
     elf_sections,
 )
@@ -182,8 +183,18 @@ def _assert_only_a_proven_layout_is_defined(
         for name in ACCESSORS
     ]
 
+    # The pass's own account of this run, before a single row is read out of
+    # it. Every way this pass can return fewer objects than the fixture
+    # contains is something it reports — an exhausted budget, an object too
+    # big to walk, a range it never started — and asserting on rows alone
+    # throws all of that away. `first` and `second` below are attached to the
+    # row lookups so a missing object names its own cause.
+    first = _report(result, "structures")
+    assert _pass(result, "structures")["coverage"] == "complete", first
+    assert result["bounded"] is False, first
+
     # -- the layout every access agrees on --------------------------------
-    proven = _at(structures, consistent)
+    proven = _at(structures, consistent, first)
     assert proven["state"] == "applied"
     assert proven["backend"] == "ida"
     assert proven["address_space"] == "image"
@@ -206,7 +217,7 @@ def _assert_only_a_proven_layout_is_defined(
     assert proven["candidate_id"] in applied
 
     # -- the same offset at two widths ------------------------------------
-    contradicted = _at(structures, conflicting)
+    contradicted = _at(structures, conflicting, first)
     assert contradicted["state"] == "candidate"
     assert contradicted["evidence"]["existing_type"] is None
     assert [entry["offset"] for entry in contradicted["evidence"]["conflicts"]] == [0]
@@ -215,7 +226,7 @@ def _assert_only_a_proven_layout_is_defined(
     assert contradicted["candidate_id"] not in applied
 
     # -- one width, repeated: a stride, not a set of distinct fields ------
-    array = _at(structures, stride)
+    array = _at(structures, stride, first)
     assert array["state"] == "applied"
     assert array["evidence"]["shape"] == "array"
     assert array["evidence"]["stride"] == 8
@@ -228,9 +239,12 @@ def _assert_only_a_proven_layout_is_defined(
 
     # -- what the managed database now holds, read back out of it ---------
     again = run_ida_passes(managed, ("structures",))
-    assert again["applied_ids"] == []
-    assert again["artifact_revision"] == result["artifact_revision"]
-    held = _at(_by_kind(again, "structure"), consistent)
+    second = _report(again, "structures")
+    assert _pass(again, "structures")["coverage"] == "complete", second
+    assert again["bounded"] is False, second
+    assert again["applied_ids"] == [], second
+    assert again["artifact_revision"] == result["artifact_revision"], second
+    held = _at(_by_kind(again, "structure"), consistent, second)
     assert held["state"] == "candidate"
     existing = held["evidence"]["existing_type"]
     assert existing is not None, held
@@ -239,12 +253,12 @@ def _assert_only_a_proven_layout_is_defined(
         (field["offset"], field["size"]) for field in existing["fields"]
     ] == list(CONSISTENT_FIELDS)
     assert existing["name"] in held["reason"]
-    held_array = _at(_by_kind(again, "structure"), stride)
+    held_array = _at(_by_kind(again, "structure"), stride, second)
     assert held_array["state"] == "candidate"
     assert held_array["evidence"]["existing_type"]["size"] == 32
     # The object the accesses contradict was never given a type, so there is
     # still nothing there for a second run to preserve or to overwrite.
-    held_conflict = _at(_by_kind(again, "structure"), conflicting)
+    held_conflict = _at(_by_kind(again, "structure"), conflicting, second)
     assert held_conflict["evidence"]["existing_type"] is None
     assert held_conflict["state"] == "candidate"
     assert _digest(binary) == source_digest

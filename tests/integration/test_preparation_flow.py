@@ -386,7 +386,16 @@ def _refused(call: Callable[[], object]) -> None:
         call()
     # The tool decorator re-raises as its own transport error; what the server
     # raised is still the adapter's unsaved-database failure.
-    assert isinstance(reported.value.__cause__, ManagedDatabaseError), reported
+    cause = reported.value.__cause__
+    assert isinstance(cause, ManagedDatabaseError), reported
+    # Unless the save never got the chance to fail. IDA 9.4's bad-pack defect
+    # refuses the *open*, so the call fails before `_refuse_to_save` is ever
+    # reached and the reason names the rollback instead of the injection —
+    # observed in a whole-suite run. That is the one outcome this file's
+    # tolerance owns, so it is handed back to it rather than asserted on;
+    # every other failure still has to be the injected one.
+    if names_the_rollback(cause):
+        raise cause from reported.value
     assert "injected" in str(reported.value)
 
 

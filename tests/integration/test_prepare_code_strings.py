@@ -112,9 +112,56 @@ def _pass(result: dict[str, Any], name: str) -> dict[str, Any]:
     return matches[0]
 
 
-def _at(rows: list[dict[str, Any]], address: int) -> dict[str, Any]:
+def _report(result: dict[str, Any], name: str) -> str:
+    """One pass's own account of itself, so a failure here explains itself.
+
+    Every way a pass can return fewer rows than the fixture contains is
+    already reported by the pass: an exhausted budget names the addresses it
+    never reached, a skipped object says how big it was, a range that was
+    never started says so, and the run's own warnings carry anything else.
+    Reading a row out of a result and asserting on it discards all of that,
+    which is what made one missing row read as "expected one row at 0x40a0,
+    got []" and explain nothing. Attach this to those assertions.
+    """
+    entry = _pass(result, name)
+    lines = [
+        f"{name}: coverage={entry['coverage']}"
+        f" applied={len(entry['applied_ids'])}"
+        f" candidates={len(entry['candidate_ids'])}"
+        f" bounded={result.get('bounded')}"
+        f" revision={result.get('artifact_revision')}"
+        f" idb={result.get('idb_path')}"
+    ]
+    lines += [f"  pass warning: {text}" for text in entry["warnings"]]
+    lines += [f"  run warning: {text}" for text in result.get("warnings") or []]
+    for row in entry["ranges"]:
+        lines.append(
+            f"  range {row['name']} {row['start']:#x}-{row['end']:#x}"
+            f" {row['coverage']} unvisited={row['unvisited']}"
+            f" reason={row['reason']}"
+        )
+    for row in result["candidates"]:
+        evidence = row["evidence"]
+        lines.append(
+            f"  candidate {row['candidate_id']} {row['kind']}"
+            f" {row['address']:#x} {row['state']}"
+            f" segment={evidence.get('segment')}"
+            f" object_name={evidence.get('object_name')}"
+            f" use_sites={evidence.get('use_site_count')}"
+            f" existing_type={(evidence.get('existing_type') or {}).get('name')}"
+            f" :: {row['reason']}"
+        )
+    return "\n".join(lines)
+
+
+def _at(
+    rows: list[dict[str, Any]], address: int, context: str = ""
+) -> dict[str, Any]:
     matches = [row for row in rows if row["address"] == address]
-    assert len(matches) == 1, f"expected one row at {address:#x}, got {matches}"
+    assert len(matches) == 1, (
+        f"expected one row at {address:#x}, got {matches}"
+        + (f"\n{context}" if context else "")
+    )
     return matches[0]
 
 

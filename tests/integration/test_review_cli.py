@@ -223,7 +223,7 @@ def _review_command() -> str:
 
 def _review(*arguments: str, answer: str | None = None) -> subprocess.CompletedProcess:
     """Run `vulfi-mcp review ...` the way an operator would, in its own process."""
-    return subprocess.run(
+    completed = subprocess.run(
         [_review_command(), "review", *arguments],
         input="" if answer is None else f"{answer}\n",
         capture_output=True,
@@ -231,6 +231,38 @@ def _review(*arguments: str, answer: str | None = None) -> subprocess.CompletedP
         check=False,
         env={**os.environ},
     )
+    _rollback_survives_the_subprocess(completed)
+    return completed
+
+
+def _rollback_survives_the_subprocess(
+    completed: subprocess.CompletedProcess,
+) -> None:
+    """Give the shared bad-pack tolerance back the error a child process kept.
+
+    ``durable_or_reported`` holds a body against "the state is intact, or the
+    loss was reported", and it can only see exceptions raised *here*. This
+    file's subject is a separate program: when IDA 9.4's bad-pack defect hits
+    the review command, the server rescues, rolls back once and says so — on
+    the child's stderr, with exit 1 — and that correct outcome reached this
+    process as "the review command wrote no JSON", which is a raw failure.
+
+    So this is the CLI's equivalent of ``test_mcp_ida.py``'s
+    ``_rollback_survives_the_transport``: the one place that knows the
+    process boundary swallowed the exception is the one place that puts it
+    back, and only for output the tolerance's *own* predicate recognises as
+    this server reporting its own rollback or discard. Every other non-zero
+    exit — a refused approval, an unparseable argument, a crash — is left
+    exactly as it was, so it still fails as loudly as it does today. The
+    tolerance's other half is untouched: once this error is raised, the
+    managed database is still re-read and every row it answers with still
+    has to be whole.
+    """
+    if completed.returncode == 0:
+        return
+    reported = ManagedDatabaseError(f"{completed.stderr}\n{completed.stdout}")
+    if names_the_rollback(reported):
+        raise reported
 
 
 def _result(completed: subprocess.CompletedProcess) -> dict[str, Any]:
@@ -242,6 +274,65 @@ def _result(completed: subprocess.CompletedProcess) -> dict[str, Any]:
             f"the review command wrote no JSON (exit {completed.returncode}):\n"
             f"stdout: {completed.stdout!r}\nstderr: {completed.stderr!r}"
         ) from broken
+
+
+def _exited(
+    status: int, stderr: str = "", stdout: str = ""
+) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=["vulfi-mcp", "review"], returncode=status, stdout=stdout, stderr=stderr
+    )
+
+
+def test_only_this_servers_own_rollback_excuses_a_non_zero_exit() -> None:
+    """The subprocess arm tolerates one named vendor defect, not failure.
+
+    The whole risk of putting an arm on the process boundary is that it
+    becomes a blanket "the CLI failed, never mind". These are the three
+    outcomes that must stay distinct: the rollback, the discard-and-rebuild,
+    and everything else — including the refusals this file asserts on, which
+    exit 1 on purpose.
+    """
+    rolled_back = _exited(
+        1,
+        stderr=(
+            "vulfi-mcp review: IDA could not open /tmp/x/vulfi_review.i64: the"
+            " save before this one left a database it cannot read. The copy"
+            " taken before that save has been put back and opens, so this"
+            " workspace works again, but whatever that save changed is gone"
+            " from it.\n"
+        ),
+    )
+    with pytest.raises(ManagedDatabaseError):
+        _rollback_survives_the_subprocess(rolled_back)
+
+    discarded = _exited(
+        1,
+        stderr=(
+            "vulfi-mcp review: IDA could not read back /tmp/x/vulfi_review.i64,"
+            " and the save that produced it kept no copy to restore: the"
+            " managed database has been discarded and has to be built again"
+            " from its source binary, which the next scan of that target"
+            " does\n"
+        ),
+    )
+    with pytest.raises(ManagedDatabaseError):
+        _rollback_survives_the_subprocess(discarded)
+
+    # An ordinary refusal, a crash and a success are all left alone, so the
+    # assertions this file makes about them are unchanged.
+    for untouched in (
+        _exited(1, stdout="only an approved proposal can be applied\n"),
+        _exited(1, stderr="vulfi-mcp review: no such proposal\n"),
+        _exited(2, stderr="Traceback (most recent call last):\nRuntimeError\n"),
+        _exited(0, stdout='{"confirmed": true}'),
+    ):
+        _rollback_survives_the_subprocess(untouched)
+
+    # And a failure the arm leaves alone still reaches the test as the loud
+    # failure it was: `_result` refuses to invent a document.
+    with pytest.raises(AssertionError, match="wrote no JSON"):
+        _result(_exited(1, stderr="vulfi-mcp review: no such proposal\n"))
 
 
 # -- reading what preparation recorded, without re-running it ---------------
