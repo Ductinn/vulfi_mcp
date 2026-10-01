@@ -50,6 +50,7 @@ import pytest
 from conftest import missing_prerequisite, names_the_rollback
 from vulfi_mcp.catalog import Catalog, get_catalog
 from vulfi_mcp.ida_adapter import ManagedDatabaseError, ensure_managed_idb, scan_ida
+from vulfi_mcp.ida_runtime import MAX_STRING_BYTES
 from vulfi_mcp.operator import proposal_briefing, review_proposal
 from vulfi_mcp.rules import validate_rules
 from vulfi_mcp.server import vulfi_prepare, vulfi_propose_recovery, vulfi_scan
@@ -629,24 +630,25 @@ def _approve_one_of_each_kind(binary: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_scripts_missing_evidence_and_type_conflicts_rejected(
+def test_scripts_missing_evidence_conflicts_and_unmapped_ranges_rejected(
     compiled_review: Path,
     managed_data_dir: Path,
     durable_or_reported: Tolerance,
 ) -> None:
     with durable_or_reported() as produced, _rollback_survives_the_tool_wrapper():
         try:
-            _three_invalid_proposals(compiled_review)
+            _four_invalid_proposals(compiled_review)
         finally:
             produced.append(ensure_managed_idb(str(compiled_review)))
 
 
-def _three_invalid_proposals(binary: Path) -> None:
+def _four_invalid_proposals(binary: Path) -> None:
     target = str(binary)
     prepared = vulfi_prepare(target)
     analysis_id = prepared["analysis_id"]
     ranges = _candidate_ranges(target, analysis_id)
     hidden = ranges["boundary"]
+    text = ranges["string"]
     defined = _only(
         _all_candidates(target, analysis_id), kind="string", text=DEFINED_MARKER
     )
@@ -693,12 +695,24 @@ def _three_invalid_proposals(binary: Path) -> None:
                 "evidence": {"text": conflicting["evidence"]["text"]},
                 "rationale": "decode it again, differently",
             },
+            # 4. A range that runs off the end of the one segment it starts
+            #    in. Not a conflict with anything — there is nothing out
+            #    there at all — and the refusal says exactly that.
+            {
+                "candidate_id": text["candidate_id"],
+                "kind": "string_decode",
+                "address_space": "image",
+                "address": text["address"],
+                "value": {"encoding": "ascii", "length": MAX_STRING_BYTES},
+                "evidence": {"text": MARKER},
+                "rationale": "read everything after it as one string",
+            },
         ],
     )
 
     assert submitted["accepted_total"] == 0
-    assert submitted["refused_total"] == 3
-    script, missing, conflict = submitted["proposals"]
+    assert submitted["refused_total"] == 4
+    script, missing, conflict, unmapped = submitted["proposals"]
 
     assert script["accepted"] is False
     assert script["proposal_id"] is None
@@ -713,6 +727,10 @@ def _three_invalid_proposals(binary: Path) -> None:
     assert str(conflicting["address"]) in conflict["reason"] or (
         f"{conflicting['address']:#x}" in conflict["reason"]
     )
+
+    assert unmapped["accepted"] is False
+    assert "mapped segment" in unmapped["reason"]
+    assert "nothing there to define" in unmapped["reason"]
 
     # Nothing was stored, so there is nothing for an operator to approve.
     with get_catalog(target) as catalog:
@@ -862,6 +880,9 @@ def _nothing_half_approved_is_reported_as_approved(binary: Path) -> None:
     assert unconfirmed["reconciliation"] is not None
     assert unconfirmed["reconciliation"]["recovered"] is True
     assert "injected" in unconfirmed["reason"]
+    # The reason names the way out, because an operator reading it has to be
+    # able to carry out what it says.
+    assert "review reopen" in unconfirmed["reason"]
 
     reconciled = proposal_briefing(target, third)
     assert reconciled["proposal"]["state"] == "approved"
@@ -875,3 +896,79 @@ def _nothing_half_approved_is_reported_as_approved(binary: Path) -> None:
     assert retried["confirmed"] is False
     assert retried["approved_revision"] is None
     assert "approved" in retried["reason"]
+    assert "review reopen" in retried["reason"]
+
+    # 4. And that way out is a real one. The row is stranded — nothing can
+    #    decide it, and re-submitting the identical change is refused as a
+    #    duplicate, because a proposal's id is derived from its content.
+    duplicate = vulfi_propose_recovery(
+        target,
+        analysis_id,
+        [
+            {
+                "candidate_id": named["candidate_id"],
+                "kind": "name",
+                "address_space": "image",
+                "address": named["address"],
+                "value": {"name": "vulfi_reviewed_again"},
+                "evidence": {"segment": ".vulfi_review_code"},
+                "rationale": "the stretch decodes to a self-contained body",
+            }
+        ],
+    )
+    assert duplicate["accepted_total"] == 0
+    assert duplicate["proposals"][0]["proposal_id"] == third
+    assert "already recorded" in duplicate["proposals"][0]["reason"]
+
+    # An operator who does not confirm the reopen changes nothing either.
+    aborted = _review(
+        "reopen", "--path", target, "--proposal-id", third, answer="no"
+    )
+    assert aborted.returncode == 1, aborted.stderr
+    assert proposal_briefing(target, third)["proposal"]["state"] == "approved"
+
+    reopened = _result(
+        _review(
+            "reopen",
+            "--path",
+            target,
+            "--proposal-id",
+            third,
+            "--reason",
+            "the catalog is readable again",
+            "--json",
+            answer="reopen",
+        )
+    )
+    assert reopened["confirmed"] is True
+    assert reopened["state"] == "pending"
+    assert reopened["applied"] is False
+    assert reopened["approved_revision"] is None, "a reopen approves nothing"
+
+    # And the approval that never became durable can now be made, through
+    # the one path that may make it, with nothing left over from the first.
+    standing = proposal_briefing(target, third)
+    assert standing["proposal"]["state"] == "pending"
+    assert standing["site"]["name"] is None
+    remade = review_proposal(
+        target, third, "approve", standing["artifact_revision"], reviewer="tester"
+    )
+    assert remade["confirmed"] is True, remade["reason"]
+    assert remade["state"] == "applied"
+    assert remade["approved_revision"] == standing["artifact_revision"] + 1
+    assert proposal_briefing(target, third)["site"]["name"] == "vulfi_reviewed_again"
+
+    # A reopen is for an approval nothing durable followed, and this one is
+    # now durable: the command refuses it rather than unwinding history.
+    refused = _review(
+        "reopen",
+        "--path",
+        target,
+        "--proposal-id",
+        third,
+        "--json",
+        answer="reopen",
+    )
+    assert refused.returncode == 1
+    assert "only an approved proposal" in refused.stdout + refused.stderr
+    assert proposal_briefing(target, third)["proposal"]["state"] == "applied"

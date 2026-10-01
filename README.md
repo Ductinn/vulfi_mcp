@@ -25,6 +25,7 @@ vulfi-mcp review list    --path ./target
 vulfi-mcp review show    --path ./target --proposal-id prop-...
 vulfi-mcp review approve --path ./target --proposal-id prop-... --expected-revision 3
 vulfi-mcp review reject  --path ./target --proposal-id prop-... --expected-revision 3 --reason "..."
+vulfi-mcp review reopen  --path ./target --proposal-id prop-... --reason "..."
 ```
 
 `show`, and every `approve`/`reject` before it asks, prints what the managed analysis holds *right now* in the proposed range — the original bytes and their digest, the name, the function, the type and the items already defined there — beside the proposed change, its expected effect, and the candidate evidence the proposal quotes. Then it waits for the decision to be typed out in full; anything else aborts and writes nothing.
@@ -32,6 +33,8 @@ vulfi-mcp review reject  --path ./target --proposal-id prop-... --expected-revis
 An approval is not a promise about a database the reviewer can no longer see. Before anything is applied it revalidates against the **current** artifact: the candidate must still be in the catalog and still carry the quoted evidence, the artifact must still be at `--expected-revision`, the bytes must still be the ones the candidate recorded, and nothing may have been defined over the range. A failure of any of those marks the proposal `stale`, applies nothing, and the proposal has to be made again. A conflict is always a refusal and never an overwrite.
 
 The order is checkpoint, apply, save, observe, record. The decision is written to the catalog *before* the write it authorizes, so a decision that never became durable is still visible afterwards; the change goes through the one lease that saves and that keeps the bytes it replaces. A durable approved revision is reported only when both stores hold it — a stale approval, a failed save, and a catalog that could not record the approval all answer `approved_revision: null`, and the last of those also takes the change back off the artifact from the checkpoint so the two stores are not left disagreeing.
+
+`reopen` is the way back from the last of those. The row it leaves behind says `approved` with no change behind it: nothing can decide it, and re-submitting the identical change is refused as a duplicate because a proposal's id is derived from its content. `reopen` returns such a row to `pending` — after reading the managed artifact again and finding that what the proposal asks for really is not there. A proposal whose change *is* there is left alone and said so, and one whose candidate no longer carries its evidence is marked `stale` instead. It approves nothing itself: the operator decides it afterwards the usual way.
 
 **The separation is procedural.** This is an ordinary program on an ordinary PATH, so anything running with the operator's own OS permissions — including a shell-capable agent — can run it. What the split prevents is an MCP client applying its own proposals through the protocol it is already talking. An installation that needs enforced human separation has to enforce it with credentials: run the MCP server as a principal that cannot execute `vulfi-mcp review` and cannot write the managed data directory, and give the reviewer a different one.
 

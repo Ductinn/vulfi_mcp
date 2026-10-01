@@ -41,6 +41,14 @@ stale approval, a save that failed and a catalog that could not record the
 approval all return ``approved_revision: None``. The last of those also takes
 the change back off the artifact, from the checkpoint the apply recorded, so
 the two stores are not left disagreeing about what happened.
+
+**An approval nothing durable followed is not stranded.** The row that last
+case leaves behind says ``approved`` with no change behind it, and no
+decision may be made about it — which is why ``vulfi-mcp review reopen``
+exists. It returns such a row to ``pending``, and only after reading the
+managed artifact again and finding that what the proposal asks for really is
+not there. It is on this command, and on no MCP tool, for the same reason
+approving is.
 """
 
 from __future__ import annotations
@@ -90,12 +98,37 @@ __all__ = [
     "list_proposals",
     "main",
     "proposal_briefing",
+    "reopen_proposal",
     "review_proposal",
 ]
 
 #: What a reviewer may decide. There is no third answer: a proposal is
 #: applied or it is refused, and "later" is simply leaving it pending.
 DECISIONS: Final[tuple[str, ...]] = ("approve", "reject")
+
+#: The third thing the command does, which is not a decision about the
+#: change at all: it puts an approval nothing durable followed back where a
+#: decision can be made about it.
+_REOPEN: Final = "reopen"
+
+#: What the command says each verb is about to do, printed above the prompt
+#: that asks for it, and how it reads once it has not happened.
+_CONFIRMATIONS: Final[dict[str, str]] = {
+    "approve": (
+        "Approving applies the change to the managed analysis and moves its"
+        " revision."
+    ),
+    "reject": "Rejecting records the decision and changes no analysis.",
+    _REOPEN: (
+        "Reopening returns the approval to pending so it can be decided"
+        " again, and changes no analysis."
+    ),
+}
+_HAPPENED: Final[dict[str, str]] = {
+    "approve": "approved",
+    "reject": "rejected",
+    _REOPEN: "reopened",
+}
 
 #: The worker operations this module sends.
 _EVIDENCE: Final = "proposal_evidence"
@@ -120,6 +153,9 @@ class ReviewResult(TypedDict):
     ``confirmed`` is the whole claim: ``True`` means the decision took effect
     exactly as asked — a rejection recorded, or a change applied, saved and
     recorded. Everything else is ``False`` with a ``reason``.
+
+    A reopen fills in the same result: ``decision`` is ``reopen``, and
+    ``confirmed`` means the stranded approval really is pending again.
 
     ``approved_revision`` is the artifact revision an approval made durable,
     and is ``None`` unless both stores hold it. A stale approval, a failed
@@ -312,6 +348,11 @@ def review_proposal(
                 " pending proposal can be decided. Nothing was applied and no"
                 " revision was approved; a decision an operator already made"
                 " is not overwritten by a second one"
+                + (
+                    f". {_reopen_hint(path, proposal_id)}"
+                    if held["state"] == "approved"
+                    else ""
+                )
             )
             return report
         drift = _unreviewable(held, candidate, body)
@@ -455,8 +496,11 @@ def _reconcile(
     a revision nobody recorded and a proposal nobody can see the outcome of.
 
     Either way this reports ``approved`` and no durable revision: the
-    decision is still on the row, as the anchor for whatever reconciliation
-    the operator chooses, and nothing here claims the approval completed.
+    decision is still on the row, as the anchor for the reconciliation that
+    follows, and nothing here claims the approval completed. When the change
+    was taken back off, that reconciliation is ``vulfi-mcp review reopen``,
+    and the reason below says so rather than naming a path that does not
+    exist.
     """
     recovery: dict[str, Any] = {
         "recovered": False,
@@ -477,6 +521,7 @@ def _reconcile(
         recovery["recovery_error"] = _text(restored.get("reason"))
         recovery["artifact_revision"] = _whole(restored.get("revision"))
         report["artifact_revision"] = recovery["artifact_revision"]
+    retreat = _reopen_command(report["path"], report["proposal_id"])
     report.update(
         state="approved",
         applied=not recovery["recovered"],
@@ -487,8 +532,9 @@ def _reconcile(
             f" record it: {recovery['catalog_error']}. "
             + (
                 "It was taken back off the managed artifact from the"
-                " checkpoint, so both stores agree nothing happened, and the"
-                " approval has to be made again once the catalog is readable"
+                " checkpoint, so both stores agree nothing happened; once the"
+                f" catalog is readable, '{retreat}' returns this proposal to"
+                " pending so the approval can be made again"
                 if recovery["recovered"]
                 else "It could not be taken back off either"
                 f" ({recovery['recovery_error']}), so the managed artifact"
@@ -551,6 +597,125 @@ def _stale(
         ),
     )
     return report
+
+
+# --------------------------------------------------------------------------
+# Unsticking an approval that nothing durable followed
+# --------------------------------------------------------------------------
+
+
+def reopen_proposal(
+    path: str,
+    proposal_id: str,
+    *,
+    reason: str | None = None,
+    reviewer: str | None = None,
+) -> ReviewResult:
+    """Return an approval nothing durable followed to ``pending``.
+
+    A decision is recorded ``approved`` before the write it authorizes, so a
+    failure after that point — a catalog that could not record the apply and
+    whose change was taken back off the artifact, or a crash between the two
+    — leaves a row saying ``approved`` with nothing behind it. Nothing could
+    move that row: :func:`review_proposal` refuses to decide it, and
+    re-submitting the same change is refused as a duplicate because a
+    proposal's id is derived from its content. This is the way out, and it is
+    the operator's alone, for the same reason approving is.
+
+    It reopens only what it can see is not durable. The managed artifact is
+    read again first: a proposal the artifact now refuses — because what it
+    asks for is already there — is left ``approved`` and said so, since
+    approving it again would only be refused; a proposal whose candidate no
+    longer carries its evidence is marked ``stale``, which is the other way
+    out of the same place. What is left is a change that really is not on the
+    artifact, and that is what goes back to ``pending``.
+    """
+    who = (reviewer or _reviewer()).strip() or _UNKNOWN_REVIEWER
+    why = (reason or "").strip() or (
+        "reopened: the approval recorded for it never became durable"
+    )
+    idb_path = _managed_database(path)
+    with _catalog(path, idb_path, writable=True) as catalog:
+        held = _held(catalog, proposal_id, path)
+        body = _body(held)
+        candidate = catalog.candidate(
+            str(held["analysis_id"]), str(held["candidate_id"])
+        )
+        observed = invoke_ida(
+            idb_path, _EVIDENCE, {"proposals": [proposal_payload(body)]}
+        )
+        reviewed = _reviewed(observed)
+        revision = _revision(observed)
+        # A reopen is made against the artifact as it is now, so the revision
+        # it was decided against is the one that was just read.
+        report = _outcome(
+            path,
+            idb_path,
+            held,
+            body,
+            str(reviewed["effect"]),
+            _REOPEN,
+            revision,
+            who,
+            revision,
+        )
+        if held["state"] != "approved":
+            report["reason"] = (
+                f"proposal {proposal_id} is {held['state']!r}, and only an"
+                " approved proposal whose change never became durable can be"
+                " reopened. Nothing was changed"
+            )
+            return report
+        drift = _unreviewable(held, candidate, body)
+        if drift is not None:
+            return _stale(catalog, report, who, drift)
+        refusal = _text(reviewed.get("refusal"))
+        if refusal is not None:
+            report["reason"] = (
+                f"proposal {proposal_id} was not reopened: the managed"
+                f" artifact refuses it as it now is ({refusal}), so what it"
+                " asks for may already be there and reopening it would only"
+                " lead to a refusal. It is still approved and nothing was"
+                " changed"
+            )
+            return report
+        try:
+            stored = catalog.decide_proposal(
+                proposal_id, state="pending", decided_by=who, reason=why
+            )
+        except Exception as refused:  # noqa: BLE001 - every failure is reported
+            report["reason"] = (
+                f"proposal {proposal_id} could not be reopened: {refused}."
+                " It is still approved and nothing was changed"
+            )
+            return report
+        report.update(
+            state=str(stored["state"]),
+            confirmed=True,
+            decided_at=_text(stored["decided_at"]),
+            reason=(
+                f"{why}. The proposal is pending again and may be approved"
+                f" against revision {revision}; nothing was applied and no"
+                " revision was approved by this command"
+            ),
+        )
+        return report
+
+
+def _reopen_command(path: str, proposal_id: str) -> str:
+    """The command that returns one stranded approval to pending."""
+    return (
+        f"vulfi-mcp review {_REOPEN} --path {shlex.quote(path)}"
+        f" --proposal-id {proposal_id}"
+    )
+
+
+def _reopen_hint(path: str, proposal_id: str) -> str:
+    """What to tell an operator holding an approval they cannot decide."""
+    return (
+        "An approval whose change never became durable is returned to pending"
+        f" by '{_reopen_command(path, proposal_id)}'"
+    )
 
 
 def _outcome(
@@ -791,6 +956,26 @@ def _parser() -> argparse.ArgumentParser:
             help="why, recorded with the decision",
         )
         decide.add_argument("--json", action="store_true")
+
+    reopening = commands.add_parser(
+        _REOPEN,
+        help="return an approval nothing durable followed to pending",
+        description=(
+            "Return to pending an approval that was recorded and that nothing"
+            " durable followed — a catalog that could not record the apply"
+            " whose change was then taken back off, or an interruption"
+            " between the two. The managed artifact is read again first, and"
+            " a proposal whose change is really there is left alone."
+        ),
+    )
+    reopening.add_argument("--path", required=True)
+    reopening.add_argument("--proposal-id", required=True)
+    reopening.add_argument(
+        "--reason",
+        default=None,
+        help="why it is being reopened, recorded with the proposal",
+    )
+    reopening.add_argument("--json", action="store_true")
     return parser
 
 
@@ -798,8 +983,9 @@ def main(argv: list[str] | None = None) -> int:
     """Run one review command. Returns the process exit status.
 
     ``0`` means the command did what it was asked. ``1`` means it did not —
-    a refusal, a stale proposal, a failed write, or an operator who did not
-    confirm — and in every one of those cases nothing was applied.
+    a refusal, a stale proposal, a failed write, a reopen the artifact would
+    not have, or an operator who did not confirm — and in every one of those
+    cases nothing was applied.
     """
     arguments = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     # With `--json` the one document on stdout is the result, so the dialogue
@@ -823,26 +1009,32 @@ def main(argv: list[str] | None = None) -> int:
             _emit(briefing, arguments.json, _render_briefing(briefing), dialogue)
             return 0
         print(_render_briefing(briefing), file=dialogue)
-        if briefing["proposal"]["state"] != "pending":
-            print(
-                f"This proposal is {briefing['proposal']['state']}, and only a"
-                " pending proposal can be decided. Nothing was changed.",
-                file=dialogue,
-            )
+        state = str(briefing["proposal"]["state"])
+        blocked = _unready(
+            arguments.command, state, arguments.path, arguments.proposal_id
+        )
+        if blocked is not None:
+            print(blocked, file=dialogue)
             return 1
         if not _confirmed(arguments.command, dialogue):
             print(
-                f"Nothing was {arguments.command}d and nothing was changed.",
+                f"Nothing was {_HAPPENED[arguments.command]} and nothing was"
+                " changed.",
                 file=dialogue,
             )
             return 1
-        result = review_proposal(
-            arguments.path,
-            arguments.proposal_id,
-            arguments.command,
-            arguments.expected_revision,
-            reason=arguments.reason,
-        )
+        if arguments.command == _REOPEN:
+            result = reopen_proposal(
+                arguments.path, arguments.proposal_id, reason=arguments.reason
+            )
+        else:
+            result = review_proposal(
+                arguments.path,
+                arguments.proposal_id,
+                arguments.command,
+                arguments.expected_revision,
+                reason=arguments.reason,
+            )
     except (
         ReviewError,
         PreparationError,
@@ -866,16 +1058,37 @@ def _emit(
         print(rendered, file=dialogue)
 
 
+def _unready(command: str, state: str, path: str, proposal_id: str) -> str | None:
+    """Why this command may not run against a proposal in ``state``, or ``None``.
+
+    Said before the prompt, not after it: an operator is not asked to confirm
+    something that was never going to happen.
+    """
+    if command == _REOPEN:
+        if state == "approved":
+            return None
+        return (
+            f"This proposal is {state}, and only an approved proposal whose"
+            " change never became durable can be reopened. Nothing was"
+            " changed."
+        )
+    if state == "pending":
+        return None
+    return (
+        f"This proposal is {state}, and only a pending proposal can be"
+        " decided. Nothing was changed."
+        + (
+            f" {_reopen_hint(path, proposal_id)}."
+            if state == "approved"
+            else ""
+        )
+    )
+
+
 def _confirmed(decision: str, dialogue: Any) -> bool:
     """Ask, and accept only the decision typed out in full."""
     print(
-        f"\nThis {decision}s the proposal above."
-        + (
-            " Approving applies the change to the managed analysis and moves"
-            " its revision."
-            if decision == "approve"
-            else " Rejecting records the decision and changes no analysis."
-        ),
+        f"\nThis {decision}s the proposal above. {_CONFIRMATIONS[decision]}",
         file=dialogue,
     )
     print(
@@ -911,6 +1124,10 @@ def _render_briefing(briefing: Briefing) -> str:
     proposal = briefing["proposal"]
     site = briefing["site"]
     value = json.dumps(proposal["value"], sort_keys=True)
+    # A range outside every mapped segment has no segment name, and an
+    # operator reading "in segment None" would be reading a Python repr
+    # where a fact about the image belongs.
+    segment = _text(site["segment"]) or "(unmapped)"
     lines = [
         f"Proposal {proposal['proposal_id']} — {proposal['kind']}"
         f" ({proposal['state']})",
@@ -920,7 +1137,7 @@ def _render_briefing(briefing: Briefing) -> str:
         f"  analysis        {proposal['analysis_id']}",
         f"  candidate       {proposal['candidate_id']}",
         f"  range           {site['start']:#x} .. {site['end']:#x}"
-        f" ({site['size']} bytes) in segment {site['segment']}",
+        f" ({site['size']} bytes) in segment {segment}",
         f"  proposed        {briefing['effect']}",
         f"  value           {value}",
         f"  rationale       {proposal['rationale']}",

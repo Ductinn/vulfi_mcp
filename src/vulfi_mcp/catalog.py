@@ -890,25 +890,36 @@ class Catalog:
                     f" {analysis!r} of this target, so there is nothing for"
                     " this proposal to be about"
                 )
-            connection.execute(
-                "INSERT INTO proposals (proposal_id, analysis_id, candidate_id,"
-                " kind, address_space, address, value, rationale, state,"
-                " expected_revision, decided_at, decided_by, decision_reason,"
-                " created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL,"
-                " NULL, ?)",
-                (
-                    identifier,
-                    analysis,
-                    candidate,
-                    kind,
-                    space,
-                    address,
-                    body,
-                    rationale,
-                    now,
-                ),
-            )
+            try:
+                connection.execute(
+                    "INSERT INTO proposals (proposal_id, analysis_id,"
+                    " candidate_id, kind, address_space, address, value,"
+                    " rationale, state, expected_revision, decided_at,"
+                    " decided_by, decision_reason, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL,"
+                    " NULL, NULL, ?)",
+                    (
+                        identifier,
+                        analysis,
+                        candidate,
+                        kind,
+                        space,
+                        address,
+                        body,
+                        rationale,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as collided:
+                # A proposal's id is derived from its content, so two
+                # submissions of one change race for this row. The loser is
+                # owed the refusal the winner's caller would have been given,
+                # in this module's vocabulary rather than the driver's.
+                raise CatalogError(
+                    f"proposal {identifier!r} is already recorded for this"
+                    " target, so this exact change is already waiting on a"
+                    f" decision: {collided}"
+                ) from collided
         stored = self.proposal(identifier)
         if stored is None:  # pragma: no cover - the transaction just wrote it
             raise CatalogError(

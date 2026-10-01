@@ -357,6 +357,26 @@ def test_the_catalog_stores_a_proposal_pending_with_its_evidence(
             rationale="the decoded instructions end in a return",
         )
 
+        # Two concurrent submissions of one change race for this row: the
+        # id is derived from the content, so both mint the same one and the
+        # pre-check in `propose_recovery` can see nothing before either
+        # writes. The loser is owed the duplicate refusal, in this module's
+        # vocabulary rather than the database driver's.
+        with pytest.raises(CatalogError, match="already recorded") as collided:
+            catalog.record_proposal(
+                ANALYSIS,
+                proposal_id="prop-1",
+                candidate_id=FUNCTION_CANDIDATE["candidate_id"],
+                kind="name",
+                address_space="image",
+                address=0x401000,
+                value={"name": "vulfi_reviewed_entry"},
+                evidence={"segment": ".vulfi_hidden"},
+                rationale="the decoded instructions end in a return",
+            )
+        assert "prop-1" in str(collided.value)
+        assert not isinstance(collided.value, sqlite3.Error)
+
     assert stored["state"] == "pending"
     assert stored["expected_revision"] is None
     assert stored["decided_at"] is None
