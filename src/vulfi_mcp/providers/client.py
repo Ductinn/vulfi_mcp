@@ -53,6 +53,7 @@ import json
 import os
 import re
 import threading
+import warnings
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -686,24 +687,20 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
             "its input schema nests deeper than the"
             f" {limits.max_response_depth} level depth budget"
         )
-    dialect, refusal = _select_dialect(schema)
-    if refusal is not None:
-        return refusal
-    assert dialect is not None
-    found = _refused_keywords(schema, dialect)
-    unclassified = [name for name in found if name in dialect.unclassified]
-    if unclassified:
+    finding = _inspect_schema(schema)
+    if finding.reason is not None:
+        return finding.reason
+    if finding.unclassified:
         return (
-            f"its input schema uses {unclassified}, which the installed"
-            f" JSON Schema library evaluates for {dialect.name} but this server"
-            " has not classified as a schema position; a keyword whose shape is"
-            " unknown is refused rather than walked past, because what it can"
-            " reach is unknown too"
+            f"its input schema uses {finding.unclassified}, which the installed"
+            " JSON Schema library evaluates but this server has not classified"
+            " as a schema position; a keyword whose shape is unknown is refused"
+            " rather than walked past, because what it can reach is unknown too"
         )
-    if found:
+    if finding.refused:
         return (
-            f"its input schema uses {found}, which this server will not"
-            " evaluate: a provider's regular expression, and anything a"
+            f"its input schema uses {finding.refused}, which this server will"
+            " not evaluate: a provider's regular expression, and anything a"
             " provider's reference can reach, runs here, in this process,"
             " before any call is sent"
         )
@@ -716,7 +713,7 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
             "its input schema declares no properties table, so nothing says"
             " which arguments it accepts"
         )
-    validator = jsonschema.validators.validator_for(schema)
+    validator = _validator_for(schema, default=jsonschema.validators._LATEST_VERSION)
     try:
         validator.check_schema(schema)
     except Exception as error:  # noqa: BLE001 - any refusal is a refusal
@@ -724,34 +721,142 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
     return None
 
 
-def _select_dialect(schema: Mapping[str, Any]) -> tuple[_Dialect | None, str | None]:
-    """The draft this schema will be evaluated under, or why it is refused.
+@dataclass(frozen=True)
+class _Finding:
+    """What one walk of a provider's schema turned up."""
 
-    The dialect comes from the schema's own ``$schema``, exactly as
-    :func:`jsonschema.validators.validator_for` reads it — that is the whole
-    point: a provider chooses the vocabulary its schema is evaluated with, so
-    the vocabulary is provider-controlled input like everything else here.
+    refused: list[str]
+    unclassified: list[str]
+    reason: str | None
+
+
+def _validator_for(schema: object, default: type[Any]) -> type[Any]:
+    """The validator class the library itself would use for ``schema``.
+
+    Called instead of comparing ``$schema`` strings, and that is the whole
+    point of this round. The previous version normalised with ``rstrip("#")``
+    while :data:`_META_SCHEMAS` is a ``URIDict`` normalising with
+    ``urlsplit(uri).geturl()`` — ``rstrip`` removes every trailing ``#`` and
+    ``urlsplit`` only an empty fragment, so ``…/draft-04/schema##`` was
+    draft-04 to the pin and 2020-12 to the evaluator, and every keyword in the
+    gap between those vocabularies became a position the walk stepped over and
+    the validator evaluated in full. There is no second normalisation here to
+    drift, because there is no second normalisation.
+
+    The library warns about a ``$schema`` it does not know and then falls back,
+    which is a decision this module must mirror, not second-guess: the warning
+    is silenced so the mirroring is deterministic.
     """
-    declared = schema.get("$schema")
-    if declared is None:
-        latest = jsonschema.validators._LATEST_VERSION
-        return DIALECTS[latest.__name__], None
-    if not isinstance(declared, str):
-        return None, (
-            f"its input schema declares a {type(declared).__name__} $schema,"
-            " which names no dialect at all"
-        )
-    uri = declared.rstrip("#")
-    if uri not in SUPPORTED_DIALECTS:
-        return None, _quote(
-            f"its input schema declares the {declared!r} dialect, which this"
-            " server does not evaluate: only the drafts it has classified and"
-            f" tested are accepted ({sorted(SUPPORTED_DIALECTS)})"
-        )
-    validator = _META_SCHEMAS.get(uri)
-    if validator is None:  # pragma: no cover - the two sets agree
-        return None, f"its input schema declares the unknown dialect {declared!r}"
-    return DIALECTS[validator.__name__], None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return jsonschema.validators.validator_for(schema, default=default)
+
+
+def _inspect_schema(schema: Mapping[str, Any]) -> _Finding:
+    """Walk a provider's schema the way the library will evaluate it.
+
+    Two things happen per node, not once at the root, and both were bypasses
+    before they did:
+
+    * **the dialect is re-selected.** ``Validator.evolve`` calls
+      ``validator_for(subschema, default=self.__class__)`` and ``descend`` goes
+      through ``evolve``, so a subschema carrying its own ``$schema`` switches
+      vocabulary *for that subtree*. A 153-byte schema with no root ``$schema``
+      at all — the shape radare2-mcp emits — reached draft-03 that way, through
+      a pin that had only ever looked at the root;
+    * **the pin is applied** to whatever class that selection returns. Membership
+      is tested on the class, never on a URI string.
+
+    A nested ``$schema`` is then refused outright, as the outer belt: no tool
+    schema either installed provider ships declares one anywhere — zero across
+    radare2-mcp's 52 table entries and GhidraMCP's 222 tools — so the legitimate
+    surface being given up is empty, while the surface being closed is every
+    dialect switch anyone thinks of next.
+    """
+    refused: set[str] = set()
+    unclassified: set[str] = set()
+    root = _validator_for(schema, default=jsonschema.validators._LATEST_VERSION)
+    if root not in SUPPORTED_DIALECTS:
+        return _Finding([], [], _unsupported(root, schema.get("$schema")))
+    stack: list[tuple[object, type[Any]]] = [(schema, root)]
+    first = True
+    while stack:
+        item, validator = stack.pop()
+        if isinstance(item, list):
+            stack.extend((child, validator) for child in item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        # Re-selection and the pin come first, deliberately: they are the layer
+        # that has to work on its own, and putting the belt in front of them
+        # would hide whether it does.
+        validator = _validator_for(item, default=validator)
+        if validator not in SUPPORTED_DIALECTS:
+            return _Finding([], [], _unsupported(validator, item.get("$schema")))
+        if not first and "$schema" in item:
+            return _Finding(
+                [],
+                [],
+                "a subschema of its input schema declares its own $schema,"
+                " which switches the dialect the library evaluates that subtree"
+                " with; no tool schema this server talks to has one, and one"
+                " here would mean the vocabulary changes underneath the check",
+            )
+        first = False
+        dialect = DIALECTS[validator.__name__]
+        for key, value in item.items():
+            if key in _REFUSED_KEYWORDS:
+                refused.add(key)
+                continue
+            if key in dialect.unclassified:
+                unclassified.add(key)
+                continue
+            kind = dialect.kinds.get(key)
+            if kind == "named":
+                if isinstance(value, dict):
+                    stack.extend((child, validator) for child in value.values())
+            elif kind == "schema":
+                stack.append((value, validator))
+    return _Finding(sorted(refused), sorted(unclassified), None)
+
+
+def _unsupported(validator: type[Any], declared: object) -> str:
+    """Why one dialect is refused, naming what the library resolved it to."""
+    named = f" declared as {declared!r}" if declared is not None else ""
+    return _quote(
+        f"its input schema would be evaluated as {validator.__name__}{named},"
+        " a dialect this server has not classified and tested; only"
+        f" {sorted(item.__name__ for item in SUPPORTED_DIALECTS)} are accepted"
+    )
+
+
+def _refused_keywords(schema: object, dialect: _Dialect) -> list[str]:
+    """The refused or unclassified keywords one dialect's vocabulary finds.
+
+    The classification on its own, with no dialect re-selection and no pin, so
+    a test can hold each layer to its own promise. :func:`_inspect_schema` is
+    what production uses.
+    """
+    found: set[str] = set()
+    stack: list[object] = [schema]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if key in _REFUSED_KEYWORDS or key in dialect.unclassified:
+                found.add(key)
+                continue
+            kind = dialect.kinds.get(key)
+            if kind == "named":
+                if isinstance(value, dict):
+                    stack.extend(value.values())
+            elif kind == "schema":
+                stack.append(value)
+    return sorted(found)
 
 
 #: How one keyword's value is shaped, and therefore what the walk must do with
@@ -783,12 +888,10 @@ _SHARED_KINDS: Final[dict[str, str]] = {
     "anyOf": "schema",
     "const": "instance",
     "contains": "schema",
-    "contentSchema": "schema",
     "dependencies": "named",
     "dependentRequired": "instance",
     "dependentSchemas": "named",
     "divisibleBy": "instance",
-    "else": "schema",
     "enum": "instance",
     "exclusiveMaximum": "instance",
     "exclusiveMinimum": "instance",
@@ -812,11 +915,24 @@ _SHARED_KINDS: Final[dict[str, str]] = {
     "properties": "named",
     "propertyNames": "schema",
     "required": "instance",
-    "then": "schema",
     "type": "instance",
     "unevaluatedItems": "schema",
     "unevaluatedProperties": "schema",
     "uniqueItems": "instance",
+}
+
+#: Keywords that are not entries in any validator's ``VALIDATORS`` table, but
+#: that another keyword's implementation descends into — ``if_`` evaluates the
+#: ``then`` and ``else`` siblings itself. They are added to a dialect only when
+#: the keyword that reaches them is present, so the completeness check can
+#: assert the tables in **both** directions: nothing missing, and nothing
+#: surplus. ``contentSchema`` used to sit in the shared table and was exactly
+#: that surplus-and-wrong entry nothing checked — no installed validator
+#: evaluates it, so it is now an annotation, like any other key the library
+#: ignores.
+_COMPANION_KINDS: Final[dict[str, tuple[str, str]]] = {
+    "else": ("if", "schema"),
+    "then": ("if", "schema"),
 }
 
 #: Where one dialect disagrees with :data:`_SHARED_KINDS`.
@@ -871,6 +987,9 @@ def _dialect(validator: Any, uri: str | None) -> _Dialect:
             unclassified.add(keyword)
         else:
             kinds[keyword] = kind
+    for companion, (reached_by, kind) in _COMPANION_KINDS.items():
+        if reached_by in validator.VALIDATORS:
+            kinds[companion] = kind
     return _Dialect(
         name=validator.__name__,
         uri=uri,
@@ -900,8 +1019,15 @@ UNCLASSIFIED_KEYWORDS: Final[dict[str, frozenset[str]]] = {
     name: dialect.unclassified for name, dialect in DIALECTS.items()
 }
 
-#: The dialects this server has classified **and tested**, by meta-schema URI.
-#: Draft-03 is deliberately absent: it is now classified correctly, and it is
+#: The dialects this server has classified **and tested**, as **validator
+#: classes**, resolved once through the same :data:`_META_SCHEMAS` mapping the
+#: library's own selector consults. Deliberately not a set of URI strings: a
+#: string comparison needs a normalisation of its own, and the one written here
+#: drifted from ``urlsplit`` badly enough that ``…/draft-04/schema##`` was
+#: draft-04 to the pin and 2020-12 to the evaluator. Membership is tested on
+#: the class the library resolved, so there is nothing left that can disagree.
+#:
+#: Draft-03 is deliberately absent. It is classified correctly now, and it is
 #: still refused, because this server has no reason to evaluate a dialect
 #: nobody ships and every round of this review has shown that the classification
 #: is the thing most likely to be wrong. Belt and braces, in that order — the
@@ -909,18 +1035,18 @@ UNCLASSIFIED_KEYWORDS: Final[dict[str, frozenset[str]]] = {
 #: provider and this process's event loop.
 #:
 #: Both installed backends emit modern schemas: measured live, none of
-#: radare2-mcp 1.8.8's 42 tools declares a ``$schema`` at all (so they take the
-#: default below), and GhidraMCP 6.0.0 was cross-checked across its 222. The
-#: cost of being wrong here is a provider refused with a reason naming the
-#: dialect.
-SUPPORTED_DIALECTS: Final[frozenset[str]] = frozenset(
-    {
+#: radare2-mcp 1.8.8's 42 tools declares a ``$schema`` at all, and GhidraMCP
+#: 6.0.0 was cross-checked across its 222. The cost of being wrong here is a
+#: provider refused with a reason naming the dialect the library resolved.
+SUPPORTED_DIALECTS: Final[frozenset[type[Any]]] = frozenset(
+    _META_SCHEMAS[uri]
+    for uri in (
         "http://json-schema.org/draft-04/schema",
         "http://json-schema.org/draft-06/schema",
         "http://json-schema.org/draft-07/schema",
         "https://json-schema.org/draft/2019-09/schema",
         "https://json-schema.org/draft/2020-12/schema",
-    }
+    )
 )
 
 
@@ -942,41 +1068,6 @@ def _too_deep(value: object, limit: int) -> bool:
             stack.extend((child, depth + 1) for child in item)
     return False
 
-
-def _refused_keywords(schema: object, dialect: _Dialect) -> list[str]:
-    """Which refused or unclassified keywords this schema uses, in ``dialect``.
-
-    The dialect carries one ``keyword -> kind`` map, so the same name can be
-    walked in one draft and stepped over in another — ``type`` is both. A key
-    the dialect does not evaluate at all is an annotation, not a subschema: a
-    provider that tags its tools with ``"x-meta": {"pattern": …}`` has not used
-    the ``pattern`` keyword, and refusing it would cost a legitimate tool for
-    nothing. A keyword the dialect *does* evaluate but nothing here classifies
-    is reported, because a position nobody has placed is a position nobody has
-    checked.
-
-    Iterative, for the reason :func:`_too_deep` is.
-    """
-    found: set[str] = set()
-    stack: list[object] = [schema]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, list):
-            stack.extend(item)
-            continue
-        if not isinstance(item, dict):
-            continue
-        for key, value in item.items():
-            if key in _REFUSED_KEYWORDS or key in dialect.unclassified:
-                found.add(key)
-                continue
-            kind = dialect.kinds.get(key)
-            if kind == "named":
-                if isinstance(value, dict):
-                    stack.extend(value.values())
-            elif kind == "schema":
-                stack.append(value)
-    return sorted(found)
 
 
 def _capability_fingerprint(
@@ -1160,7 +1251,14 @@ def _validation_failure(
 ) -> ProviderError | None:
     """Run the pinned schema. Called on a worker thread; returns, never raises."""
     try:
-        jsonschema.validate(instance=arguments, schema=capability.input_schema)
+        # Selected explicitly, through the same helper the pin-time walk used,
+        # rather than letting ``jsonschema.validate`` select again: a second
+        # implicit selection is how this module and the evaluator came to
+        # disagree about which dialect a schema was in.
+        validator = _validator_for(
+            capability.input_schema, default=jsonschema.validators._LATEST_VERSION
+        )
+        validator(capability.input_schema).validate(arguments)
     except jsonschema.ValidationError as error:
         where = "/".join(str(part) for part in error.absolute_path) or capability.name
         return ProviderArgumentError(

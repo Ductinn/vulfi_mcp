@@ -999,10 +999,21 @@ def test_every_dialect_the_selector_can_choose_is_classified() -> None:
     }
     assert unplaced == {}, unplaced
 
+    # Both directions. The completeness check above catches a keyword that is
+    # *missing*; it never catches one that is surplus and wrong, and three such
+    # entries sat in the shared table unexamined until a reviewer counted them.
     for validator in registry.values():
         dialect = client.DIALECTS[validator.__name__]
         missing = sorted(set(validator.VALIDATORS) - set(dialect.kinds))
         assert missing == [], f"{validator.__name__} has unplaced {missing}"
+
+        surplus = sorted(set(dialect.kinds) - set(validator.VALIDATORS))
+        for keyword in surplus:
+            # A surplus entry is legitimate only when another keyword's
+            # implementation descends into it — `if_` evaluates `then`/`else`
+            # itself — and only while that keyword is in this dialect.
+            reached_by, _ = client._COMPANION_KINDS[keyword]
+            assert reached_by in validator.VALIDATORS, (validator.__name__, keyword)
 
     # The pair, not the name: the same keyword, classified differently.
     assert client.DIALECTS["Draft3Validator"].kinds["type"] == "schema"
@@ -1042,8 +1053,8 @@ def test_a_dialect_this_server_has_not_tested_is_refused() -> None:
     }
     reason = client._unusable_schema(hostile, ProviderLimits())
     assert reason is not None
-    assert "draft-03" in reason
-    assert "does not evaluate" in reason
+    assert "Draft3Validator" in reason
+    assert "has not classified and tested" in reason
 
     # Underneath the refusal, the classification holds on its own: these are
     # the three draft-03 shapes that the name-keyed tables walked straight past.
@@ -1062,13 +1073,115 @@ def test_a_dialect_this_server_has_not_tested_is_refused() -> None:
         {"extends": {"definitions": {"d": {"$ref": "#/definitions/d"}}}}, draft3
     ) == ["definitions"]
 
-    # An unparsable or unknown dialect is refused by name too.
-    for declared in ("https://example.invalid/schema#", 7):
-        refusal = client._unusable_schema(
-            {"$schema": declared, "type": "object", "properties": {}},
-            ProviderLimits(),
+    # A `$schema` the library does not know is not refused, and that is the
+    # point: `validator_for` falls back to the latest draft and evaluates it as
+    # 2020-12, so this module classifies it as 2020-12 too. Mirroring the
+    # selector beats second-guessing it — divergence from the selector is the
+    # whole failure mode being closed here.
+    unknown = {
+        "$schema": "https://example.invalid/schema#",
+        "type": "object",
+        "properties": {"address": {"type": "string"}},
+    }
+    assert client._unusable_schema(unknown, ProviderLimits()) is None
+    assert (
+        client._validator_for(
+            unknown, default=jsonschema.validators._LATEST_VERSION
         )
-        assert refusal is not None
+        is jsonschema.validators._LATEST_VERSION
+    )
+    # But a hostile keyword inside it is still caught, under the vocabulary the
+    # library will actually use rather than the one the URI suggests.
+    reason = client._unusable_schema(
+        {**unknown, "prefixItems": [{"pattern": "(a+)+$"}]}, ProviderLimits()
+    )
+    assert reason is not None and "pattern" in reason
+
+
+def test_the_dialect_pin_is_matched_the_way_the_library_matches_it() -> None:
+    """Bypass A: a second `#`, and a pin that normalised `$schema` by hand.
+
+    `rstrip("#")` removes every trailing `#`; the library's `URIDict` uses
+    `urlsplit(uri).geturl()`, which removes only an empty fragment. So
+    `…/draft-04/schema##` was draft-04 to the pin and 2020-12 to the evaluator,
+    and every keyword in the gap between those two vocabularies — `if`/`then`,
+    `prefixItems`, `unevaluated*` — became a position the walk stepped over and
+    the validator evaluated in full: 190 bytes, 5.51 s, 1 heartbeat of 110 due.
+
+    There is no string comparison left to drift: `SUPPORTED_DIALECTS` holds
+    validator classes and membership is tested on what the library resolved.
+    """
+    assert all(isinstance(item, type) for item in client.SUPPORTED_DIALECTS)
+    assert jsonschema.Draft3Validator not in client.SUPPORTED_DIALECTS
+
+    doubled = "http://json-schema.org/draft-04/schema##"
+    # Root selection passes the library's own fallback, so this is exactly the
+    # class the evaluator will use — and it is not the draft-04 the URI reads as.
+    assert client._validator_for(
+        {"$schema": doubled}, default=jsonschema.validators._LATEST_VERSION
+    ) is jsonschema.validators._LATEST_VERSION
+    hostile = {
+        "$schema": doubled,
+        "type": "object",
+        "properties": {"address": {"type": "string"}},
+        "if": {"properties": {"address": {"type": "string"}}},
+        "then": {"properties": {"address": {"pattern": "(a+)+$"}}},
+    }
+    reason = client._unusable_schema(hostile, ProviderLimits())
+    assert reason is not None
+    # Caught by the vocabulary the library will really use, not by the pin:
+    # under 2020-12 `if` is a keyword and its implementation descends into
+    # `then`, so `then` is a position this walk now descends into too.
+    assert "pattern" in reason
+
+
+def test_a_nested_schema_cannot_switch_the_dialect_underneath_the_check() -> None:
+    """Bypass B, which needed no trick at all and matches a real provider's shape.
+
+    `Validator.evolve` calls `validator_for(subschema, default=self.__class__)`
+    and `descend` goes through `evolve`, so a subschema carrying its own
+    `$schema` switches vocabulary for that subtree. 153 bytes with **no root
+    `$schema`** — exactly what radare2-mcp emits — reached draft-03 straight
+    through a pin that had only ever looked at the root: 4.81 s of GIL-held
+    regex.
+
+    Both layers are asserted separately, and in the order the ruling put them:
+    re-selection and the pin first, so the belt is not the only thing working.
+    """
+    nested_draft3 = {
+        "type": "object",
+        "properties": {
+            "address": {
+                "$schema": "http://json-schema.org/draft-03/schema#",
+                "extends": {"pattern": "(a+)+$"},
+            }
+        },
+    }
+    by_reselection = client._unusable_schema(nested_draft3, ProviderLimits())
+    assert by_reselection is not None
+    assert "Draft3Validator" in by_reselection
+
+    # And the belt, for a nested dialect the pin would otherwise accept.
+    nested_supported = {
+        "type": "object",
+        "properties": {
+            "address": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "string",
+            }
+        },
+    }
+    by_belt = client._unusable_schema(nested_supported, ProviderLimits())
+    assert by_belt is not None
+    assert "declares its own $schema" in by_belt
+
+    # The shape a real provider emits is untouched.
+    honest = {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+    }
+    assert client._unusable_schema(honest, ProviderLimits()) is None
 
 
 def test_the_schema_deadline_is_its_own_bound_with_a_floor(
