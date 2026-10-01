@@ -26,7 +26,7 @@ The whole format, with every optional key shown::
     args = []
     stderr_log = "/var/log/vulfi/r2.log"  # default: the null device
 
-    [r2.env]                              # the child's whole environment
+    [r2.env]                              # merged over the SDK's inherited set
     PATH = "/opt/r2/bin:/usr/bin:/bin"
     LD_LIBRARY_PATH = "/opt/r2/lib"
 
@@ -61,6 +61,17 @@ The whole format, with every optional key shown::
 There is no ``tools`` key, and there never will be: which tools a backend may
 be asked for is a constant in that backend's adapter, not something an
 installation can widen.
+
+``[r2.env]`` is **not** the child's whole environment. The MCP SDK launches the
+child with ``get_default_environment() | (env or {})``, and on POSIX that
+default carries ``HOME``, ``LOGNAME``, ``PATH``, ``SHELL``, ``TERM`` and
+``USER`` through from this process. An operator can therefore override a
+variable by naming it, but cannot unset one by leaving it out.
+
+A configured ``[*.attest]`` tool is called like any other, so **it must also
+appear in that backend's adapter allowlist constant**. It is not exempt: an
+``attest`` naming a tool the adapter does not allow makes identity
+unverifiable, and the session is refused rather than opened unchecked.
 """
 
 from __future__ import annotations
@@ -205,6 +216,10 @@ class AttestConfig:
 
     Only needed when the mapped path is not readable on this host — when it is,
     the client hashes it directly and never takes the provider's word for it.
+
+    ``tool`` is called through the ordinary gate, so it **must be in the
+    adapter's allowlist constant**. One that is not makes identity
+    unverifiable, and the session is refused.
     """
 
     tool: str

@@ -44,8 +44,10 @@ from vulfi_mcp.providers import (
     CapabilityUnavailableError,
     ForbiddenToolError,
     ProviderArgumentError,
+    ProviderCallError,
     ProviderConfig,
     ProviderConfigError,
+    ProviderError,
     ProviderEvidenceError,
     ProviderIdentityError,
     ProviderResponseError,
@@ -788,6 +790,166 @@ def test_an_oversize_or_malformed_response_is_refused(
     assert "depth" in _run(exercise(build("malformed")))
 
 
+def test_a_provider_schema_is_never_run_unbounded(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """A tool's input schema is provider-controlled, and this one is a weapon.
+
+    ``jsonschema`` compiles and runs ``pattern`` synchronously, in this
+    process's event loop, *before* ``call_tool`` — so ``call_timeout_seconds``
+    never applies to it. Without the pin-time refusal this call matches a
+    classic exponential backtracker against a 29-character argument and takes
+    around twenty seconds; a slightly longer argument does not finish at all.
+    """
+    config = configure(
+        _config_text(
+            variant="catastrophic_pattern",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[str, float]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            started = time.monotonic()
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "a" * 29 + "!"},
+                    session.fingerprint("beta_text"),
+                )
+            return str(refused.value), time.monotonic() - started
+
+    reason, elapsed = _run(exercise())
+    assert "pattern" in reason
+    assert "beta_text" in reason
+    assert elapsed < 2.0, f"the schema was evaluated anyway ({elapsed:.1f}s)"
+
+
+def test_an_unevaluatable_schema_is_a_refusal_not_a_foreign_exception(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """An unresolvable ``$ref`` is the provider's defect, reported as one.
+
+    ``jsonschema`` raises ``_WrappedReferencingError`` here, which is not a
+    ``ProviderError`` and not even a public type; letting it out would hand an
+    adapter something it cannot record as unsupported.
+    """
+    config = configure(
+        _config_text(
+            variant="broken_ref",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> str:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            with pytest.raises(ProviderError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            assert isinstance(refused.value, CapabilityUnavailableError)
+            return str(refused.value)
+
+    reason = _run(exercise())
+    assert "beta_text" in reason
+    assert "could not be evaluated" in reason
+
+
+def test_a_tool_that_declares_no_arguments_table_is_refused(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    # A bare {"type": "object"} says nothing about which arguments exist, so
+    # the undeclared-key filter would pass anything. An *empty* properties
+    # table is a different claim — "this tool takes no arguments" — and both
+    # installed providers spell a zero-argument tool that way, so it stays
+    # callable; only the missing table fails closed.
+    config = configure(
+        _config_text(
+            variant="no_properties",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> str:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session, "beta_text", {}, session.fingerprint("beta_text")
+                )
+            return str(refused.value)
+
+    assert "no properties table" in _run(exercise())
+
+
+def test_a_failure_cannot_carry_unbounded_provider_prose(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """A JSON-RPC error's message and data are whatever the provider sends.
+
+    Task 4 puts this string in an agent-visible ``reason``, so the operator's
+    response budget has to reach it too; without the cap the refusal below
+    carries roughly 56 KB of the provider's choosing.
+    """
+    config = configure(
+        _config_text(
+            variant="huge_error",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> str:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            with pytest.raises(ProviderCallError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            return str(refused.value)
+
+    reason = _run(exercise())
+    assert len(reason) < 800, len(reason)
+    assert "truncated" in reason
+    assert "PAYLOAD PAYLOAD PAYLOAD" not in reason
+
+
 def test_a_cancelled_session_releases_the_provider(
     configure: Callable[[str], dict[str, ProviderConfig]],
     binary: Path,
@@ -935,6 +1097,24 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
             "required": ["addr"],
             "additionalProperties": False,
         }
+    if variant == "catastrophic_pattern":
+        # The classic exponential backtracker. jsonschema compiles and runs
+        # this synchronously, in our event loop, before any call is sent.
+        beta_schema = {
+            "type": "object",
+            "properties": {"address": {"type": "string", "pattern": "(a+)+$"}},
+            "required": ["address"],
+            "additionalProperties": False,
+        }
+    if variant == "broken_ref":
+        beta_schema = {
+            "type": "object",
+            "properties": {"address": {"$ref": "#/$defs/missing"}},
+            "required": ["address"],
+            "additionalProperties": False,
+        }
+    if variant == "no_properties":
+        beta_schema = {"type": "object"}
     note = INJECTION.format(sentinel=sentinel) if variant == "injection" else ""
     tools: list[dict[str, object]] = [
         {
@@ -1072,6 +1252,24 @@ def _serve(variant: str) -> None:  # pragma: no cover - runs in a subprocess
             )
         elif method == "tools/list":
             reply(message["id"], {"tools": _server_tools(variant, sentinel)})
+        elif method == "tools/call" and variant == "huge_error":
+            # A JSON-RPC error, not a tool result: this is the path that goes
+            # through _flatten rather than through the response envelope.
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {
+                            "code": -32000,
+                            "message": "PROSE " * 4000,
+                            "data": {"detail": "PAYLOAD " * 4000},
+                        },
+                    }
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
         elif method == "tools/call":
             reply(
                 message["id"],

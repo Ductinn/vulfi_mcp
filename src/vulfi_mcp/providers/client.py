@@ -182,17 +182,46 @@ def tool_fingerprint(tool: types.Tool) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-class _Capability:
-    """One allowlisted tool, as this session found it."""
+#: JSON Schema keywords this module refuses to evaluate, because their cost is
+#: not bounded by the size of the schema and the size of the instance. Both are
+#: regular expressions, compiled and run by ``jsonschema`` **synchronously,
+#: inside this process's event loop, before any call is sent** — so no
+#: ``call_timeout_seconds`` applies to them. A provider-supplied ``(a+)+$``
+#: against a 29-character argument measures around twenty seconds here, and a
+#: slightly longer argument does not finish.
+#:
+#: Nothing is lost by refusing them: the arguments this module sends are
+#: adapter-authored constants, never agent input, so a provider's own regular
+#: expression was never the thing keeping them honest. ``format`` is not in
+#: this list because no format checker is installed, which is what makes it
+#: inert rather than a second regular-expression engine.
+_UNBOUNDED_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {"pattern", "patternProperties"}
+)
 
-    __slots__ = ("fingerprint", "input_schema", "name")
+
+class _Capability:
+    """One allowlisted tool, as this session found it.
+
+    ``unusable`` is set at pin time, from the provider's own advertisement, and
+    is the reason this tool may never be called. Keeping it here rather than
+    dropping the tool means the refusal names what was wrong with it instead of
+    looking like a tool the provider never offered.
+    """
+
+    __slots__ = ("fingerprint", "input_schema", "name", "unusable")
 
     def __init__(
-        self, name: str, input_schema: dict[str, Any], fingerprint: str
+        self,
+        name: str,
+        input_schema: dict[str, Any],
+        fingerprint: str,
+        unusable: str | None = None,
     ) -> None:
         self.name = name
         self.input_schema = input_schema
         self.fingerprint = fingerprint
+        self.unusable = unusable
 
 
 class ProviderSession:
@@ -326,15 +355,7 @@ async def provider_session(
                     f" session: {_flatten(error)}"
                 ) from error
             capabilities = {
-                tool.name: _Capability(
-                    tool.name,
-                    (
-                        dict(tool.input_schema)
-                        if isinstance(tool.input_schema, dict)
-                        else {}
-                    ),
-                    tool_fingerprint(tool),
-                )
+                tool.name: _pin(tool, config.limits)
                 for tool in tools
                 if tool.name in allowed
             }
@@ -382,6 +403,12 @@ async def checked_call(
             f" the schema it was pinned at ({schema_fingerprint}); it now"
             f" fingerprints as {capability.fingerprint}, so this capability is"
             " unavailable rather than answered from a contract that changed",
+        )
+    if capability.unusable is not None:
+        raise CapabilityUnavailableError(
+            tool,
+            f"the {session.backend} provider's {tool!r} tool cannot be used:"
+            f" {capability.unusable}",
         )
     _check_arguments(session.backend, capability, arguments)
     try:
@@ -580,6 +607,121 @@ async def _list_tools(
     )
 
 
+def _pin(tool: types.Tool, limits: ProviderLimits) -> _Capability:
+    """One advertised tool, with its schema vetted before anything uses it.
+
+    The input schema is the one provider-controlled value this module *runs*
+    rather than merely reads, so it is checked here, once, while the session is
+    being built — not at call time, where a refusal would already have cost
+    whatever the schema asked it to cost.
+    """
+    schema = dict(tool.input_schema) if isinstance(tool.input_schema, dict) else {}
+    return _Capability(
+        tool.name, schema, tool_fingerprint(tool), _unusable_schema(schema, limits)
+    )
+
+
+def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | None:
+    """Why this tool's input schema may not be evaluated, or ``None``."""
+    try:
+        encoded = json.dumps(schema, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        return _quote(f"its input schema is not JSON ({error})")
+    if len(encoded) > limits.max_response_bytes:
+        return (
+            f"its input schema is {len(encoded)} bytes, over the"
+            f" {limits.max_response_bytes} byte response budget"
+        )
+    if _too_deep(schema, limits.max_response_depth):
+        return (
+            "its input schema nests deeper than the"
+            f" {limits.max_response_depth} level depth budget"
+        )
+    found = _unbounded_keywords(schema)
+    if found:
+        return (
+            f"its input schema uses {found}, whose cost this server cannot"
+            " bound; a provider's regular expression is run here, in this"
+            " process, before any call is sent"
+        )
+    if not isinstance(schema.get("properties"), dict):
+        # An empty ``properties`` table is a real answer — "this tool takes no
+        # arguments" — and stays callable. No table at all means nothing says
+        # which arguments exist, so the undeclared-key filter would pass
+        # anything; failing closed is the only honest reading.
+        return (
+            "its input schema declares no properties table, so nothing says"
+            " which arguments it accepts"
+        )
+    validator = jsonschema.validators.validator_for(schema)
+    try:
+        validator.check_schema(schema)
+    except Exception as error:  # noqa: BLE001 - any refusal is a refusal
+        return _quote(f"its input schema is not a valid JSON Schema ({error})")
+    return None
+
+
+#: Keywords whose value is a table *keyed by names the author chose*, so those
+#: names are data and only the values below them are schemas. Without this, a
+#: tool with an argument honestly called ``pattern`` would be refused for using
+#: the ``pattern`` keyword it never used.
+_NAMED_SUBSCHEMAS: Final[frozenset[str]] = frozenset(
+    {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+)
+
+#: Keywords whose value is an instance, not a schema: nothing inside them is a
+#: keyword either.
+_INSTANCE_VALUES: Final[frozenset[str]] = frozenset(
+    {"enum", "const", "default", "examples", "title", "description"}
+)
+
+
+def _too_deep(value: object, limit: int) -> bool:
+    """Whether ``value`` nests past ``limit``, walked without recursion.
+
+    Iterative because the thing being measured is hostile input: a recursive
+    walk would answer a deeply nested schema with ``RecursionError``, which is
+    not one of this module's refusals.
+    """
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+    return False
+
+
+def _unbounded_keywords(schema: object) -> list[str]:
+    """Which :data:`_UNBOUNDED_KEYWORDS` this schema actually uses.
+
+    Position-aware: a property *name* is not a keyword, and a value under
+    ``enum`` or ``default`` is not a schema at all. Iterative, for the reason
+    :func:`_too_deep` is.
+    """
+    found: set[str] = set()
+    stack: list[object] = [schema]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        found |= set(item) & _UNBOUNDED_KEYWORDS
+        for key, value in item.items():
+            if key in _INSTANCE_VALUES:
+                continue
+            if key in _NAMED_SUBSCHEMAS and isinstance(value, dict):
+                stack.extend(value.values())
+                continue
+            stack.append(value)
+    return sorted(found)
+
+
 def _capability_fingerprint(
     backend: str,
     initialized: types.InitializeResult,
@@ -642,7 +784,14 @@ def _single(group: BaseExceptionGroup) -> BaseException:
 
 
 def _flatten(error: BaseException) -> str:
-    """One line naming every leaf of a (possibly grouped) failure."""
+    """One line naming every leaf of a (possibly grouped) failure.
+
+    Truncated, because the text below is the provider's: a JSON-RPC error
+    ``message`` and ``data`` are whatever the provider chose to send, and these
+    strings become the ``reason`` an agent is shown. Without a cap the
+    operator's ``max_response_bytes`` would close the success path while the
+    failure path stayed an unbounded channel.
+    """
     described: list[str] = []
     for leaf in _leaves(error):
         detail = getattr(leaf, "data", None)
@@ -650,7 +799,20 @@ def _flatten(error: BaseException) -> str:
             f"{type(leaf).__name__}: {leaf}"
             + (f" ({detail})" if isinstance(detail, (str, dict, list)) else "")
         )
-    return _sanitize("; ".join(described) or repr(error))
+    return _quote(_sanitize("; ".join(described) or repr(error)))
+
+
+#: How much provider-authored text any one refusal may carry. The same bound
+#: the tool-failure envelope already used, applied everywhere prose from the
+#: other side becomes a message this server hands onward.
+MAX_REASON_CHARS: Final = 512
+
+
+def _quote(text: str) -> str:
+    """Provider text, bounded, with the elision made visible."""
+    if len(text) <= MAX_REASON_CHARS:
+        return text
+    return f"{text[:MAX_REASON_CHARS]}… ({len(text)} characters, truncated)"
 
 
 # -- arguments and responses ------------------------------------------------
@@ -666,26 +828,32 @@ def _check_arguments(
             f"{capability.name}: arguments must be a mapping of string keys,"
             f" got {type(arguments).__name__}"
         )
-    declared = capability.input_schema.get("properties")
-    if isinstance(declared, dict):
-        undeclared = sorted(set(arguments) - set(declared))
-        if undeclared:
-            raise ProviderArgumentError(
-                f"{capability.name}: {undeclared} is not declared by the pinned"
-                f" input schema, so the {backend} provider is never sent it"
-            )
+    declared = capability.input_schema["properties"]
+    undeclared = sorted(set(arguments) - set(declared))
+    if undeclared:
+        raise ProviderArgumentError(
+            f"{capability.name}: {undeclared} is not declared by the pinned"
+            f" input schema, so the {backend} provider is never sent it"
+        )
     try:
         jsonschema.validate(instance=arguments, schema=capability.input_schema)
     except jsonschema.ValidationError as error:
         where = "/".join(str(part) for part in error.absolute_path) or capability.name
         raise ProviderArgumentError(
             f"{capability.name}: argument {where!r} does not match the pinned"
-            f" input schema: {error.message}"
+            f" input schema: {_quote(error.message)}"
         ) from None
-    except jsonschema.SchemaError as error:
-        raise ProviderArgumentError(
-            f"{capability.name}: the pinned input schema is not usable:"
-            f" {error.message}"
+    except Exception as error:  # noqa: BLE001 - see below
+        # Anything that is not "these arguments are wrong" is "this schema
+        # cannot be evaluated", and that is the provider's defect, not ours:
+        # an unresolvable ``$ref`` raises ``_WrappedReferencingError``, which
+        # is not even a ``jsonschema`` public type. Letting it out would hand a
+        # caller a foreign exception where the contract promises a reasoned
+        # refusal it can record as unsupported.
+        raise CapabilityUnavailableError(
+            capability.name,
+            f"the {backend} provider's {capability.name!r} input schema could"
+            f" not be evaluated: {_quote(f'{type(error).__name__}: {error}')}",
         ) from None
 
 
@@ -703,7 +871,7 @@ def _envelope(
     if result.is_error:
         raise ProviderCallError(
             f"the {session.backend} provider reported {tool!r} failed:"
-            f" {' '.join(text)[:512]}"
+            f" {_quote(' '.join(text))}"
         )
     structured = result.structured_content
     if structured is not None and not isinstance(structured, dict):
