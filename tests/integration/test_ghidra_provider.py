@@ -1215,3 +1215,34 @@ def tmp_provider_config(original: Path, url: str) -> Path:
         encoding="utf-8",
     )
     return copy
+
+
+@pytest.mark.requires_ghidra
+def test_one_readable_range_per_context_in_context_order(
+    compiled_fallback: Path, ghidra_config: Path, managed_data_dir: Path
+) -> None:
+    """The pairing the routing layer reads addresses out of, pinned.
+
+    ``RuleEvidence`` has no field tying a context to the site it came from:
+    ``contexts`` carries facts and ``ranges`` carries addresses, and the only
+    thing joining them is that this adapter emits one range per call site, in
+    call-site order, and appends a context only for the sites it could read.
+    Task 4 reconstructs a finding's location from exactly that, so it is an
+    invariant rather than an accident and is pinned here — a site whose facts
+    fail must leave an ``unavailable`` range and no context, never a readable
+    range with nothing behind it.
+    """
+    live(prepare_ghidra(str(compiled_fallback), ("functions",)))
+    index, printf_rule = _stock("Format String", "printf")
+    evidence = live(evidence_ghidra(str(compiled_fallback), printf_rule, index))
+
+    readable = [
+        item for item in evidence["ranges"] if item["coverage"] != "unavailable"
+    ]
+    assert len(readable) == len(evidence["contexts"]), evidence["ranges"]
+    assert [item["start"] for item in readable] == sorted(
+        item["start"] for item in readable
+    ), evidence["ranges"]
+    # Every readable range is one call site, not a span of several.
+    assert all(item["end"] == item["start"] + 1 for item in readable), readable
+    assert all(item["stage"] == "instructions" for item in evidence["ranges"])
