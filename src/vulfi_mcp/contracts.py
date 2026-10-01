@@ -11,11 +11,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict
 
 __all__ = [
+    "AddressGap",
+    "AddressRange",
     "Backend",
+    "Candidate",
+    "CandidateKind",
+    "CandidateState",
     "Finding",
     "FindingsPage",
     "JsonValue",
+    "PassName",
+    "PassResult",
+    "PassStage",
     "Priority",
+    "RangeCoverage",
     "RuleCoverage",
     "RuleState",
     "ScanCoverage",
@@ -51,12 +60,35 @@ if TYPE_CHECKING:
     ScanCoverage = Literal["complete", "partial"]
     RuleState = Literal["evaluated", "unsupported", "failed"]
 
+    #: The four preparation passes the RE preparation design defines, in
+    #: dependency order. :mod:`vulfi_mcp.prepare` runs the subset this build
+    #: implements and refuses the rest by name.
+    PassName = Literal["strings", "functions", "structures", "pointer_tables"]
+
+    #: The stage inside a pass that produced one range's evidence. Raw-byte
+    #: discovery stands on its own; instruction-derived discovery needs the
+    #: ``functions`` pass to have run first.
+    PassStage = Literal["raw_bytes", "instructions", "code_scan"]
+
+    #: What one pass may claim about one address range. There is no fourth
+    #: answer: a range nothing looked at is not a range that held nothing.
+    RangeCoverage = Literal["complete", "partial", "unavailable"]
+
+    #: What preparation produced. A candidate is a description; only
+    #: ``applied`` says the managed artifact changed.
+    CandidateState = Literal["candidate", "applied", "rejected"]
+
+    #: The candidate kinds this build produces. Plan 2's later tasks add the
+    #: structure-field and pointer-table kinds with the passes that find them.
+    CandidateKind = Literal["function", "string"]
+
     #: How an IDA row and its reviewer-linked external partner stand. Plan 4
     #: creates links; until then every stored row is ``unlinked``, which is not
     #: the same claim as ``synchronized``.
     SyncState = Literal["unlinked", "pending", "synchronized", "conflict", "paused"]
 else:
     Backend = Priority = TriageStatus = ScanCoverage = RuleState = SyncState = str
+    PassName = PassStage = RangeCoverage = CandidateState = CandidateKind = str
 
 
 class Finding(TypedDict):
@@ -187,3 +219,86 @@ class TriageResult(TypedDict):
     store_health: dict[str, JsonValue]
     sync_state: SyncState
     warnings: list[str]
+
+
+class AddressGap(TypedDict):
+    """One half-open stretch of addresses a bounded pass never looked at.
+
+    Named, rather than dropped, because "the pass found nothing here" and
+    "the pass never got here" are different answers and only one of them is
+    evidence.
+    """
+
+    start: int
+    end: int
+
+
+class AddressRange(TypedDict):
+    """What one pass stage did with one half-open address range.
+
+    ``coverage`` is per range, not per pass: a run that exhausted its budget
+    half way through a segment reports that segment ``partial`` and names the
+    rest in ``unvisited``, while the segments it finished stay ``complete``.
+    ``unavailable`` means the stage could not read this range at all — an
+    uninitialized segment, or an architecture whose instructions this build
+    does not model — and ``reason`` then says which.
+    """
+
+    name: str
+    stage: PassStage
+    start: int
+    end: int
+    coverage: RangeCoverage
+    unvisited: list[AddressGap]
+    reason: str | None
+
+
+class Candidate(TypedDict):
+    """One thing preparation found, and the evidence that it is there.
+
+    ``state`` is the whole claim. ``applied`` means the managed artifact now
+    carries this definition; ``candidate`` means it does not, and ``reason``
+    says what was missing. ``confidence`` is a number in 0..1 and is never
+    proof: a candidate with high confidence is still a candidate.
+
+    ``evidence`` carries the bytes or the instructions the recovery rests on,
+    with their addresses, so a reader can check the claim against the image
+    instead of trusting the label. ``address`` is the normalized address in
+    ``address_space`` where one is provable, and ``None`` where it is not.
+    """
+
+    candidate_id: str
+    kind: CandidateKind
+    backend: Backend
+    address_space: str
+    address: int | None
+    evidence: dict[str, JsonValue]
+    confidence: float
+    state: CandidateState
+    reason: str | None
+
+
+#: Result of one preparation pass on one backend.
+#:
+#: Spelled with the functional syntax because ``pass`` is a Python keyword and
+#: the design names the field ``pass``; the class syntax cannot declare it.
+#:
+#: ``coverage`` summarizes ``ranges``: ``complete`` only when every range is,
+#: and ``partial`` as soon as one range was cut short — a pass never reports
+#: ``complete`` over a range it stopped in the middle of. ``applied_ids`` and
+#: ``candidate_ids`` both name rows in ``candidates``; a candidate id that is
+#: not in ``applied_ids`` changed nothing. ``artifact_revision`` is the
+#: managed artifact's revision these results describe.
+PassResult = TypedDict(
+    "PassResult",
+    {
+        "pass": PassName,
+        "backend": Backend,
+        "ranges": list[AddressRange],
+        "coverage": RangeCoverage,
+        "applied_ids": list[str],
+        "candidate_ids": list[str],
+        "warnings": list[str],
+        "artifact_revision": int | None,
+    },
+)

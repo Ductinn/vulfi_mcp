@@ -42,9 +42,10 @@ import hashlib
 import json
 import math
 import operator
+import time
 import unicodedata
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -60,11 +61,16 @@ __all__ = [
     "MAX_EXPRESSION_LENGTH",
     "MAX_EXPRESSION_NODES",
     "MAX_PAGE_LIMIT",
+    "MAX_PREPARE_WARNINGS",
     "MAX_RATIONALE_LENGTH",
     "MAX_SCAN_NAME_LENGTH",
+    "MIN_DEFINED_STRING_CHARS",
+    "MIN_STRING_CHARS",
     "NETNODE_BLOB_INDEX",
     "NETNODE_BLOB_TAG",
     "NETNODE_NAME",
+    "PREPARE_LIMITS",
+    "PREPARE_PASSES",
     "PRIORITIES",
     "SCHEMA_VERSION",
     "TRIAGE_STATUSES",
@@ -89,6 +95,8 @@ __all__ = [
     "utc_now",
     "validate_expression",
     "validate_page",
+    "validate_prepare_limits",
+    "validate_prepare_passes",
     "validate_rationale",
     "validate_scan_name",
     "validate_scope",
@@ -3394,11 +3402,1454 @@ def _store_findings(
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Preparation operation: what one IDA database can recover before a scan.
+#
+# Two passes live here. ``functions`` looks at the executable bytes no
+# function owns and at the addresses something references, decodes what it
+# finds, and defines a function only where a call, a jump, a relocated
+# pointer or an ELF symbol says the address is an entry point and the decode
+# reaches a return without touching a byte an existing function owns.
+# ``strings`` reads mapped bytes directly — never IDA's string list — and
+# decodes bounded ASCII and both UTF-16 byte orders, then walks the
+# instructions of the functions the first pass left behind and recovers the
+# buffers they assemble out of immediate operands.
+#
+# Three rules shape every line below.
+#
+# **Evidence or nothing.** A recovered string carries the bytes it was
+# decoded from and their addresses, or the instructions that wrote them and
+# the value each one wrote. A defined function carries its decoded
+# instructions, what made its entry an entry, and the gap that proves it
+# overlaps nothing. What cannot be justified is reported as a candidate with
+# the reason it is only a candidate; it is never applied and never dropped.
+#
+# **Bounded, and loud about it.** Every byte read, address examined,
+# instruction decoded, function walked and candidate produced is charged to
+# :class:`_PrepareBudget`, in the style of the expression interpreter's
+# ``_charge``. A pass that runs out names the addresses it never reached in
+# the range it was in, and names every range after it too. There is no
+# silent truncation anywhere in this section.
+#
+# **The original bytes are not ours.** Everything here writes to the managed
+# database the worker already has open, through IDA's own ``add_func`` and
+# ``create_strlit``, and the adapter saves it once at the end of the lease
+# behind the rescue copy ``_save_session`` takes. There is no second save
+# route, and no path from here to the operator's binary or supplied IDB.
+# ---------------------------------------------------------------------------
+
+#: The preparation passes this build runs, in dependency order. The design
+#: defines ``structures`` and ``pointer_tables`` as well; Plan 2's Task 3
+#: implements them, and until it does they are refused by name rather than
+#: reported as a coverage this build never produced.
+PREPARE_PASSES: Final[tuple[str, ...]] = ("functions", "strings")
+
+#: Ceilings on one preparation run. A payload may lower a bound, never raise
+#: one, and a pass that hits a bound says which addresses it never reached.
+PREPARE_LIMITS: Final[dict[str, int]] = {
+    #: Mapped bytes read, across every range of every pass.
+    "bytes": 64 * 1024 * 1024,
+    #: Candidates one run may produce.
+    "candidates": 2000,
+    #: Addresses examined as a possible function entry.
+    "seeds": 20000,
+    #: Instructions decoded, across every pass.
+    "instructions": 400000,
+    #: Functions walked for instruction-derived strings.
+    "functions": 5000,
+    #: Wall-clock seconds the whole run may take.
+    "seconds": 300,
+}
+
+#: Address space of everything one single-image database reports. The adapter
+#: publishes the same constant; this module cannot import it.
+ADDRESS_SPACE_IMAGE: Final = "image"
+
+#: Most warnings one preparation result carries back.
+MAX_PREPARE_WARNINGS: Final = 64
+
+#: Bytes one recovered string may span, terminator included.
+MAX_STRING_BYTES: Final = 4096
+#: Shortest run of characters reported as a string. Shorter runs are mostly
+#: coincidence in compiled code, and a scan that reported them would bury the
+#: strings a reviewer is looking for.
+MIN_STRING_CHARS: Final = 5
+#: Characters a run needs before this pass will *define* it in the database
+#: rather than only report it. Five printable bytes followed by a NUL happen
+#: often inside unwind tables, relocation data and compressed sections, and a
+#: string literal defined over those bytes is a false positive written into
+#: the analysis. Reporting such a run costs a reviewer one line; defining it
+#: costs them a wrong item. Longer runs are reported and defined.
+MIN_DEFINED_STRING_CHARS: Final = 8
+#: Bytes of one recovered string quoted verbatim in its evidence. The whole
+#: run's digest is always carried, so a longer string is still checkable
+#: without putting an unbounded slice of the image in a JSON result.
+MAX_QUOTED_BYTES: Final = 256
+#: Mapped bytes read per step while scanning a segment.
+_READ_STEP: Final = 64 * 1024
+#: Byte values a recovered string may contain.
+_PRINTABLE: Final = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
+
+#: Bytes one candidate function may span.
+MAX_FUNCTION_BYTES: Final = 64 * 1024
+#: Instructions decoded for one candidate function.
+MAX_FUNCTION_INSTRUCTIONS: Final = 4096
+#: Decoded instructions quoted in one function candidate's evidence.
+MAX_QUOTED_INSTRUCTIONS: Final = 16
+#: References listed for one examined address.
+MAX_QUOTED_REFERENCES: Final = 16
+#: Frame bytes one function's constant-write recovery tracks at once.
+MAX_FRAME_BYTES: Final = 4096
+#: Alignment an unreferenced gap address is retried at. Compilers align
+#: function entries; an unaligned address with nothing pointing at it is not
+#: an entry point, it is the middle of something.
+_GAP_ALIGNMENT: Final = 16
+
+#: Entry evidence that is strong enough to define a function, in the order a
+#: single address's evidence is reported. A reference is stronger than a
+#: name: something uses the address, rather than something labelled it.
+_ENTRY_PROOF: Final = ("call_xref", "jump_xref", "data_pointer", "symbol")
+
+#: The processor whose constant-write stack strings this build recovers.
+_X86: Final = "metapc"
+#: The frame-pointer register of that processor, in both bitnesses.
+_FRAME_POINTER: Final = 5
+
+#: Confidences this build publishes. They order candidates for review; none
+#: of them is proof, and ``applied`` is the only claim that the database
+#: changed.
+_CONFIDENT: Final = 0.9
+_LIKELY: Final = 0.7
+_WEAK: Final = 0.4
+
+
+class _PrepareBudgetError(Exception):
+    """One preparation budget ran out, so its range is partial."""
+
+    def __init__(self, budget: str, limit: int) -> None:
+        super().__init__(
+            f"the {budget} budget of {limit} ran out here, so the addresses"
+            " below were never looked at"
+        )
+        self.budget = budget
+        self.limit = limit
+
+
+class _PrepareBudget:
+    """What one preparation run may spend, charged as it is spent.
+
+    One counter per kind of work, decremented by the code doing the work, and
+    an exception the moment a counter would go negative — the same shape the
+    expression interpreter's ``_charge`` uses. Nothing here truncates quietly:
+    the pass that catches the exception is the one that knows which addresses
+    it had not reached, and it is required to name them.
+    """
+
+    def __init__(self, limits: dict[str, int], clock: Callable[[], float]) -> None:
+        self._limits = dict(limits)
+        self._left = {
+            name: value for name, value in limits.items() if name != "seconds"
+        }
+        self._clock = clock
+        self._deadline = clock() + limits["seconds"]
+        #: Budgets that really ran out, in the order they did.
+        self.exhausted: list[str] = []
+
+    def charge(self, name: str, amount: int = 1) -> None:
+        """Spend ``amount`` of ``name``, or stop this range where it stands."""
+        left = self._left[name] - amount
+        if left < 0:
+            self._stop(name)
+        self._left[name] = left
+        if self._clock() > self._deadline:
+            self._stop("seconds")
+
+    def left(self, name: str) -> int:
+        return self._left[name]
+
+    def _stop(self, name: str) -> NoReturn:
+        if name not in self.exhausted:
+            self.exhausted.append(name)
+        raise _PrepareBudgetError(name, self._limits[name])
+
+
+def validate_prepare_passes(value: object) -> tuple[str, ...]:
+    """The passes to run, in dependency order, or exactly what is wrong.
+
+    ``None`` means every pass this build implements. A name the design
+    defines but this build does not run is refused by name: accepting it and
+    running something else would report a coverage nothing produced.
+    """
+    if value is None:
+        return PREPARE_PASSES
+    if not isinstance(value, (list, tuple)) or not value:
+        raise OperationError(
+            "prepare: 'passes' must be a non-empty list of pass names, one or"
+            f" more of {', '.join(PREPARE_PASSES)}"
+        )
+    requested: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise OperationError(
+                f"prepare: every pass must be a string, got {item!r}"
+            )
+        if item not in PREPARE_PASSES:
+            raise OperationError(
+                f"prepare: this build does not run a {item!r} pass; it runs"
+                f" {', '.join(PREPARE_PASSES)}"
+            )
+        if item not in requested:
+            requested.append(item)
+    return tuple(name for name in PREPARE_PASSES if name in requested)
+
+
+def validate_prepare_limits(value: object) -> dict[str, int]:
+    """Merge requested limits, which may only tighten the shipped ceilings."""
+    if value is None:
+        return dict(PREPARE_LIMITS)
+    if not isinstance(value, dict):
+        raise OperationError("prepare: 'limits' must be an object")
+    unknown = sorted(set(value) - set(PREPARE_LIMITS))
+    if unknown:
+        raise OperationError(f"prepare: unknown limit(s) {', '.join(unknown)}")
+    limits = dict(PREPARE_LIMITS)
+    for name, ceiling in PREPARE_LIMITS.items():
+        if name not in value:
+            continue
+        requested = value[name]
+        if (
+            isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or requested < 1
+        ):
+            raise OperationError(
+                f"prepare: limits[{name!r}] must be a positive integer"
+            )
+        limits[name] = min(requested, ceiling)
+    return limits
+
+
+def _ascii_run(raw: bytes, start: int) -> tuple[int, str] | None:
+    """The NUL-terminated printable run at ``start``, with its byte length.
+
+    A terminator is required. An unterminated tail of printable bytes is as
+    often the start of the next thing as it is a string, and this pass would
+    rather miss it than publish a boundary it cannot point at.
+    """
+    end = start
+    stop = min(len(raw), start + MAX_STRING_BYTES - 1)
+    while end < stop and raw[end] in _PRINTABLE:
+        end += 1
+    if end - start < MIN_STRING_CHARS or end >= len(raw) or raw[end] != 0:
+        return None
+    return end + 1 - start, raw[start:end].decode("ascii")
+
+
+def _utf16_run(raw: bytes, start: int, *, big_endian: bool) -> tuple[int, str] | None:
+    """The NUL-terminated UTF-16 run at ``start``, in one byte order.
+
+    Only characters whose other byte is zero are accepted, which is ASCII
+    inside UTF-16. A wider decode would have to guess at code pages this pass
+    has no evidence for, and the design says to report those as attempted
+    methods rather than as decoded text.
+    """
+    characters: list[str] = []
+    end = start
+    stop = min(len(raw), start + MAX_STRING_BYTES - 2)
+    while end + 1 < stop:
+        high, low = (raw[end], raw[end + 1]) if big_endian else (raw[end + 1], raw[end])
+        if high != 0 or low not in _PRINTABLE:
+            break
+        characters.append(chr(low))
+        end += 2
+    if len(characters) < MIN_STRING_CHARS or end + 1 >= len(raw):
+        return None
+    if raw[end] != 0 or raw[end + 1] != 0:
+        return None
+    return end + 2 - start, "".join(characters)
+
+
+def _alignment(address: int) -> int:
+    """The largest power of two up to 64 that divides ``address``."""
+    if address == 0:
+        return 64
+    return min(64, address & -address)
+
+
+def _quoted(raw: bytes) -> dict[str, object]:
+    """One byte run, as evidence: a bounded quote and the whole run's digest."""
+    return {
+        "bytes_hex": raw[:MAX_QUOTED_BYTES].hex(),
+        "bytes_quoted": min(len(raw), MAX_QUOTED_BYTES),
+        "bytes_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+class _Preparation:
+    """One bounded preparation run over the database this worker has open."""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        import ida_bytes
+        import ida_funcs
+        import ida_ida
+        import ida_idp
+        import ida_loader
+        import ida_nalt
+        import ida_name
+        import ida_segment
+        import ida_ua
+        import ida_xref
+        import idaapi
+        import idautils
+
+        self._bytes = ida_bytes
+        self._funcs = ida_funcs
+        self._idp = ida_idp
+        self._loader = ida_loader
+        self._nalt = ida_nalt
+        self._names = ida_name
+        self._segment = ida_segment
+        self._ua = ida_ua
+        self._xref = ida_xref
+        self._api = idaapi
+        self._utils = idautils
+
+        self._passes = validate_prepare_passes(payload.get("passes"))
+        self._limits = validate_prepare_limits(payload.get("limits"))
+        self._budget = _PrepareBudget(self._limits, time.monotonic)
+        self._processor = ida_ida.inf_get_procname()
+        self._bits = 64 if ida_ida.inf_is_64bit() else 32
+        self._image_base = idaapi.get_imagebase()
+        #: The IDA string type each encoding is defined with, where there is
+        #: one. IDA 9.4 registers UTF-8, UTF-16LE and UTF-32LE and no
+        #: big-endian UTF-16, so a UTF-16BE run is reported and not defined.
+        self._string_types: dict[str, int | None] = {
+            "ascii": ida_nalt.STRTYPE_C,
+            "utf-16le": ida_nalt.STRTYPE_C_16,
+            "utf-16be": None,
+        }
+        self._changes = (
+            ida_idp.CF_CHG1,
+            ida_idp.CF_CHG2,
+            ida_idp.CF_CHG3,
+            ida_idp.CF_CHG4,
+            ida_idp.CF_CHG5,
+            ida_idp.CF_CHG6,
+        )
+        self._candidates: list[dict[str, Any]] = []
+        self._applied: list[str] = []
+        self._warnings: list[str] = []
+        self._skipped: list[dict[str, object]] = []
+        #: Where the pass currently running had got to, so that a budget that
+        #: runs out names the rest of the range instead of dropping it.
+        self._cursor = 0
+        #: Aligned gap addresses that decoded into nothing, counted rather
+        #: than reported one by one: an address with no reference, no symbol
+        #: and no complete decode is padding, and a candidate per padding
+        #: slot would bury the candidates that mean something.
+        self._gap_rejections = 0
+        #: Printable runs that are already defined items, counted the same way.
+        self._already_defined = 0
+        #: Functions whose frame this build cannot follow.
+        self._unsupported_frames = 0
+        #: How far along the segment being scanned a recovered run already
+        #: reaches, so a run read across a read step is reported once.
+        self._claimed = 0
+
+    # -- entry point ------------------------------------------------------
+
+    def run(self) -> dict[str, object]:
+        record, _ = _read_record()
+        preparation = record["preparation"]
+        results: list[dict[str, object]] = []
+        for name in self._passes:
+            results.append(
+                self._functions_pass() if name == "functions" else self._strings_pass()
+            )
+        revision = preparation.get("revision") or 0
+        if self._applied:
+            # The managed artifact changed, so the revision these results
+            # describe is a new one. The bump rides in the same netnode write
+            # the adapter saves with the changes themselves: there is no state
+            # in which the artifact moved and its revision did not.
+            revision = int(revision) + 1
+            preparation["revision"] = revision
+            _write_record(record)
+        for result in results:
+            result["artifact_revision"] = revision
+        digest = self._nalt.retrieve_input_file_sha256()
+        return {
+            "mutated": bool(self._applied),
+            "backend": BACKEND_NAME,
+            "address_space": ADDRESS_SPACE_IMAGE,
+            "idb_path": self._loader.get_path(self._loader.PATH_TYPE_IDB),
+            "input_file": self._nalt.get_root_filename(),
+            "input_sha256": digest.hex() if digest else None,
+            "image_base": self._image_base,
+            "processor": self._processor,
+            "managed_idb_id": record.get("managed_idb_id"),
+            "artifact_revision": revision,
+            "requested_passes": list(self._passes),
+            "passes": results,
+            "candidates": self._candidates,
+            "applied_ids": list(self._applied),
+            "skipped_prerequisites": self._skipped,
+            "warnings": self._warnings[:MAX_PREPARE_WARNINGS],
+            "bounded": bool(self._budget.exhausted),
+        }
+
+    # -- segments and ranges ----------------------------------------------
+
+    def _segments(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for ea in self._utils.Segments():
+            segment = self._segment.getseg(ea)
+            if segment is None or segment.end_ea <= segment.start_ea:
+                continue
+            found.append(
+                {
+                    "name": self._segment.get_segm_name(segment)
+                    or f"seg_{segment.start_ea:x}",
+                    "start": segment.start_ea,
+                    "end": segment.end_ea,
+                    "executable": bool(segment.perm & self._segment.SEGPERM_EXEC),
+                }
+            )
+        return found
+
+    @staticmethod
+    def _range(segment: dict[str, Any], stage: str) -> dict[str, Any]:
+        return {
+            "name": segment["name"],
+            "stage": stage,
+            "start": segment["start"],
+            "end": segment["end"],
+            "coverage": "complete",
+            "unvisited": [],
+            "reason": None,
+        }
+
+    def _unreached(
+        self, segment: dict[str, Any], stage: str, reason: str
+    ) -> dict[str, Any]:
+        """A range the run never started, named rather than left out."""
+        entry = self._range(segment, stage)
+        entry["coverage"] = "partial"
+        entry["unvisited"] = [{"start": segment["start"], "end": segment["end"]}]
+        entry["reason"] = reason
+        return entry
+
+    def _stop_here(
+        self, entry: dict[str, Any], segment: dict[str, Any], reason: str
+    ) -> None:
+        """Mark the range the budget ran out in, and name what is left of it."""
+        entry["coverage"] = "partial"
+        entry["reason"] = reason
+        if self._cursor < segment["end"]:
+            entry["unvisited"] = [{"start": self._cursor, "end": segment["end"]}]
+
+    @staticmethod
+    def _pass_result(
+        name: str,
+        ranges: list[dict[str, Any]],
+        applied_ids: list[str],
+        candidate_ids: list[str],
+        warnings: list[str],
+    ) -> dict[str, object]:
+        states = {entry["coverage"] for entry in ranges}
+        if not states or states == {"unavailable"}:
+            coverage = "unavailable"
+        elif states == {"complete"}:
+            coverage = "complete"
+        else:
+            coverage = "partial"
+        return {
+            "pass": name,
+            "backend": BACKEND_NAME,
+            "ranges": ranges,
+            "coverage": coverage,
+            "applied_ids": applied_ids,
+            "candidate_ids": candidate_ids,
+            "warnings": warnings[:MAX_PREPARE_WARNINGS],
+            "artifact_revision": None,
+        }
+
+    def _record(self, row: dict[str, Any]) -> None:
+        self._candidates.append(row)
+        if row["state"] == "applied":
+            self._applied.append(row["candidate_id"])
+
+    def _warn(self, message: str) -> None:
+        if message in self._warnings or len(self._warnings) >= MAX_PREPARE_WARNINGS:
+            return
+        self._warnings.append(message)
+
+    # -- the functions pass -------------------------------------------------
+
+    def _functions_pass(self) -> dict[str, object]:
+        """Define the entry points the evidence justifies, describe the rest."""
+        first_candidate = len(self._candidates)
+        first_applied = len(self._applied)
+        self._gap_rejections = 0
+        ranges: list[dict[str, Any]] = []
+        stopped: str | None = None
+        for segment in self._segments():
+            if not segment["executable"]:
+                continue
+            if stopped is not None:
+                ranges.append(self._unreached(segment, "code_scan", stopped))
+                continue
+            entry = self._range(segment, "code_scan")
+            self._cursor = segment["start"]
+            try:
+                self._sweep_code(segment)
+            except _PrepareBudgetError as exhausted:
+                stopped = str(exhausted)
+                self._stop_here(entry, segment, stopped)
+            ranges.append(entry)
+        warnings: list[str] = []
+        if self._gap_rejections:
+            warnings.append(
+                f"{self._gap_rejections} aligned addresses in executable gaps"
+                " decoded into no complete function and carry no reference or"
+                " symbol; they are counted here rather than reported one by one"
+            )
+        if stopped is not None:
+            warnings.append(stopped)
+            self._warn(f"the functions pass stopped early: {stopped}")
+        return self._pass_result(
+            "functions",
+            ranges,
+            self._applied[first_applied:],
+            [row["candidate_id"] for row in self._candidates[first_candidate:]],
+            warnings,
+        )
+
+    def _sweep_code(self, segment: dict[str, Any]) -> None:
+        """Walk one executable segment once, function chunks and gaps alike."""
+        cursor = segment["start"]
+        end = segment["end"]
+        while cursor < end:
+            self._cursor = cursor
+            chunk = self._funcs.get_fchunk(cursor)
+            if chunk is not None and chunk.end_ea > cursor:
+                stop = min(chunk.end_ea, end)
+                self._budget.charge("bytes", stop - cursor)
+                self._defined_targets(segment, cursor, stop)
+                cursor = stop
+                continue
+            following = self._funcs.get_next_fchunk(cursor)
+            gap_end = end
+            if following is not None and cursor < following.start_ea < end:
+                gap_end = following.start_ea
+            self._budget.charge("bytes", gap_end - cursor)
+            self._scan_gap(segment, cursor, gap_end)
+            cursor = gap_end
+
+    def _defined_targets(
+        self, segment: dict[str, Any], start: int, end: int
+    ) -> None:
+        """Report targets that land inside a function without being its entry."""
+        for address in self._referenced(start, end):
+            self._cursor = address
+            owner = self._funcs.get_func(address)
+            if owner is None or owner.start_ea == address:
+                continue
+            evidence = self._reference_evidence(address, owner)
+            if evidence is None:
+                # Only this function's own branches point here. That is not a
+                # claim about an entry point, it is ordinary control flow.
+                continue
+            self._budget.charge("candidates")
+            self._record(self._overlap_candidate(segment, address, evidence, owner))
+
+    def _referenced(self, start: int, end: int) -> Iterator[int]:
+        """Every address in ``[start, end)`` something refers to."""
+        if start < end and self._bytes.has_xref(self._bytes.get_flags(start)):
+            yield start
+        address = start
+        while address < end:
+            self._budget.charge("seeds")
+            address = self._bytes.next_that(address, end, self._bytes.has_xref)
+            if address == self._api.BADADDR or address >= end:
+                return
+            yield address
+
+    def _reference_evidence(
+        self, address: int, owner: Any = None
+    ) -> dict[str, object] | None:
+        """What refers to ``address``, or ``None`` when only its own flow does."""
+        calls: list[int] = []
+        jumps: list[int] = []
+        pointers: list[int] = []
+        for index, xref in enumerate(self._utils.XrefsTo(address)):
+            if index >= MAX_QUOTED_REFERENCES:
+                break
+            if xref.type in (self._xref.fl_CN, self._xref.fl_CF):
+                calls.append(xref.frm)
+            elif xref.type in (self._xref.fl_JN, self._xref.fl_JF):
+                source = self._funcs.get_func(xref.frm)
+                if owner is None or source is None or source.start_ea != owner.start_ea:
+                    jumps.append(xref.frm)
+            elif not xref.iscode and xref.type == self._xref.dr_O:
+                pointers.append(xref.frm)
+        for kind, sources in (
+            ("call_xref", calls),
+            ("jump_xref", jumps),
+            ("data_pointer", pointers),
+        ):
+            if sources:
+                return {"kind": kind, "from": sorted(sources)}
+        return None
+
+    def _entry_evidence(self, address: int) -> dict[str, object] | None:
+        """Why ``address`` might be an entry point, or ``None`` when nothing is."""
+        flags = self._bytes.get_flags(address)
+        symbol = self._names.get_name(address) if self._bytes.has_name(flags) else ""
+        evidence = self._reference_evidence(address)
+        if evidence is None and symbol:
+            evidence = {"kind": "symbol", "from": []}
+        elif evidence is None and address % _GAP_ALIGNMENT == 0:
+            evidence = {"kind": "aligned_gap", "from": []}
+        if evidence is None:
+            return None
+        evidence["symbol"] = symbol or None
+        evidence["alignment"] = _alignment(address)
+        return evidence
+
+    def _scan_gap(self, segment: dict[str, Any], start: int, end: int) -> None:
+        """Examine the addresses in one executable gap that could be entries."""
+        cursor = start
+        while cursor < end:
+            self._cursor = cursor
+            self._budget.charge("seeds")
+            resume = cursor + 1
+            evidence = self._entry_evidence(cursor)
+            if evidence is not None:
+                candidate = self._gap_candidate(segment, cursor, start, end, evidence)
+                if candidate is None:
+                    self._gap_rejections += 1
+                else:
+                    self._record(candidate)
+                    # One decoded stretch is one answer, so the seeds after it
+                    # start where it ends rather than inside it.
+                    reached = candidate["evidence"]["defined_end"]
+                    if reached is None:
+                        reached = candidate["evidence"]["end"]
+                    if reached is not None and reached > cursor:
+                        resume = reached
+            cursor = self._next_seed(resume, end)
+
+    def _next_seed(self, resume: int, end: int) -> int:
+        """The next address worth examining: aligned, or referred to."""
+        aligned = (resume + _GAP_ALIGNMENT - 1) & ~(_GAP_ALIGNMENT - 1)
+        aligned = min(max(aligned, resume), end)
+        if resume >= end:
+            return end
+        referred = self._bytes.next_that(resume - 1, end, self._bytes.has_xref)
+        if referred != self._api.BADADDR and resume <= referred < aligned:
+            return referred
+        return aligned
+
+    def _gap_candidate(
+        self,
+        segment: dict[str, Any],
+        entry: int,
+        gap_start: int,
+        gap_end: int,
+        evidence: dict[str, object],
+    ) -> dict[str, Any] | None:
+        """Describe, and where the evidence allows it define, one entry point."""
+        proven = evidence["kind"] in _ENTRY_PROOF
+        decoded = self._decode_function(entry, gap_end)
+        if decoded["refusal"] is not None and not proven:
+            # Padding, data, or the middle of something: nothing says this is
+            # an entry point and the bytes do not make a function either.
+            return None
+        self._budget.charge("candidates")
+        state = "candidate"
+        reason = decoded["refusal"]
+        defined_end: int | None = None
+        if reason is None and not proven:
+            reason = (
+                "no call, jump, relocated pointer or symbol establishes"
+                f" {entry:#x} as an entry point, so its instructions are"
+                " described and no function is created over them"
+            )
+        elif reason is None:
+            failure = self._define_function(entry, decoded["end"])
+            if failure is None:
+                state = "applied"
+                created = self._funcs.get_func(entry)
+                defined_end = created.end_ea if created is not None else decoded["end"]
+            else:
+                reason = failure
+        return {
+            "candidate_id": f"ida:function:{entry:08x}",
+            "kind": "function",
+            "backend": BACKEND_NAME,
+            "address_space": ADDRESS_SPACE_IMAGE,
+            "address": entry,
+            "confidence": _CONFIDENT if proven else _WEAK,
+            "state": state,
+            "reason": reason,
+            "evidence": {
+                "entry": entry,
+                "end": decoded["end"],
+                "defined_end": defined_end,
+                "size": None if decoded["end"] is None else decoded["end"] - entry,
+                "segment": segment["name"],
+                "entry_evidence": evidence,
+                "instructions": decoded["instructions"],
+                "instruction_count": decoded["count"],
+                "terminator": decoded["terminator"],
+                "gap": {"start": gap_start, "end": gap_end},
+                "overlaps": None,
+            },
+        }
+
+    def _overlap_candidate(
+        self,
+        segment: dict[str, Any],
+        address: int,
+        evidence: dict[str, object],
+        owner: Any,
+    ) -> dict[str, Any]:
+        """A target inside an existing function: described, never defined."""
+        name = self._funcs.get_func_name(owner.start_ea)
+        evidence["symbol"] = (
+            self._names.get_name(address)
+            if self._bytes.has_name(self._bytes.get_flags(address))
+            else None
+        )
+        evidence["alignment"] = _alignment(address)
+        decoded = self._decode_function(address, owner.end_ea)
+        return {
+            "candidate_id": f"ida:function:{address:08x}",
+            "kind": "function",
+            "backend": BACKEND_NAME,
+            "address_space": ADDRESS_SPACE_IMAGE,
+            "address": address,
+            "confidence": _LIKELY,
+            "state": "candidate",
+            "reason": (
+                f"{address:#x} is inside {name} ({owner.start_ea:#x}-"
+                f"{owner.end_ea:#x}) and is not its entry, so defining a"
+                " function here would redefine code that function already owns"
+            ),
+            "evidence": {
+                "entry": address,
+                "end": None,
+                "defined_end": None,
+                "size": None,
+                "segment": segment["name"],
+                "entry_evidence": evidence,
+                "instructions": decoded["instructions"],
+                "instruction_count": decoded["count"],
+                "terminator": decoded["terminator"],
+                "gap": None,
+                "overlaps": {
+                    "start": owner.start_ea,
+                    "end": owner.end_ea,
+                    "name": name,
+                },
+            },
+        }
+
+    def _decode_function(self, entry: int, limit: int) -> dict[str, Any]:
+        """Decode from ``entry`` to a return, without leaving ``[entry, limit)``.
+
+        A forward branch inside the range moves the end out past itself, so
+        the first ``ret`` of a function with two exits does not become its
+        boundary. Anything that cannot be decoded, anything that would run
+        past ``limit``, and any jump to an address that is neither inside the
+        range nor an existing function's entry refuses the whole range: a
+        boundary this walk cannot prove is not a boundary worth writing down.
+        """
+        instruction = self._ua.insn_t()
+        quoted: list[dict[str, object]] = []
+        count = 0
+        furthest = entry
+        address = entry
+        while address < limit:
+            self._budget.charge("instructions")
+            size = self._ua.decode_insn(instruction, address)
+            if size <= 0:
+                return self._undecoded(
+                    quoted,
+                    count,
+                    f"the bytes at {address:#x} do not decode into an instruction",
+                )
+            count += 1
+            if count > MAX_FUNCTION_INSTRUCTIONS:
+                return self._undecoded(
+                    quoted,
+                    count,
+                    f"more than {MAX_FUNCTION_INSTRUCTIONS} instructions decode"
+                    f" from {entry:#x} without reaching a return",
+                )
+            if len(quoted) < MAX_QUOTED_INSTRUCTIONS:
+                quoted.append(
+                    {
+                        "address": address,
+                        "size": size,
+                        "mnemonic": instruction.get_canon_mnem(),
+                        "text": self._disassembly(address),
+                    }
+                )
+            following = address + size
+            if following > limit or following - entry > MAX_FUNCTION_BYTES:
+                return self._undecoded(
+                    quoted,
+                    count,
+                    f"the instruction at {address:#x} runs past {limit:#x}, which"
+                    " is as far as this range can be proven to reach",
+                )
+            feature = instruction.get_canon_feature()
+            if not feature & self._idp.CF_CALL:
+                target = self._branch_target(instruction)
+                if target is not None and entry <= target < limit:
+                    furthest = max(furthest, target)
+                elif target is not None and not self._is_entry(target):
+                    return self._undecoded(
+                        quoted,
+                        count,
+                        f"the branch at {address:#x} leaves this range for"
+                        f" {target:#x}, which is not a function entry",
+                    )
+            if feature & self._idp.CF_STOP and following > furthest:
+                if self._api.is_ret_insn(instruction):
+                    terminator = "return"
+                elif self._branch_target(instruction) is not None:
+                    terminator = "tail_jump"
+                else:
+                    return self._undecoded(
+                        quoted,
+                        count,
+                        f"the flow stops at {address:#x} without returning and"
+                        " without a target this pass can resolve",
+                    )
+                return {
+                    "end": following,
+                    "instructions": quoted,
+                    "count": count,
+                    "terminator": terminator,
+                    "refusal": None,
+                }
+            address = following
+        return self._undecoded(
+            quoted, count, f"no return ends the range that starts at {entry:#x}"
+        )
+
+    @staticmethod
+    def _undecoded(
+        quoted: list[dict[str, object]], count: int, refusal: str
+    ) -> dict[str, Any]:
+        return {
+            "end": None,
+            "instructions": quoted,
+            "count": count,
+            "terminator": None,
+            "refusal": refusal,
+        }
+
+    def _branch_target(self, instruction: Any) -> int | None:
+        operand = instruction.ops[0]
+        if operand.type in (self._ua.o_near, self._ua.o_far):
+            return int(operand.addr)
+        return None
+
+    def _is_entry(self, address: int) -> bool:
+        function = self._funcs.get_func(address)
+        return function is not None and function.start_ea == address
+
+    def _disassembly(self, address: int) -> str:
+        line = self._api.generate_disasm_line(address, 1)
+        return self._api.tag_remove(line) if line else ""
+
+    def _define_function(self, entry: int, end: int) -> str | None:
+        """Create the function, or say why IDA would not. ``None`` means done."""
+        try:
+            created = bool(self._funcs.add_func(entry, end))
+        except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+            return (
+                f"IDA refused to create a function at {entry:#x}:"
+                f" {type(error).__name__}: {error}"
+            )
+        if not created:
+            return f"IDA refused to create a function at {entry:#x}"
+        function = self._funcs.get_func(entry)
+        if function is None or function.start_ea != entry:
+            return f"IDA reported a function at {entry:#x} that it does not hold"
+        if function.end_ea != end:
+            self._warn(
+                f"IDA ended the function at {entry:#x} at {function.end_ea:#x},"
+                f" not at the {end:#x} this pass decoded"
+            )
+        return None
+
+    # -- the strings pass ---------------------------------------------------
+
+    def _strings_pass(self) -> dict[str, object]:
+        """Read the mapped bytes, then the instructions that build buffers."""
+        first_candidate = len(self._candidates)
+        first_applied = len(self._applied)
+        self._already_defined = 0
+        self._unsupported_frames = 0
+        warnings: list[str] = []
+        ranges = self._raw_byte_strings(warnings)
+        if "functions" in self._passes:
+            ranges.extend(self._instruction_strings(warnings))
+        else:
+            ranges.extend(self._skip_instruction_stage(warnings))
+        if self._already_defined:
+            warnings.append(
+                f"{self._already_defined} printable runs already belong to a"
+                " defined item and are not reported again"
+            )
+        if self._unsupported_frames:
+            warnings.append(
+                f"{self._unsupported_frames} functions keep their locals without"
+                " a frame pointer; this build follows constant writes through"
+                " the frame pointer only, so their buffers were not recovered"
+            )
+        return self._pass_result(
+            "strings",
+            ranges,
+            self._applied[first_applied:],
+            [row["candidate_id"] for row in self._candidates[first_candidate:]],
+            warnings,
+        )
+
+    def _raw_byte_strings(self, warnings: list[str]) -> list[dict[str, Any]]:
+        """Stage one: every mapped byte, independent of any other pass."""
+        ranges: list[dict[str, Any]] = []
+        stopped: str | None = None
+        for segment in self._segments():
+            if stopped is not None:
+                ranges.append(self._unreached(segment, "raw_bytes", stopped))
+                continue
+            entry = self._range(segment, "raw_bytes")
+            self._cursor = segment["start"]
+            try:
+                self._scan_segment_bytes(segment, entry)
+            except _PrepareBudgetError as exhausted:
+                stopped = str(exhausted)
+                self._stop_here(entry, segment, stopped)
+            ranges.append(entry)
+        if stopped is not None:
+            warnings.append(stopped)
+            self._warn(f"raw string discovery stopped early: {stopped}")
+        return ranges
+
+    def _scan_segment_bytes(
+        self, segment: dict[str, Any], entry: dict[str, Any]
+    ) -> None:
+        base = segment["start"]
+        end = segment["end"]
+        # A run that starts inside one step is read to its end past the step
+        # boundary, so the next step must not rediscover its tail as a
+        # shorter string at a different address.
+        self._claimed = base
+        while base < end:
+            self._cursor = base
+            allowance = self._budget.left("bytes")
+            take = min(_READ_STEP, end - base, max(allowance, 1))
+            self._budget.charge("bytes", take)
+            overlap = min(MAX_STRING_BYTES, end - base - take)
+            raw = self._bytes.get_bytes(base, take + overlap)
+            if raw is None or len(raw) < take:
+                entry["coverage"] = (
+                    "unavailable" if base == segment["start"] else "partial"
+                )
+                entry["reason"] = (
+                    f"{segment['name']} holds no bytes in the image from"
+                    f" {base:#x}, so nothing can be read out of it"
+                )
+                entry["unvisited"] = [{"start": base, "end": end}]
+                return
+            self._harvest_bytes(segment, base, raw, take)
+            base += take
+
+    def _harvest_bytes(
+        self, segment: dict[str, Any], base: int, raw: bytes, take: int
+    ) -> None:
+        offset = max(0, self._claimed - base)
+        while offset < take:
+            found = self._longest_run(raw, offset, base + offset)
+            if found is None:
+                offset += 1
+                continue
+            length, text, encoding = found
+            start = base + offset
+            self._claimed = start + length
+            if self._is_undefined(start, start + length):
+                self._raw_string_candidate(
+                    segment, start, text, encoding, raw[offset : offset + length]
+                )
+            else:
+                self._already_defined += 1
+            offset += length
+
+    def _longest_run(
+        self, raw: bytes, offset: int, address: int
+    ) -> tuple[int, str, str] | None:
+        """The longest decodable run starting here, so encodings never overlap."""
+        found: list[tuple[int, str, str]] = []
+        plain = _ascii_run(raw, offset)
+        if plain is not None:
+            found.append((plain[0], plain[1], "ascii"))
+        if address % 2 == 0:
+            little = _utf16_run(raw, offset, big_endian=False)
+            if little is not None:
+                found.append((little[0], little[1], "utf-16le"))
+            big = _utf16_run(raw, offset, big_endian=True)
+            if big is not None:
+                found.append((big[0], big[1], "utf-16be"))
+        return max(found, key=operator.itemgetter(0)) if found else None
+
+    def _is_undefined(self, start: int, end: int) -> bool:
+        address = start
+        while address < end:
+            if not self._bytes.is_unknown(self._bytes.get_flags(address)):
+                return False
+            address += 1
+        return True
+
+    def _raw_string_candidate(
+        self,
+        segment: dict[str, Any],
+        start: int,
+        text: str,
+        encoding: str,
+        raw: bytes,
+    ) -> None:
+        self._budget.charge("candidates")
+        string_type = self._string_types[encoding]
+        state = "candidate"
+        reason: str | None = None
+        if segment["executable"]:
+            # Undefined bytes in an executable segment are as likely to be
+            # code IDA has not reached as they are to be text, and a string
+            # defined over an instruction hides it. The bytes and their
+            # addresses are reported; the database is left alone.
+            reason = (
+                f"{start:#x} is in the executable segment {segment['name']},"
+                " where undefined bytes may be code this analysis has not"
+                " decoded yet, so the run is reported and not defined"
+            )
+        elif len(text) < MIN_DEFINED_STRING_CHARS:
+            reason = (
+                f"{len(text)} printable characters followed by a terminator"
+                " happen by chance in packed data, so this run is reported"
+                f" with its bytes; {MIN_DEFINED_STRING_CHARS} or more are"
+                " defined in the database"
+            )
+        elif string_type is None:
+            reason = (
+                "this IDA registers no big-endian UTF-16 string type, so these"
+                " bytes are reported with their exact addresses and the"
+                " database is left as it is"
+            )
+        else:
+            failure = self._define_string(start, len(raw), string_type)
+            if failure is None:
+                state = "applied"
+            else:
+                reason = failure
+        self._record(
+            {
+                "candidate_id": f"ida:string:{encoding}:{start:08x}",
+                "kind": "string",
+                "backend": BACKEND_NAME,
+                "address_space": ADDRESS_SPACE_IMAGE,
+                "address": start,
+                "confidence": (
+                    _CONFIDENT if len(text) >= MIN_DEFINED_STRING_CHARS else _LIKELY
+                ),
+                "state": state,
+                "reason": reason,
+                "evidence": {
+                    "stage": "raw_bytes",
+                    "method": "mapped bytes decoded in place",
+                    "encoding": encoding,
+                    "start": start,
+                    "end": start + len(raw),
+                    "length": len(raw),
+                    "characters": len(text),
+                    "terminator": "nul",
+                    "text": text,
+                    "segment": segment["name"],
+                    **_quoted(raw),
+                },
+            }
+        )
+
+    def _define_string(self, start: int, length: int, string_type: int) -> str | None:
+        try:
+            created = bool(self._bytes.create_strlit(start, length, string_type))
+        except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+            return (
+                f"IDA refused to define a string at {start:#x}:"
+                f" {type(error).__name__}: {error}"
+            )
+        if not created:
+            return f"IDA refused to define a string at {start:#x}"
+        defined = self._bytes.get_item_size(start)
+        if defined != length:
+            self._warn(
+                f"IDA defined {defined} bytes at {start:#x}, not the {length}"
+                " this pass decoded"
+            )
+        return None
+
+    # -- stage two: buffers that exist only in instructions -----------------
+
+    def _skip_instruction_stage(self, warnings: list[str]) -> list[dict[str, Any]]:
+        """Say which stage did not run, and what it was waiting for."""
+        reason = (
+            "instruction-derived string recovery reads the instructions of"
+            " recovered functions, and the 'functions' pass was not requested,"
+            " so this stage did not run"
+        )
+        self._skipped.append(
+            {
+                "pass": "strings",
+                "stage": "instructions",
+                "requires": "functions",
+                "reason": reason,
+            }
+        )
+        warnings.append(reason)
+        self._warn(reason)
+        return [
+            self._unreached(segment, "instructions", reason)
+            for segment in self._segments()
+            if segment["executable"]
+        ]
+
+    def _instruction_strings(self, warnings: list[str]) -> list[dict[str, Any]]:
+        executable = [
+            segment for segment in self._segments() if segment["executable"]
+        ]
+        if self._processor != _X86:
+            reason = (
+                "constant-write string recovery is implemented for x86 and"
+                f" x86-64, and this database is {self._processor!r}"
+            )
+            warnings.append(reason)
+            self._warn(reason)
+            ranges = []
+            for segment in executable:
+                entry = self._range(segment, "instructions")
+                entry["coverage"] = "unavailable"
+                entry["unvisited"] = [
+                    {"start": segment["start"], "end": segment["end"]}
+                ]
+                entry["reason"] = reason
+                ranges.append(entry)
+            return ranges
+        ranges = []
+        stopped: str | None = None
+        for segment in executable:
+            if stopped is not None:
+                ranges.append(self._unreached(segment, "instructions", stopped))
+                continue
+            entry = self._range(segment, "instructions")
+            self._cursor = segment["start"]
+            try:
+                for address in self._utils.Functions(segment["start"], segment["end"]):
+                    self._cursor = address
+                    self._budget.charge("functions")
+                    self._stack_strings(segment, address)
+            except _PrepareBudgetError as exhausted:
+                stopped = str(exhausted)
+                self._stop_here(entry, segment, stopped)
+            ranges.append(entry)
+        if stopped is not None:
+            warnings.append(stopped)
+            self._warn(f"instruction-derived string recovery stopped early: {stopped}")
+        return ranges
+
+    def _stack_strings(self, segment: dict[str, Any], start: int) -> None:
+        """Recover the buffers one function assembles out of immediates.
+
+        Only writes whose value this walk can prove are kept: an immediate
+        stored straight into the frame, or a register this walk watched an
+        immediate being loaded into. Every other write to a tracked byte
+        forgets that byte, a branch target forgets every register, and a
+        store through a register this walk cannot resolve harvests what is
+        known and starts again — a byte that might have been overwritten is
+        not a byte this pass may quote.
+        """
+        function = self._funcs.get_func(start)
+        if function is None:
+            return
+        if not function.flags & self._funcs.FUNC_FRAME:
+            self._unsupported_frames += 1
+            return
+        frame: dict[int, dict[str, Any]] = {}
+        registers: dict[int, bytes] = {}
+        instruction = self._ua.insn_t()
+        address = function.start_ea
+        previous: int | None = None
+        while address < function.end_ea:
+            self._budget.charge("instructions")
+            size = self._ua.decode_insn(instruction, address)
+            if size <= 0:
+                registers.clear()
+                previous = None
+                address += 1
+                continue
+            if previous is not None and self._reached_from_elsewhere(address, previous):
+                registers.clear()
+            if not self._apply_instruction(instruction, address, registers, frame):
+                self._harvest_frame(segment, function, frame)
+                frame = {}
+                registers.clear()
+            previous = address
+            address += size
+        self._harvest_frame(segment, function, frame)
+
+    def _reached_from_elsewhere(self, address: int, previous: int) -> bool:
+        """Whether anything but the instruction before it branches here."""
+        if not self._bytes.has_xref(self._bytes.get_flags(address)):
+            return False
+        source = self._xref.get_first_cref_to(address)
+        while source != self._api.BADADDR:
+            if source != previous:
+                return True
+            source = self._xref.get_next_cref_to(address, source)
+        return False
+
+    def _apply_instruction(
+        self,
+        instruction: Any,
+        address: int,
+        registers: dict[int, bytes],
+        frame: dict[int, dict[str, Any]],
+    ) -> bool:
+        """Fold one instruction in. ``False`` when the frame stops being provable."""
+        feature = instruction.get_canon_feature()
+        mnemonic = instruction.get_canon_mnem()
+        if mnemonic in ("leave", "enter"):
+            # The frame itself moves, so every offset this walk holds is about
+            # a frame that no longer exists.
+            return False
+        if feature & self._idp.CF_CALL:
+            registers.clear()
+            return True
+        destination = instruction.ops[0]
+        source = instruction.ops[1]
+        if mnemonic == "mov" and destination.type == self._ua.o_reg:
+            if source.type == self._ua.o_imm:
+                self._load_register(destination, source, registers)
+                return True
+        if (
+            mnemonic == "mov"
+            and destination.type == self._ua.o_displ
+            and destination.reg == _FRAME_POINTER
+        ):
+            self._store_frame(
+                instruction, address, destination, source, registers, frame
+            )
+            return True
+        return self._forget(instruction, feature, registers, frame)
+
+    def _load_register(
+        self, destination: Any, source: Any, registers: dict[int, bytes]
+    ) -> None:
+        """Remember an immediate loaded into a register, where x86 proves it.
+
+        A 4-byte load clears the upper half of the 64-bit register and an
+        8-byte load sets all of it; a 1- or 2-byte load leaves the rest of the
+        register whatever it already was, which this walk does not know.
+        """
+        width = self._ua.get_dtype_size(destination.dtype)
+        if width not in (4, 8):
+            registers.pop(destination.reg, None)
+            return
+        registers[destination.reg] = (source.value & ((1 << (width * 8)) - 1)).to_bytes(
+            8, "little"
+        )
+
+    def _store_frame(
+        self,
+        instruction: Any,
+        address: int,
+        destination: Any,
+        source: Any,
+        registers: dict[int, bytes],
+        frame: dict[int, dict[str, Any]],
+    ) -> None:
+        width = self._ua.get_dtype_size(destination.dtype)
+        offset = self._signed(destination.addr)
+        value: bytes | None = None
+        if source.type == self._ua.o_imm and width <= 8:
+            if self._ua.get_dtype_size(source.dtype) >= width or not (
+                source.value >> (self._ua.get_dtype_size(source.dtype) * 8 - 1)
+            ):
+                value = (source.value & ((1 << (width * 8)) - 1)).to_bytes(
+                    width, "little"
+                )
+        elif source.type == self._ua.o_reg and source.reg in registers:
+            if self._ua.get_dtype_size(source.dtype) >= width:
+                value = registers[source.reg][:width]
+        if value is None:
+            for index in range(width):
+                frame.pop(offset + index, None)
+            return
+        if len(frame) + width > MAX_FRAME_BYTES:
+            self._warn(
+                f"a frame grew past {MAX_FRAME_BYTES} tracked bytes; the writes"
+                f" at and after {address:#x} in that function were not followed"
+            )
+            return
+        write = {
+            "address": address,
+            "mnemonic": instruction.get_canon_mnem(),
+            "text": self._disassembly(address),
+            "frame_offset": offset,
+            "size": width,
+            "value": value.hex(),
+        }
+        for index, byte in enumerate(value):
+            frame[offset + index] = {"byte": byte, "write": write}
+
+    def _forget(
+        self,
+        instruction: Any,
+        feature: int,
+        registers: dict[int, bytes],
+        frame: dict[int, dict[str, Any]],
+    ) -> bool:
+        """Drop what this instruction may have changed. ``False`` if unknowable."""
+        provable = True
+        for index, operand in enumerate(instruction.ops):
+            if operand.type == self._ua.o_void or index >= len(self._changes):
+                break
+            if not feature & self._changes[index]:
+                continue
+            if operand.type == self._ua.o_reg:
+                if operand.reg == _FRAME_POINTER:
+                    return False
+                registers.pop(operand.reg, None)
+            elif operand.type == self._ua.o_displ and operand.reg == _FRAME_POINTER:
+                offset = self._signed(operand.addr)
+                for step in range(self._ua.get_dtype_size(operand.dtype)):
+                    frame.pop(offset + step, None)
+            elif operand.type in (self._ua.o_mem, self._ua.o_phrase, self._ua.o_displ):
+                # A write through an address this walk cannot resolve could
+                # land anywhere, the frame included.
+                provable = False
+        return provable
+
+    def _signed(self, value: int) -> int:
+        limit = 1 << self._bits
+        value &= limit - 1
+        return value - limit if value >= limit >> 1 else value
+
+    def _harvest_frame(
+        self, segment: dict[str, Any], function: Any, frame: dict[int, dict[str, Any]]
+    ) -> None:
+        """Report the NUL-terminated runs the tracked frame bytes spell out."""
+        if not frame:
+            return
+        group: list[int] = []
+        for offset in sorted(frame):
+            if group and offset != group[-1] + 1:
+                self._harvest_group(segment, function, frame, group)
+                group = []
+            group.append(offset)
+        self._harvest_group(segment, function, frame, group)
+
+    def _harvest_group(
+        self,
+        segment: dict[str, Any],
+        function: Any,
+        frame: dict[int, dict[str, Any]],
+        group: list[int],
+    ) -> None:
+        if len(group) < MIN_STRING_CHARS + 1:
+            return
+        data = bytes(frame[offset]["byte"] for offset in group)
+        index = 0
+        while index < len(data):
+            run = _ascii_run(data, index)
+            if run is None:
+                index += 1
+                continue
+            length, text = run
+            self._stack_candidate(
+                segment, function, frame, group[index : index + length], text
+            )
+            index += length
+
+    def _stack_candidate(
+        self,
+        segment: dict[str, Any],
+        function: Any,
+        frame: dict[int, dict[str, Any]],
+        offsets: list[int],
+        text: str,
+    ) -> None:
+        self._budget.charge("candidates")
+        raw = bytes(frame[offset]["byte"] for offset in offsets)
+        writes: dict[int, dict[str, Any]] = {}
+        for offset in offsets:
+            write = frame[offset]["write"]
+            writes[write["address"]] = write
+        first = min(writes)
+        self._record(
+            {
+                # A stack buffer has no image address of its own, so the
+                # candidate is anchored at the first instruction that writes
+                # it: an address a reviewer can actually go to.
+                "candidate_id": f"ida:string:stack:{function.start_ea:08x}:{first:08x}",
+                "kind": "string",
+                "backend": BACKEND_NAME,
+                "address_space": ADDRESS_SPACE_IMAGE,
+                "address": first,
+                "confidence": _LIKELY,
+                "state": "candidate",
+                "reason": (
+                    "a buffer assembled in a stack frame has no image address"
+                    " to define, so its bytes are reported with the"
+                    " instructions that write them"
+                ),
+                "evidence": {
+                    "stage": "instructions",
+                    "method": "constant writes into the frame, traced in order",
+                    "encoding": "ascii",
+                    "anchor": "first_constant_write",
+                    "function": function.start_ea,
+                    "function_end": function.end_ea,
+                    "function_name": self._funcs.get_func_name(function.start_ea),
+                    "frame_base": "frame pointer",
+                    "frame_offset": offsets[0],
+                    "length": len(raw),
+                    "characters": len(text),
+                    "terminator": "nul",
+                    "text": text,
+                    "segment": segment["name"],
+                    "writes": [writes[key] for key in sorted(writes)],
+                    **_quoted(raw),
+                },
+            }
+        )
+
+
+def _run_preparation(payload: dict[str, object]) -> dict[str, object]:
+    """Recover what the evidence justifies, and describe what it does not."""
+    return _Preparation(payload).run()
+
+
 #: Every operation ``run`` accepts, by name. Each takes the JSON payload and
 #: returns a JSON-native dictionary.
 _OPERATIONS: Final[dict[str, Callable[[dict[str, object]], dict[str, object]]]] = {
     "database_summary": _database_summary,
     "findings_page": _findings_page,
+    "prepare": _run_preparation,
     "scan": _scan,
     "store_scan": _store_scan,
     "triage": _triage,
