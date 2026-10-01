@@ -37,6 +37,22 @@ Four gates, in the order they fire:
     stripped, so a provider cannot even repaint a terminal through a reason
     string.
 
+The two schema gates are **not** backed by the same safety net, and the
+difference decides how much the pin-time refusal has to carry:
+
+* an **input** schema is evaluated by this module, on a worker thread, under
+  ``schema_deadline_seconds``. A cost that slips past the pin becomes a
+  :class:`CapabilityUnavailableError` on the deadline — unless it holds the
+  GIL, which is why regular expressions are refused outright rather than timed;
+* an **output** schema is evaluated by the SDK, inside
+  ``ClientSession.call_tool``'s ``validate_tool_result``, on this event loop,
+  **after** ``send_request`` has returned. ``read_timeout_seconds`` bounds the
+  wait for the answer and not what is done with it; the operator's response
+  budgets are applied by :func:`_envelope`, which runs later still. There is no
+  thread, no deadline and no budget on that path, so **the pin-time refusal is
+  the entire defence there** — which is why :data:`_COSTLY_KEYWORDS` exists and
+  why both schemas are vetted, not just the one this module runs itself.
+
 The session itself is an async context manager, and it releases the provider on
 the way out of the ``with`` — on success, on error and on cancellation alike.
 Nothing here writes to stdout or stderr: this process speaks MCP on its own
@@ -191,9 +207,9 @@ def tool_fingerprint(tool: types.Tool) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-#: JSON Schema keywords a provider's **input schema** may not contain. There
-#: are two different reasons in this one set, and the second is the important
-#: one:
+#: JSON Schema keywords a provider's schema may not contain, input or output
+#: alike. There are two different reasons in this one set, and the second is
+#: the important one:
 #:
 #: ``pattern``, ``patternProperties``
 #:     Regular expressions, compiled and run by ``jsonschema``
@@ -214,14 +230,42 @@ def tool_fingerprint(tool: types.Tool) -> str:
 #:     measured at 39.8 seconds. So the reachability itself is removed. Do not
 #:     "improve" this by narrowing it back to a list of bad constructs.
 #:
-#: Nothing is lost by refusing any of them: the arguments this module sends are
-#: adapter-authored constants, never agent input, so a provider's own schema
-#: was never the thing keeping them honest; and neither installed backend emits
-#: a reference — radare2-mcp 1.8.8 uses none across all 42 of its tools,
-#: GhidraMCP 6.0.0 none across its 222. ``format`` is not here because no
-#: format checker
-#: is installed, which is what makes it inert rather than a second
-#: regular-expression engine.
+#: Nothing measurable is lost by refusing any of them, and that is an
+#: availability claim, so it is measured rather than argued: **GhidraMCP 6.0.0
+#: declares an output schema on all 222 of its tools and none is refused by
+#: this set; radare2-mcp 1.8.8 declares none at all across its 42, and its
+#: input schemas use none of these keywords either.** (The older justification
+#: here — that the arguments this module sends are adapter-authored constants —
+#: was about input schemas only, and stopped being the whole reason when this
+#: set started governing output schemas, which are run against a provider's own
+#: answer.) ``format`` is not here because no format checker is installed,
+#: which is what makes it inert rather than a second regular-expression engine.
+#: Keywords refused for what they **cost**, which is a different question from
+#: the one :data:`_SHARED_KINDS` answers and must stay one.
+#:
+#: The position classification asks *"does this keyword hold a subschema?"*.
+#: This set asks *"can this keyword's evaluation cost more than the bytes it is
+#: given?"*. For seven rounds this module treated the second as a consequence
+#: of the first, and ``uniqueItems`` is where they part company: it holds no
+#: subschema — ``instance`` is the *correct* position class for it — and
+#: ``jsonschema``'s ``uniq`` still falls back to an O(n²) deep comparison
+#: whenever the array's items are unorderable, which the provider chooses.
+#: A 72-byte output schema measured 0.74 s on an 11 KB answer, 12.2 s on 50 KB
+#: and 52.5 s on 103 KB, every call succeeding, after every budget this server
+#: applies.
+#:
+#: Populated by measurement, not by guesswork: every keyword classified
+#: ``instance``, in every dialect, swept against the worst instance a provider
+#: could choose. ``uniqueItems`` was the only one whose cost is both
+#: super-linear and unbounded by anything else. ``maximum`` and
+#: ``exclusiveMaximum`` are super-linear in an integer's digits — 36 ms at
+#: 64,000 digits, quadratic — but CPython's own ``sys.get_int_max_str_digits``
+#: of 4,300 means ``json`` refuses to parse a longer one at all, capping them
+#: at 0.18 ms; ``enum``, ``const``, ``required`` and the rest measured linear.
+#: The sweep and those ceilings are pinned in ``tests/test_provider_security.py``
+#: so the set keeps its evidence and a change of ceiling is visible.
+_COSTLY_KEYWORDS: Final[frozenset[str]] = frozenset({"uniqueItems"})
+
 _REFUSED_KEYWORDS: Final[frozenset[str]] = frozenset(
     {
         "$defs",
@@ -738,7 +782,7 @@ def _unusable_schema(
             f"its {what} schema nests deeper than the"
             f" {limits.max_response_depth} level depth budget"
         )
-    finding = _inspect_schema(schema)
+    finding = _inspect_schema(schema, what)
     if finding.reason is not None:
         return finding.reason
     if finding.unclassified:
@@ -748,6 +792,14 @@ def _unusable_schema(
             " JSON Schema library evaluates but this server has not classified"
             " as a schema position; a keyword whose shape is unknown is refused"
             " rather than walked past, because what it can reach is unknown too"
+        )
+    if finding.costly:
+        return (
+            f"its {what} schema uses {finding.costly}, whose evaluation cost"
+            " this server cannot bound: measured at 12.2 s on a 50 KB answer"
+            " and 52.5 s on a 103 KB one, growing with the square of what the"
+            " provider sends, inside this process and after every budget this"
+            " server applies"
         )
     if finding.refused:
         return (
@@ -789,6 +841,7 @@ class _Finding:
 
     refused: list[str]
     unclassified: list[str]
+    costly: list[str]
     reason: str | None
 
 
@@ -826,7 +879,7 @@ def _validator_for(schema: object, default: type[Any]) -> type[Any]:
     return jsonschema.validators.validator_for(schema, default=default)
 
 
-def _inspect_schema(schema: Mapping[str, Any]) -> _Finding:
+def _inspect_schema(schema: Mapping[str, Any], what: str) -> _Finding:
     """Walk a provider's schema the way the library will evaluate it.
 
     Two things happen per node, not once at the root, and both were bypasses
@@ -848,17 +901,18 @@ def _inspect_schema(schema: Mapping[str, Any]) -> _Finding:
     dialect switch anyone thinks of next.
     """
     try:
-        return _walk_schema(schema)
+        return _walk_schema(schema, what)
     except _UnusableDialect as error:
-        return _Finding([], [], f"its schema: {error.reason}")
+        return _Finding([], [], [], f"its {what} schema: {error.reason}")
 
 
-def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
+def _walk_schema(schema: Mapping[str, Any], what: str) -> _Finding:
     refused: set[str] = set()
     unclassified: set[str] = set()
+    costly: set[str] = set()
     root = _validator_for(schema, default=jsonschema.validators._LATEST_VERSION)
     if root not in SUPPORTED_DIALECTS:
-        return _Finding([], [], _unsupported(root, schema.get("$schema")))
+        return _Finding([], [], [], _unsupported(root, schema.get("$schema"), what))
     stack: list[tuple[object, type[Any]]] = [(schema, root)]
     first = True
     while stack:
@@ -873,12 +927,15 @@ def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
         # would hide whether it does.
         validator = _validator_for(item, default=validator)
         if validator not in SUPPORTED_DIALECTS:
-            return _Finding([], [], _unsupported(validator, item.get("$schema")))
+            return _Finding(
+                [], [], [], _unsupported(validator, item.get("$schema"), what)
+            )
         if not first and "$schema" in item:
             return _Finding(
                 [],
                 [],
-                "a subschema declares its own $schema,"
+                [],
+                f"a subschema of its {what} schema declares its own $schema,"
                 " which switches the dialect the library evaluates that subtree"
                 " with; no tool schema this server talks to has one, and one"
                 " here would mean the vocabulary changes underneath the check",
@@ -886,6 +943,11 @@ def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
         first = False
         dialect = DIALECTS[validator.__name__]
         for key, value in item.items():
+            if key in dialect.kinds and key in _COSTLY_KEYWORDS:
+                # Asked separately from the position question below, and of
+                # every keyword the dialect evaluates whatever its shape.
+                costly.add(key)
+                continue
             if key in _REFUSED_KEYWORDS:
                 refused.add(key)
                 continue
@@ -898,14 +960,14 @@ def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
                     stack.extend((child, validator) for child in value.values())
             elif kind == "schema":
                 stack.append((value, validator))
-    return _Finding(sorted(refused), sorted(unclassified), None)
+    return _Finding(sorted(refused), sorted(unclassified), sorted(costly), None)
 
 
-def _unsupported(validator: type[Any], declared: object) -> str:
+def _unsupported(validator: type[Any], declared: object, what: str) -> str:
     """Why one dialect is refused, naming what the library resolved it to."""
     named = f" declared as {declared!r}" if declared is not None else ""
     return _quote(
-        f"a schema of its would be evaluated as {validator.__name__}{named},"
+        f"its {what} schema would be evaluated as {validator.__name__}{named},"
         " a dialect this server has not classified and tested; only"
         f" {sorted(item.__name__ for item in SUPPORTED_DIALECTS)} are accepted"
     )

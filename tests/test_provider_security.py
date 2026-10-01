@@ -1360,6 +1360,103 @@ def test_a_declared_output_schema_is_cost_vetted_too(
     assert elapsed < 2.0, f"the output schema was compiled and run ({elapsed:.1f}s)"
 
 
+def test_a_schema_that_holds_no_subschema_can_still_cost_unbounded(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """Position class and cost class are different questions.
+
+    `uniqueItems` holds no subschema, so `instance` is the *correct* position
+    class for it — and `jsonschema`'s `uniq` still falls back to an O(n^2) deep
+    comparison when the array's items are unorderable, which the provider
+    chooses by what it returns. Measured with the pin disabled: 0.74 s on an
+    11 KB answer, 12.2 s on 50 KB, 52.5 s on 103 KB, **every call succeeding**.
+    Nothing bounds it: `read_timeout_seconds` covers the wait for the answer,
+    not what `validate_tool_result` then does with it, and the response budgets
+    are applied later still by `_envelope`.
+
+    Timed through a real session for that reason — the failure to catch is the
+    seconds, not a return value.
+    """
+    config = configure(
+        _config_text(
+            variant="quadratic_output",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[str, float]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            started = time.monotonic()
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            return str(refused.value), time.monotonic() - started
+
+    reason, elapsed = _run(exercise())
+    assert "output schema" in reason
+    assert "uniqueItems" in reason
+    assert elapsed < 2.0, (
+        f"the output schema was run against the answer ({elapsed:.1f}s)"
+    )
+
+
+def test_the_cost_set_is_what_measurement_says_it_is() -> None:
+    """The evidence behind `_COSTLY_KEYWORDS`, kept where a change is visible.
+
+    Two things are pinned. First, that `uniqueItems` really is quadratic — if a
+    future `jsonschema` makes `uniq` linear this fails and the entry can be
+    reconsidered on evidence rather than removed on a hunch. Second, the
+    *ceiling* that keeps `maximum`/`exclusiveMaximum` out of the set: they are
+    super-linear in an integer's digits (36 ms at 64,000), but CPython refuses
+    to parse an integer literal longer than `sys.get_int_max_str_digits`, so a
+    provider cannot deliver one. Raise that limit and this test fails, which is
+    exactly when the decision should be revisited.
+    """
+    validator = jsonschema.Draft202012Validator({"type": "array", "uniqueItems": True})
+
+    def cost(n: int) -> float:
+        items = [{"i": index} for index in range(n)]
+        started = time.monotonic()
+        for _ in validator.iter_errors(items):
+            break
+        return time.monotonic() - started
+
+    small, large = cost(500), cost(1000)
+    assert small > 0.0
+    # Doubling the answer roughly quadruples the work; linear would be ~2.
+    assert large / small > 3.0, (small, large)
+
+    assert sys.get_int_max_str_digits() == 4300
+    with pytest.raises(ValueError, match="4300 digits"):
+        json.loads("9" * 4301)
+
+    biggest = json.loads("9" * 4300)
+    numeric = jsonschema.Draft202012Validator({"maximum": 1})
+    started = time.monotonic()
+    for _ in range(100):
+        list(numeric.iter_errors(biggest))
+    assert time.monotonic() - started < 1.0
+
+    assert client._COSTLY_KEYWORDS == frozenset({"uniqueItems"})
+    # Cost is asked of keywords whatever their position class, and `uniqueItems`
+    # is classified `instance` in every dialect that has it — correctly.
+    for dialect in client.DIALECTS.values():
+        if "uniqueItems" in dialect.kinds:
+            assert dialect.kinds["uniqueItems"] == "instance"
+
+
 def test_an_absent_output_schema_is_not_an_unusable_one(
     configure: Callable[[str], dict[str, ProviderConfig]],
     binary: Path,
@@ -1916,6 +2013,15 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
                 "properties": {"text": {"type": "string", "pattern": "^(a+)+$"}},
                 "required": ["text"],
             }
+        if variant == "quadratic_output":
+            # 72 bytes, no regex, no subschema anywhere, every keyword
+            # classified exactly right. `uniq` still falls back to an O(n^2)
+            # deep comparison because the items are unorderable — which the
+            # provider, not the schema, chooses.
+            beta["outputSchema"] = {
+                "type": "object",
+                "properties": {"xs": {"type": "array", "uniqueItems": True}},
+            }
         tools.insert(1, beta)
     if variant == "injection":
         tools.append(
@@ -1979,6 +2085,12 @@ def _server_call(
             return {
                 "content": [{"type": "text", "text": "ok"}],
                 "structuredContent": {"text": "a" * 28 + "!"},
+                "isError": False,
+            }
+        if variant == "quadratic_output":
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"xs": [{"i": i} for i in range(4000)]},
                 "isError": False,
             }
         text = (
