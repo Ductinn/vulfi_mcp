@@ -13,25 +13,32 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict
 __all__ = [
     "AddressGap",
     "AddressRange",
+    "AttemptOutcome",
     "Backend",
+    "BackendAttempt",
     "Candidate",
     "CandidateKind",
     "CandidateState",
+    "ExternalScope",
     "Finding",
     "FindingsPage",
     "JsonValue",
     "PassName",
     "PassResult",
+    "PassRouting",
     "PassStage",
     "PreparationPage",
     "PreparationResult",
     "Priority",
     "RangeCoverage",
+    "RouteState",
     "RuleCoverage",
     "RuleEvidence",
+    "RuleRouting",
     "RuleState",
     "ScanCoverage",
     "ScanResult",
+    "ScopeState",
     "SkippedPrerequisite",
     "SyncState",
     "TriageResult",
@@ -92,9 +99,53 @@ if TYPE_CHECKING:
     #: creates links; until then every stored row is ``unlinked``, which is not
     #: the same claim as ``synchronized``.
     SyncState = Literal["unlinked", "pending", "synchronized", "conflict", "paused"]
+
+    #: What one backend made of one pass or one rule when it was asked.
+    #:
+    #: The five are deliberately not collapsible, and each one decides what
+    #: the chain does next.
+    #:
+    #: ``answered``
+    #:     Evidence. This backend's result was recorded.
+    #: ``unsupported``
+    #:     A session that really opened, stating it cannot establish this
+    #:     fact at all. The chain advances; this is the capability
+    #:     fall-through the whole design is built on.
+    #: ``failed``
+    #:     A session that opened and a call that did not finish — a drifted
+    #:     schema, a reply it could not read. The chain advances too, because
+    #:     loudness is a property of the report and not of the search, but
+    #:     the failure is sticky: it is kept against this backend, no later
+    #:     answer erases it, and nothing it touched is ever summarised as
+    #:     complete.
+    #: ``unavailable``
+    #:     Nobody looked: no configuration, no session. The chain advances.
+    #: ``unverified``
+    #:     This backend could not be shown to be looking at the same bytes.
+    #:     The chain **stops** here for this pass or rule. "We cannot prove
+    #:     it is the same binary" is not "it had nothing to offer", and
+    #:     advancing past it is how a result from one image ends up
+    #:     aggregated against another.
+    AttemptOutcome = Literal[
+        "answered", "unsupported", "failed", "unavailable", "unverified"
+    ]
+
+    #: What the whole chain made of one pass or one rule. The same five
+    #: words, now describing every backend together: ``unavailable`` means no
+    #: backend in the chain was reachable, ``unsupported`` means at least one
+    #: answered and none could establish it, ``failed`` means at least one
+    #: tried and could not finish and nothing later answered either, and
+    #: ``unverified`` means the chain refused on identity.
+    RouteState = AttemptOutcome
+
+    #: What one stored external scope records about the scan that wrote it.
+    #: ``evaluated`` means a backend really ran these rules over this scope;
+    #: the others carry the same distinctions :data:`AttemptOutcome` does.
+    ScopeState = Literal["evaluated", "failed", "unavailable", "unverified"]
 else:
     Backend = Priority = TriageStatus = ScanCoverage = RuleState = SyncState = str
     PassName = PassStage = RangeCoverage = CandidateState = CandidateKind = str
+    AttemptOutcome = RouteState = ScopeState = str
 
 
 class Finding(TypedDict):
@@ -362,6 +413,103 @@ SkippedPrerequisite = TypedDict(
 )
 
 
+class BackendAttempt(TypedDict):
+    """What one backend made of one pass or one rule when it was asked.
+
+    This is the row that keeps "nobody looked" apart from "we looked and
+    could not read it" apart from "we looked and it is clean". A router that
+    reported only the backend that answered would leave a reader unable to
+    tell a Ghidra that was never configured from a Ghidra whose schema had
+    drifted, and those are different things to go and fix.
+
+    ``outcome`` decides what the chain did next, and
+    :data:`AttemptOutcome` spells out each one. Four of the five advance to
+    the next backend; only ``unverified`` stops, because an unprovable
+    identity is the one refusal another backend cannot stand in for.
+
+    A ``failed`` attempt is **sticky**. It advances the chain so evidence we
+    really have is not thrown away over a transient fault in a backend that
+    may not have been the one able to answer — and it stays in this list,
+    stays in the catalog, and keeps anything it touched from ever being
+    summarised as complete. "ghidra: failed (reason); r2: evaluated, no
+    finding" is the shape; a later answer is reported *alongside* the
+    failure, never instead of it.
+    """
+
+    backend: Backend
+    outcome: AttemptOutcome
+    reason: str | None
+
+
+#: How one requested pass was routed, and what every backend said about it.
+#:
+#: Spelled with the functional syntax for the same reason :data:`PassResult`
+#: is: the field is named ``pass``, which the class syntax cannot declare.
+#:
+#: ``backend`` is the one whose :class:`PassResult` was recorded, and is
+#: ``None`` when no backend produced one. ``coverage`` is that result's own
+#: coverage, carried through unchanged — routing never upgrades a pass
+#: summary, and ``unavailable`` is never upgraded by anything. ``attempts``
+#: is every backend that was asked, in the order the chain asked them.
+PassRouting = TypedDict(
+    "PassRouting",
+    {
+        "pass": PassName,
+        "backend": Backend | None,
+        "state": RouteState,
+        "coverage": RangeCoverage,
+        "attempts": list[BackendAttempt],
+        "reason": str | None,
+    },
+)
+
+
+class RuleRouting(TypedDict):
+    """How one rule was routed, and what every backend said about it.
+
+    ``backend`` is the one whose evidence became a verdict, and is ``None``
+    when none did. ``state`` is that backend's :class:`RuleCoverage` state,
+    or the chain's own verdict when nothing answered: ``unsupported`` when a
+    backend answered and could not establish the rule's facts, ``failed``
+    when one tried and could not finish, ``unavailable`` when none opened.
+    ``reason`` names the missing fact, never the provider's prose.
+    """
+
+    rule_index: int
+    rule_name: str
+    backend: Backend | None
+    state: RouteState
+    reason: str | None
+    attempts: list[BackendAttempt]
+
+
+class ExternalScope(TypedDict):
+    """One backend's own ``default|custom:<scan_name>`` scope, as stored.
+
+    Scopes are independent: a complete scan of one retires only that one's
+    rows, and the IDA store and every other scope of every other backend are
+    untouched by it. ``state`` and ``coverage`` are separate claims on
+    purpose — ``state`` says whether a backend ran these rules at all, and
+    ``coverage`` says how much of the image the run that did covered.
+    ``stale_total`` counts rows a later partial or failed scan did not
+    observe again and therefore kept rather than deleted.
+    """
+
+    backend: Backend
+    scope: str
+    scan_id: str | None
+    scanned_at: str | None
+    state: ScopeState
+    coverage: ScanCoverage | None
+    reason: str | None
+    capability_fingerprint: str | None
+    rule_coverage: list[RuleCoverage]
+    warnings: list[str]
+    total: int
+    stale_total: int
+
+
+
 class PreparationResult(TypedDict):
     """One preparation revision of one target, as ``vulfi_prepare`` reports it.
 
@@ -382,10 +530,18 @@ class PreparationResult(TypedDict):
 
     ``skipped_prerequisites`` describes *this call's* run and is empty when a
     revision was reused; what each pass found is in ``passes`` either way.
+
+    ``routing`` is one row per *requested* pass, naming every backend the
+    chain asked and what each one said. ``passes`` holds only the results
+    that were recorded, so a pass no backend could run is in ``routing`` and
+    not in ``passes`` — named, rather than left out as if it had run and
+    found nothing. ``idb_path`` is ``None`` when the chain never involved
+    IDA: a Ghidra-only preparation has no managed IDB, and naming one would
+    read as a database this call made.
     """
 
     path: str
-    idb_path: str
+    idb_path: str | None
     backend: Backend
     requested_backend: str
     analysis_id: str
@@ -404,6 +560,7 @@ class PreparationResult(TypedDict):
     applied_ids: list[str]
     applied_total: int
     skipped_prerequisites: list[SkippedPrerequisite]
+    routing: list[PassRouting]
     artifact_paths: dict[str, JsonValue]
     catalog_available: bool
     warnings: list[str]

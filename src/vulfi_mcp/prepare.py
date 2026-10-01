@@ -62,50 +62,92 @@ fallback to IDA is reported, because no fallback happens.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import shlex
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Final, TypedDict
+from typing import Any, Final, NamedTuple, TypedDict
 
 from vulfi_mcp.catalog import (
     CATALOG_UNAVAILABLE_REASON,
+    EXTERNAL_BACKENDS,
     Catalog,
     CatalogError,
+    UnknownAnalysisError,
+    UnverifiedAssociationError,
     get_catalog,
     open_catalog,
 )
 from vulfi_mcp.contracts import (
+    BackendAttempt,
     Candidate,
+    Finding,
+    FindingsPage,
     JsonValue,
+    PassRouting,
     PreparationPage,
     PreparationResult,
+    RuleCoverage,
+    RuleEvidence,
+    RuleRouting,
+    ScanResult,
+    TriageResult,
 )
 from vulfi_mcp.ida_adapter import (
     BACKEND,
     IDB_SUFFIXES,
+    NO_DATABASE_REASON,
+    MAX_SCAN_FINDINGS,
+    SYNC_STATE,
+    ManagedDatabaseError,
     ensure_managed_idb,
     existing_managed_idb,
+    findings_ida,
     invoke_ida,
+    scan_ida,
+    triage_ida,
+    unscanned_findings_page,
 )
 from vulfi_mcp.ida_runtime import (
     MAX_PREPARE_WARNINGS,
     PREPARE_LIMITS,
     PREPARE_PASSES,
+    PRIORITIES,
+    TRIAGE_STATUSES,
+    ExpressionError,
     OperationError,
+    UnavailableEvidenceError,
+    UnknownFindingError,
+    evaluate_rule,
+    utc_now,
     validate_analysis_id,
     validate_page,
     validate_prepare_limits,
     validate_prepare_passes,
+    validate_rationale,
+    validate_scope,
+    validate_status,
     proposal_payload,
     validate_proposal,
     validate_proposal_request,
 )
+from vulfi_mcp.providers import (
+    ProviderError,
+    ProviderIdentityError,
+    load_provider_config,
+    rule_contexts,
+)
+from vulfi_mcp.providers import ghidra as ghidra_provider
+from vulfi_mcp.providers import r2 as r2_provider
+from vulfi_mcp.rules import Rule, canonical_rule_digest
 
 __all__ = [
     "BACKENDS",
+    "BACKEND_CHAINS",
     "CATALOG_UNAVAILABLE_REASON",
-    "IMPLEMENTED_BACKENDS",
+    "EXTERNAL_BACKENDS",
     "LIMITS",
     "NOTHING_PREPARED_REASON",
     "NO_MANAGED_DATABASE_REASON",
@@ -115,14 +157,21 @@ __all__ = [
     "PreparationError",
     "ProposalResult",
     "ProposalSubmission",
+    "UnverifiedBinaryError",
+    "adapter_fingerprint",
+    "backend_chain",
     "check_proposal_against_candidate",
     "ensure_prepared",
+    "findings_across_backends",
     "mint_proposal_id",
     "prepare_target",
     "preparation_page",
     "propose_recovery",
     "resolve_backend",
+    "run_provider",
     "run_ida_passes",
+    "scan_target",
+    "triage_across_backends",
 ]
 
 #: The passes this build runs, in the order dependencies require. ``strings``
@@ -141,10 +190,42 @@ LIMITS: Final[dict[str, int]] = dict(PREPARE_LIMITS)
 #: Every backend selector the design names.
 BACKENDS: Final[tuple[str, ...]] = ("auto", "ida", "ghidra", "r2")
 
-#: The ones this build can honour. ``auto`` resolves to IDA because IDA is
-#: the only backend here; Plan 3 is what gives ``auto`` something to choose
-#: between.
-IMPLEMENTED_BACKENDS: Final[tuple[str, ...]] = ("auto", "ida")
+#: The chain each selector runs, in the order it runs it.
+#:
+#: ``auto`` is the design's own priority — IDA, then a configured Ghidra MCP,
+#: then a configured radare2 MCP — and it is a chain rather than a choice
+#: because the decision is made **per pass and per rule**, not per scan: IDA
+#: answers what it can, and only what IDA could not establish is asked of the
+#: next backend.
+#:
+#: Naming a backend explicitly runs exactly that backend and nothing else.
+#: There is no fallback out of an explicit choice, for the reason this
+#: project refuses every other quiet substitution: a result produced by IDA
+#: is not a Ghidra result, and a caller who asked for one would be handed the
+#: other with no way to tell.
+BACKEND_CHAINS: Final[dict[str, tuple[str, ...]]] = {
+    "auto": (BACKEND, "ghidra", "r2"),
+    "ida": (BACKEND,),
+    "ghidra": ("ghidra",),
+    "r2": ("r2",),
+}
+
+#: The adapter module each external backend is reached through, and the two
+#: entry points this module calls on it. Constant maps, so nothing a caller
+#: supplies can name a module or a function: a backend selector indexes
+#: these, and a selector outside them was refused long before here.
+_ADAPTERS: Final[dict[str, Any]] = {
+    "ghidra": ghidra_provider,
+    "r2": r2_provider,
+}
+_PREPARE: Final[dict[str, Any]] = {
+    "ghidra": ghidra_provider.prepare_ghidra,
+    "r2": r2_provider.prepare_r2,
+}
+_EVIDENCE_OF: Final[dict[str, Any]] = {
+    "ghidra": ghidra_provider.evidence_ghidra,
+    "r2": r2_provider.evidence_r2,
+}
 
 #: The worker operations this module sends.
 _RUN: Final = "prepare"
@@ -153,10 +234,14 @@ _RECORD: Final = "record_preparation"
 _EVIDENCE: Final = "proposal_evidence"
 
 #: Backends whose candidates this build can write a reviewed change back to.
-#: Plan 3 adds the external providers; until one of them can write safely, a
-#: proposal against its candidate is refused by name rather than applied
-#: against the IDA analysis as if that were the same thing.
-WRITABLE_BACKENDS: Final[tuple[str, ...]] = (BACKEND,)
+#: Ghidra joins IDA here because :func:`vulfi_mcp.providers.ghidra
+#: .apply_ghidra_review` validates the write against the managed project and
+#: saves it. radare2 deliberately does not: that provider has no project and
+#: no save, so a mutation would not outlive the session that made it, and a
+#: proposal against one of its candidates is refused by name rather than
+#: applied against some other backend's analysis as if that were the same
+#: thing.
+WRITABLE_BACKENDS: Final[tuple[str, ...]] = (BACKEND, "ghidra")
 
 #: The candidate kinds each proposed change may be made to. A name can be
 #: given to anything preparation found; the other four are changes to one
@@ -398,27 +483,36 @@ def prepare_target(
 
     ``passes=None`` runs all four in dependency order; a nonempty subset runs
     only those and reports the stages their missing prerequisites cost. An
-    empty list, a pass this build does not run and a backend it does not have
-    are all refused here, before a managed database or a catalog file can
-    exist because of them.
+    empty list, a pass this build does not run and a backend it does not
+    name are all refused here, before a managed database or a catalog file
+    can exist because of them.
+
+    The chain ``backend`` selects is walked **per pass**. Under ``auto`` IDA
+    runs first and answers what it can; each pass it could not establish is
+    then asked of a configured Ghidra MCP, and each pass still unanswered of
+    a configured radare2 MCP. A pass no backend could run is named in
+    ``routing`` with what every backend said about it, rather than left out
+    of the result as if it had run and found nothing.
 
     A recorded revision is reused — nothing runs, nothing is applied and the
     artifact revision does not move — only when the target's source identity,
     the managed artifact, the backend capability fingerprint and the recorded
     pass coverage all still match this request. The result says so in
-    ``reused``.
+    ``reused``. Only an IDA-headed chain can reuse: an external revision's
+    reusability would be a claim about a provider that is there *now*, and
+    nothing short of opening a session can make it.
     """
-    resolved = resolve_backend(backend)
+    chain = backend_chain(backend)
     requested_backend = str(backend)
     requested = _requested_passes(passes)
-    reused = _reuse(path, requested_backend, resolved, requested)
-    if reused is not None:
-        return reused
+    if chain[0] == BACKEND:
+        reused = _reuse(path, requested_backend, BACKEND, requested)
+        if reused is not None:
+            return reused
     # Only now may a database exist: no malformed request above this line can
     # be the reason one was created.
-    idb_path = ensure_managed_idb(path)
-    result = run_ida_passes(idb_path, requested)
-    return _record(path, idb_path, requested_backend, resolved, requested, result)
+    routed = _route_passes(path, chain, requested)
+    return _record(path, requested_backend, chain, requested, routed)
 
 
 def preparation_page(
@@ -431,15 +525,20 @@ def preparation_page(
 
     ``0 <= offset`` and ``1 <= limit <= 200``, enforced before the workspace
     is consulted. Nothing here analyzes, creates or writes: a target with no
-    managed database, a missing catalog and a database nothing has prepared
-    are each reported as an unavailable store with the reason, never as an
-    empty page.
+    recorded preparation at all, a missing catalog and a database nothing has
+    prepared are each reported as an unavailable store with the reason, never
+    as an empty page.
+
+    A target with no managed IDB is **not** automatically a target with no
+    preparation: a Ghidra- or radare2-headed chain records its passes in the
+    catalog and makes no IDA database at all. The managed record is consulted
+    when there is one, and the catalog answers either way.
     """
     offset, limit = validate_page(offset, limit)
     wanted = None if analysis_id is None else _analysis_argument(analysis_id)
     idb_path = existing_managed_idb(path)
     if idb_path is None:
-        return _unavailable(path, None, None, NO_MANAGED_DATABASE_REASON, offset, limit)
+        return _external_page(path, wanted, offset, limit)
     summary = _summary(idb_path)
     stored = summary["preparation"]
     revision = _revision(stored)
@@ -490,6 +589,52 @@ def preparation_page(
         }
 
 
+def _external_page(
+    path: str, wanted: str | None, offset: int, limit: int
+) -> PreparationPage:
+    """One window of a preparation that produced no managed IDA database.
+
+    This is the Ghidra- or radare2-headed chain's own read. There is no
+    managed record to consult and no artifact revision to report, so both are
+    reported as what they are rather than as zero. A target the catalog has
+    never heard of is still unavailable with the reason it always was.
+    """
+    catalog = get_catalog(path)
+    if catalog is None:
+        return _unavailable(
+            path, None, None, NO_MANAGED_DATABASE_REASON, offset, limit
+        )
+    with catalog:
+        chosen = wanted or catalog.latest_analysis()
+        if chosen is None:
+            return _unavailable(
+                path, None, None, NO_MANAGED_DATABASE_REASON, offset, limit
+            )
+        page = catalog.page_candidates(chosen, offset, limit)
+        recorded = catalog.pass_results(chosen)
+        backends = [str(entry["backend"]) for entry in recorded]
+        return {
+            "path": path,
+            "idb_path": None,
+            "backend": backends[0] if backends else BACKEND,
+            "available": True,
+            "reason": None,
+            "analysis_id": chosen,
+            "target_key": catalog.target_key,
+            "source_sha256": catalog.source_sha256,
+            "managed_idb_id": catalog.managed_idb_id,
+            "source_association": catalog.source_association,
+            "preparation_revision": None,
+            "offset": page["offset"],
+            "limit": page["limit"],
+            "total": page["total"],
+            "loaded": page["loaded"],
+            "candidates": _candidates(page["candidates"]),
+            "passes": recorded,
+            "warnings": _warnings(_pass_warnings(recorded)),
+        }
+
+
 def ensure_prepared(
     path: str, backend: str = "auto", analysis_id: str | None = None
 ) -> PreparationResult:
@@ -501,18 +646,33 @@ def ensure_prepared(
     preparing a different one under a name the caller supplied would report a
     revision nobody asked for, and silently ignoring the name would scan an
     analysis the caller did not choose.
+
+    Only an IDA-headed chain has a reusable revision at all — see
+    :func:`prepare_target` — so naming one against an external chain is
+    refused rather than answered with a revision that was made by something
+    else.
     """
-    resolved = resolve_backend(backend)
+    chain = backend_chain(backend)
     requested_backend = str(backend)
     if analysis_id is None:
         return prepare_target(path, backend=backend, passes=None)
     wanted = _analysis_argument(analysis_id)
-    reused = _reuse(path, requested_backend, resolved, _requested_passes(None))
+    reused = (
+        _reuse(path, requested_backend, BACKEND, _requested_passes(None))
+        if chain[0] == BACKEND
+        else None
+    )
     if reused is not None and reused["analysis_id"] == wanted:
         return reused
     held = "nothing matching this request has been prepared for this target"
     if reused is not None:
         held = f"the reusable revision recorded here is {reused['analysis_id']!r}"
+    elif chain[0] != BACKEND:
+        held = (
+            f"the {chain[0]} backend records no reusable revision: its"
+            " reusability would be a claim about a provider session that is"
+            " open now, and nothing short of opening one can make it"
+        )
     raise PreparationError(
         f"analysis_id={analysis_id!r} names no reusable preparation revision"
         f" of this target: {held}. A revision is reusable only for the same"
@@ -521,6 +681,968 @@ def ensure_prepared(
         " analysis_id to prepare the target, or call vulfi_prepare first."
         " Nothing was analyzed, nothing was created and nothing was scanned."
     )
+
+
+# --------------------------------------------------------------------------
+# Scanning across backends
+# --------------------------------------------------------------------------
+
+#: Address space of an external backend's findings.
+#:
+#: Deliberately *not* ``image``, which is the IDA store's own space. The
+#: design is explicit that numeric addresses from two backends never imply
+#: the same call site, and a shared space name is precisely what would make
+#: them look as if they did. Plan 4's reviewer-created link is what joins two
+#: spaces, after it has verified the mapping.
+def external_space(backend: str) -> str:
+    return f"{backend}:image"
+
+
+#: Why the IDA store did not answer a scan that never asked it.
+_IDA_NOT_IN_CHAIN: Final = (
+    "this request named an external backend, so the managed IDA database was"
+    " not opened and its rows were not counted; that is a store nothing"
+    " looked at, not a store with nothing in it"
+)
+
+
+class _RoutedRules(NamedTuple):
+    """What the chain made of every rule, and the rows it produced."""
+
+    routing: list[RuleRouting]
+    coverage: list[RuleCoverage]
+    findings: dict[str, list[Finding]]
+    scopes: dict[str, dict[str, Any]]
+    warnings: list[str]
+
+
+def scan_target(
+    path: str,
+    rules: tuple[Rule, ...],
+    scope: str,
+    *,
+    backend: str = "auto",
+    analysis_id: str | None = None,
+    decompiler: str = "auto",
+) -> ScanResult:
+    """Scan ``path`` with ``rules``, routing each rule across the chain.
+
+    The target is prepared first — reused when a recorded revision matches —
+    and then every rule is decided on its own. IDA evaluates the rules its
+    evidence supports. Each rule it reported ``unsupported`` or ``failed``,
+    and every rule at all when IDA is not in the chain, is then asked of a
+    configured Ghidra MCP and then of a configured radare2 MCP, and the first
+    backend that establishes *complete* facts for it is the one whose verdict
+    is stored. Partial facts are not a weaker verdict: they stay
+    ``unsupported``.
+
+    Every backend's rows live in that backend's own scope, so none of this
+    can touch another's. An external scope is retired only by a scan that
+    really ran, covered the whole image and was asked every rule in the scan;
+    anything less keeps the rows it did not observe and marks them stale.
+
+    ``decompiler`` is not an MCP parameter and never was. It exists so a test
+    can run the disassembly-only extraction IDA itself falls back to when
+    Hex-Rays is absent, against a real database, which is the condition this
+    whole plan is about.
+    """
+    chain = backend_chain(backend)
+    if not rules:
+        raise PreparationError("a scan needs at least one rule")
+    try:
+        scope = validate_scope(scope)
+    except OperationError as refused:
+        raise PreparationError(str(refused)) from refused
+    prepared = ensure_prepared(path, backend=backend, analysis_id=analysis_id)
+    idb_path = prepared["idb_path"]
+    if chain[0] == BACKEND and idb_path:
+        result = scan_ida(idb_path, rules, scope, path=path, decompiler=decompiler)
+    else:
+        result = _unscanned_ida(path, prepared, scope)
+    answered = {
+        int(entry["rule_index"]): entry
+        for entry in result["rule_coverage"]
+        if str(entry["backend"]) == BACKEND
+    }
+    routed = _route_rules(path, chain, rules, scope, answered, prepared)
+    result["analysis_id"] = prepared["analysis_id"]
+    result["preparation_revision"] = prepared["preparation_revision"]
+    result["warnings"] = [
+        *result["warnings"],
+        *prepared["warnings"],
+        *routed.warnings,
+    ]
+    return _merge_scan(path, result, routed, prepared, scope)
+
+
+def _unscanned_ida(
+    path: str, prepared: PreparationResult, scope: str
+) -> ScanResult:
+    """The shape a scan takes when IDA was never in the chain.
+
+    Zero IDA rows and the IDA store reported *unavailable with a reason*,
+    never as a store that answered nothing. A caller that asked for Ghidra
+    gets Ghidra's answer and an explicit statement that nobody looked in the
+    managed database, which is not the same as the managed database being
+    empty.
+    """
+    return {
+        "path": path,
+        "idb_path": prepared["idb_path"],
+        "binary_sha256": prepared["source_sha256"],
+        "analysis_id": prepared["analysis_id"],
+        "preparation_revision": prepared["preparation_revision"],
+        "backend": str(prepared["backend"]),
+        "scope": scope,
+        "scan_id": "",
+        "scanned_at": utc_now(),
+        "coverage": "partial",
+        "rule_coverage": [],
+        "findings": [],
+        "scope_total": 0,
+        "target_total": 0,
+        "target_total_complete": False,
+        "status_counts": {},
+        "scope_health": {},
+        "store_health": {
+            BACKEND: {"available": False, "reason": _IDA_NOT_IN_CHAIN}
+        },
+        "sync_state": SYNC_STATE,
+        "warnings": [_IDA_NOT_IN_CHAIN],
+    }
+
+
+def _route_rules(
+    path: str,
+    chain: tuple[str, ...],
+    rules: tuple[Rule, ...],
+    scope: str,
+    answered: dict[int, RuleCoverage],
+    prepared: PreparationResult,
+) -> _RoutedRules:
+    """Decide every rule separately, down the chain, and keep every answer.
+
+    A rule IDA evaluated is finished: no provider is asked about it, because
+    the first backend that can establish a rule's facts is the one whose
+    verdict stands. Everything else walks the rest of the chain, and what
+    each backend said is kept whether or not a later one answered — a clean
+    answer is reported *alongside* an earlier failure, never instead of it.
+    """
+    routing: list[RuleRouting] = []
+    coverage: list[RuleCoverage] = []
+    findings: dict[str, list[Finding]] = {}
+    asked: dict[str, list[int]] = {}
+    states: dict[str, dict[int, tuple[str, str | None]]] = {}
+    complete: dict[str, bool] = {}
+    reasons: dict[str, tuple[str, str]] = {}
+    warnings: list[str] = []
+    sha256 = prepared["source_sha256"]
+
+    for index, rule in enumerate(rules):
+        attempts: list[BackendAttempt] = []
+        held = answered.get(index)
+        if held is not None:
+            attempts.append(
+                _attempt(BACKEND, _outcome_of(str(held["state"])), held["reason"])
+            )
+            if str(held["state"]) == "evaluated":
+                routing.append(_rule_routing(index, rule, BACKEND, "answered", None, attempts))
+                continue
+        settled: tuple[str, str, str | None] | None = None
+        for backend in chain:
+            if backend == BACKEND:
+                continue
+            refusal = _identity_refusal(backend, path)
+            if refusal is not None:
+                attempts.append(_attempt(backend, "unverified", refusal))
+                reasons.setdefault(backend, ("unverified", refusal))
+                settled = ("unverified", backend, refusal)
+                break
+            outcome, evidence, reason = _rule_evidence(backend, path, rule, index)
+            attempts.append(_attempt(backend, outcome, reason))
+            if outcome in ("unavailable", "unverified", "failed"):
+                reasons.setdefault(backend, (outcome, reason or ""))
+                if outcome == "unverified":
+                    settled = ("unverified", backend, reason)
+                    break
+                continue
+            asked.setdefault(backend, []).append(index)
+            if evidence is None:  # pragma: no cover - outcome implies evidence
+                continue
+            if outcome != "answered":
+                states.setdefault(backend, {})[index] = ("unsupported", reason)
+                complete[backend] = False
+                continue
+            rows, state, why = _evidence_findings(
+                backend, scope, rule, index, evidence, sha256
+            )
+            states.setdefault(backend, {})[index] = (state, why)
+            if state != "evaluated":
+                complete[backend] = False
+                attempts[-1] = _attempt(backend, _outcome_of(state), why)
+                continue
+            if not _ranges_complete(evidence):
+                complete[backend] = False
+            findings.setdefault(backend, []).extend(rows)
+            settled = ("answered", backend, None)
+            break
+        if settled is None:
+            state = _chain_state([item["outcome"] for item in attempts])
+            routing.append(
+                _rule_routing(index, rule, None, state, _joined(attempts), attempts)
+            )
+        else:
+            kind, backend, reason = settled
+            routing.append(
+                _rule_routing(
+                    index,
+                    rule,
+                    backend if kind == "answered" else None,
+                    kind,
+                    reason,
+                    attempts,
+                )
+            )
+        for attempt in attempts:
+            if attempt["outcome"] == "failed":
+                warnings.append(
+                    f"the {attempt['backend']} backend failed on rule"
+                    f" {index} ({rule['name']!r}): {attempt['reason']}"
+                )
+
+    for backend, table in states.items():
+        for index, (state, reason) in sorted(table.items()):
+            coverage.append(
+                {
+                    "rule_index": index,
+                    "backend": backend,
+                    "state": state,
+                    "reason": reason,
+                }
+            )
+    scopes = {
+        backend: _external_scope_report(
+            backend,
+            rules,
+            asked.get(backend, []),
+            states.get(backend, {}),
+            complete.get(backend, True),
+            reasons.get(backend),
+        )
+        for backend in {*asked, *reasons}
+    }
+    return _RoutedRules(routing, coverage, findings, scopes, warnings)
+
+
+def _rule_evidence(
+    backend: str, path: str, rule: Rule, index: int
+) -> tuple[str, RuleEvidence | None, str | None]:
+    """Ask one backend about one rule, in the five-outcome vocabulary."""
+    unavailable = _unavailable_error(backend)
+    try:
+        evidence = run_provider(_EVIDENCE_OF[backend](path, rule, index))
+    except ProviderIdentityError as refused:
+        return "unverified", None, str(refused)
+    except unavailable as refused:
+        return "unavailable", None, str(refused)
+    except ProviderError as refused:
+        return "failed", None, str(refused)
+    state = str(evidence["state"])
+    if state == "evaluated":
+        return "answered", evidence, None
+    return _outcome_of(state), evidence, evidence["reason"]
+
+
+def _outcome_of(state: str) -> str:
+    """One ``RuleState`` in the routing vocabulary."""
+    return "answered" if state == "evaluated" else state
+
+
+def _chain_state(outcomes: list[str]) -> str:
+    for candidate in ("failed", "unsupported", "unavailable", "unverified"):
+        if candidate in outcomes:
+            return candidate
+    return "unavailable"
+
+
+def _joined(attempts: list[BackendAttempt]) -> str:
+    return "; ".join(
+        f"{item['backend']}: {item['outcome']}"
+        + (f" ({item['reason']})" if item["reason"] else "")
+        for item in attempts
+    ) or (
+        "no backend in this chain was asked about this rule, which is not the"
+        " same as a rule that ran and matched nothing"
+    )
+
+
+def _rule_routing(
+    index: int,
+    rule: Rule,
+    backend: str | None,
+    state: str,
+    reason: str | None,
+    attempts: list[BackendAttempt],
+) -> RuleRouting:
+    return {
+        "rule_index": index,
+        "rule_name": rule["name"],
+        "backend": backend,
+        "state": state,
+        "reason": reason,
+        "attempts": attempts,
+    }
+
+
+def _ranges_complete(evidence: RuleEvidence) -> bool:
+    """Whether this evidence was established over every address it names."""
+    return all(
+        str(item.get("coverage")) == "complete"
+        for item in _entries(evidence.get("ranges"))
+    )
+
+
+def _evidence_findings(
+    backend: str,
+    scope: str,
+    rule: Rule,
+    index: int,
+    evidence: RuleEvidence,
+    sha256: str | None,
+) -> tuple[list[Finding], str, str | None]:
+    """Turn one backend's established facts into this rule's stored rows.
+
+    :func:`vulfi_mcp.ida_runtime.evaluate_rule` is the only thing that decides
+    a priority, here as on the IDA path, so a second backend cannot reach a
+    different conclusion from the same facts. A context that still cannot
+    answer — the adapter probed, and the evaluator wants a fact nothing
+    states — makes the whole rule ``unsupported`` on this backend rather than
+    a weaker verdict over the sites that could answer.
+
+    The call site each context describes is read out of the evidence's own
+    ranges: the adapters append one readable range per context, in context
+    order, and name the containing function on it. If those two do not line
+    up, this refuses rather than pairing a verdict with an address it cannot
+    show belongs to it.
+    """
+    try:
+        contexts = rule_contexts(evidence)
+    except ProviderError as refused:
+        return [], "failed", str(refused)
+    if not contexts:
+        return [], "evaluated", None
+    sites = [
+        item
+        for item in _entries(evidence.get("ranges"))
+        if str(item.get("coverage")) != "unavailable"
+    ]
+    if len(sites) != len(contexts):
+        return (
+            [],
+            "failed",
+            f"the {backend} backend returned {len(contexts)} call-site"
+            f" contexts over {len(sites)} readable ranges, so no verdict here"
+            " can be shown to belong to the address it would be stored at",
+        )
+    digest = canonical_rule_digest(rule)
+    space = external_space(backend)
+    names = sorted(rule["function_names"])
+    rows: list[Finding] = []
+    occurrences: dict[int, int] = {}
+    for context, site in zip(contexts, sites, strict=True):
+        try:
+            priority = evaluate_rule(rule, context)
+        except UnavailableEvidenceError as missing:
+            return [], "unsupported", str(missing)
+        except ExpressionError as broken:
+            return [], "failed", str(broken)
+        if priority is None:
+            continue
+        address = int(site["start"])
+        occurrence = occurrences.get(address, 0)
+        occurrences[address] = occurrence + 1
+        branch = priority if priority in PRIORITIES else None
+        rows.append(
+            {
+                "id": (
+                    f"{backend}:{scope}:{index}:{digest}"
+                    f":{space}:0x{address:x}:{occurrence}"
+                ),
+                "backend": backend,
+                "source": scope,
+                "binary_sha256": sha256,
+                "rule_index": index,
+                "rule_digest": digest,
+                "rule_name": rule["name"],
+                # Which of the rule's names this site called is a fact this
+                # backend's evidence does not state, and one name out of
+                # several would be a guess. It is given only where the rule
+                # leaves no room for one.
+                "function_name": names[0] if len(names) == 1 else "",
+                "found_in": str(site.get("name") or ""),
+                "address_space": space,
+                "address": f"0x{address:x}",
+                "relative_address": None,
+                "occurrence": occurrence,
+                "priority": priority,
+                "status": "Not Checked",
+                "rationale": "",
+                "assessed_at": None,
+                "triage_revision": 0,
+                "link_id": None,
+                "link_revision": None,
+                "last_seen_scan_id": "",
+                "stale": False,
+                "evidence": {
+                    "matched_branch": branch,
+                    "expression": rule["mark_if"][branch] if branch else None,
+                    "rule_function_names": names,
+                    "matched_name": names[0] if len(names) == 1 else None,
+                    "site_coverage": site.get("coverage"),
+                    "site_reason": site.get("reason"),
+                    "facts": evidence["contexts"][len(rows)]
+                    if len(rows) < len(evidence["contexts"])
+                    else None,
+                },
+            }
+        )
+    return rows, "evaluated", None
+
+
+def _external_scope_report(
+    backend: str,
+    rules: tuple[Rule, ...],
+    asked: list[int],
+    states: dict[int, tuple[str, str | None]],
+    ranges_complete: bool,
+    refusal: tuple[str, str] | None,
+) -> dict[str, Any]:
+    """What this backend's scope will record about the scan that just ran.
+
+    ``coverage`` is ``complete`` under three conditions together, and all
+    three are load-bearing because ``complete`` is the only thing that may
+    retire a stored row: this backend was asked **every** rule in the scan,
+    it evaluated every one of them, and each answer was established over
+    ranges it read in full. A backend asked only the rules an earlier one
+    could not answer has not looked at the others, so it may not retire their
+    rows.
+    """
+    if not asked:
+        outcome, reason = refusal or (
+            "unavailable",
+            f"the {backend} backend was never asked about any rule in this"
+            " scan",
+        )
+        return {
+            "state": "unverified" if outcome == "unverified" else outcome,
+            "coverage": None,
+            "reason": reason,
+            "rule_coverage": [],
+        }
+    evaluated = [
+        index for index in asked if states.get(index, ("", None))[0] == "evaluated"
+    ]
+    whole = len(asked) == len(rules) and len(evaluated) == len(rules)
+    return {
+        "state": "evaluated",
+        "coverage": "complete" if whole and ranges_complete else "partial",
+        "reason": None
+        if whole and ranges_complete
+        else _scope_reason(backend, rules, asked, states, ranges_complete),
+        "rule_coverage": [
+            {
+                "rule_index": index,
+                "backend": backend,
+                "state": states[index][0],
+                "reason": states[index][1],
+            }
+            for index in sorted(states)
+        ],
+    }
+
+
+def _scope_reason(
+    backend: str,
+    rules: tuple[Rule, ...],
+    asked: list[int],
+    states: dict[int, tuple[str, str | None]],
+    ranges_complete: bool,
+) -> str:
+    notes: list[str] = []
+    if len(asked) != len(rules):
+        notes.append(
+            f"{len(rules) - len(asked)} of this scan's {len(rules)} rules were"
+            f" answered before the {backend} backend was reached, so it did"
+            " not look at them and may not retire their rows"
+        )
+    unresolved = [
+        index for index, (state, _) in states.items() if state != "evaluated"
+    ]
+    if unresolved:
+        notes.append(
+            f"{len(unresolved)} rule(s) came back unsupported or failed on"
+            f" this backend: {sorted(unresolved)}"
+        )
+    if not ranges_complete:
+        notes.append(
+            "at least one rule was established over addresses this backend"
+            " could not read in full"
+        )
+    return "; ".join(notes)
+
+
+# --------------------------------------------------------------------------
+# Storing an external scope, and reporting both stores together
+# --------------------------------------------------------------------------
+
+
+def _merge_scan(
+    path: str,
+    result: ScanResult,
+    routed: _RoutedRules,
+    prepared: PreparationResult,
+    scope: str,
+) -> ScanResult:
+    """Commit each external scope, then report both stores as one answer."""
+    scan_id = result["scan_id"] or utc_now()
+    stored: dict[str, dict[str, Any]] = {}
+    counts: dict[str, dict[str, int]] = {}
+    totals: dict[str, Any] = {"by_backend": {}, "total": 0, "stale": 0}
+    scopes: list[dict[str, object]] = []
+    rows: list[Finding] = []
+    catalog_reason: str | None = None
+    try:
+        catalog = open_catalog(path, prepared["managed_idb_id"])
+    except (CatalogError, OSError) as refused:
+        catalog = None
+        catalog_reason = str(refused)
+    if catalog is not None:
+        with catalog:
+            for backend, report in sorted(routed.scopes.items()):
+                try:
+                    stored[backend] = catalog.record_external_scan(
+                        backend=backend,
+                        scope=scope,
+                        scan_id=scan_id,
+                        scanned_at=result["scanned_at"],
+                        state=str(report["state"]),
+                        coverage=report["coverage"],
+                        reason=report["reason"],
+                        capability_fingerprint=adapter_fingerprint(backend),
+                        rules=[],
+                        rule_coverage=report["rule_coverage"],
+                        warnings=[],
+                        findings=[
+                            {**row, "last_seen_scan_id": scan_id}
+                            for row in routed.findings.get(backend, [])
+                        ],
+                    )
+                except UnverifiedAssociationError as refused:
+                    # Rows that cannot be filed under the original binary's
+                    # digest are not filed somewhere else; the scan says so.
+                    routed.warnings.append(str(refused))
+            counts = catalog.external_status_counts()
+            totals = catalog.external_totals()
+            scopes = catalog.external_scopes()
+            rows = [
+                row
+                for row in catalog.page_external_findings(0, MAX_SCAN_FINDINGS)[
+                    "findings"
+                ]
+                if str(row["source"]) == scope
+            ]
+    for backend, report in sorted(routed.scopes.items()):
+        result["scope_health"][backend] = {
+            "state": report["state"],
+            "coverage": report["coverage"],
+            "reason": report["reason"],
+            "observed_findings": len(routed.findings.get(backend, [])),
+            "stored": stored.get(backend, {}).get("scope"),
+            "retired": stored.get(backend, {}).get("retired", []),
+            "stale": stored.get(backend, {}).get("stale", []),
+        }
+    result["scope_health"]["routing"] = routed.routing
+    result["rule_coverage"] = [*result["rule_coverage"], *routed.coverage]
+    result["findings"] = [*result["findings"], *rows][:MAX_SCAN_FINDINGS]
+    result["scope_total"] = int(result["scope_total"]) + sum(
+        int(entry["total"])
+        for entry in scopes
+        if str(entry["scope"]) == scope
+    )
+    result["target_total"] = int(result["target_total"]) + int(totals["total"])
+    ida_available = bool(
+        _mapping(result["store_health"].get(BACKEND)).get("available")
+    )
+    result["target_total_complete"] = ida_available and catalog is not None
+    result["status_counts"] = _merged_counts(result["status_counts"], counts)
+    result["store_health"]["catalog"] = _catalog_health(
+        catalog_reason, totals, scopes
+    )
+    if not _routing_clean(routed.routing):
+        result["coverage"] = "partial"
+    result["warnings"] = _warnings([*result["warnings"], *routed.warnings])
+    return result
+
+
+def _routing_clean(routing: list[RuleRouting]) -> bool:
+    """Whether every rule was answered and nothing failed on the way.
+
+    A failure anywhere in a rule's attempts keeps the scan ``partial`` even
+    when a later backend answered that rule. The answer is reported, and so
+    is the failure; what may not happen is the scan calling itself complete
+    over a backend that could not finish.
+    """
+    return all(
+        row["state"] == "answered"
+        and all(item["outcome"] != "failed" for item in row["attempts"])
+        for row in routing
+    )
+
+
+def _merged_counts(
+    stored: dict[str, dict[str, int]], external: dict[str, dict[str, int]]
+) -> dict[str, dict[str, int]]:
+    """Triage counts per backend plus an aggregate over all of them.
+
+    The aggregate counts *findings*, not deduplicated vulnerabilities: a
+    reviewer-linked pair contributes two rows, exactly as the design says it
+    must.
+
+    No backend answered means no counts at all, not an aggregate of zeroes.
+    An empty mapping says "nothing to count these from"; a table of zeroes
+    says "every store answered and held nothing", and only one of those is
+    true of a target with no store.
+    """
+    merged = {
+        name: dict(table) for name, table in stored.items() if name != "aggregate"
+    }
+    for name, table in external.items():
+        merged[name] = dict(table)
+    if not merged:
+        return {}
+    aggregate = {status: 0 for status in TRIAGE_STATUSES}
+    for table in merged.values():
+        for status, count in table.items():
+            aggregate[status] = aggregate.get(status, 0) + int(count)
+    merged["aggregate"] = aggregate
+    return merged
+
+
+def _catalog_health(
+    reason: str | None, totals: dict[str, Any], scopes: list[dict[str, object]]
+) -> dict[str, object]:
+    """Whether the external store answered, and what it holds if it did."""
+    if reason is not None:
+        return {"available": False, "reason": reason}
+    return {
+        "available": True,
+        "total": totals["total"],
+        "stale_total": totals["stale"],
+        "by_backend": totals["by_backend"],
+        "scopes": scopes,
+    }
+
+
+def _mapping(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+# --------------------------------------------------------------------------
+# Reading and assessing rows across both stores
+# --------------------------------------------------------------------------
+
+
+def findings_across_backends(
+    path: str,
+    binary_path: str | None = None,
+    offset: int = 0,
+    limit: int = 100,
+) -> FindingsPage:
+    """One page of stored rows across every backend, without rescanning.
+
+    Rows from the managed IDB and rows from the catalog are ordered together
+    by verified address space, then location, then finding id — and the two
+    never share an address space, so a reader is never shown two backends'
+    addresses as if they were the same place.
+
+    Aggregation happens only when source identity really verifies.
+    ``binary_path`` is how an IDB-only target supplies the original bytes, and
+    it is *proved* against the digest the database itself records rather than
+    accepted on a matching name. An unrelated binary is refused outright: the
+    IDA rows are still readable, but the two stores are not joined, because a
+    join on anything less is how one image's findings end up reported against
+    another's.
+    """
+    offset, limit = validate_page(offset, limit)
+    idb_path = existing_managed_idb(path)
+    catalog, reason = _verified_catalog(path, binary_path)
+    if idb_path is None:
+        ida_page = unscanned_findings_page(path, 0, limit)
+        ida_rows: list[Finding] = []
+        ida_total = 0
+    else:
+        ida_page = findings_ida(idb_path, 0, 1, path=path)
+        ida_rows = _ida_rows(idb_path, offset + limit)
+        ida_total = int(ida_page["target_total"])
+    rows: list[Finding] = []
+    external_total = 0
+    stale = 0
+    counts: dict[str, dict[str, int]] = {}
+    health: dict[str, object] = {"available": False, "reason": reason}
+    if catalog is not None:
+        with catalog:
+            rows = _external_rows(catalog, offset + limit)
+            totals = catalog.external_totals()
+            external_total = int(totals["total"])
+            stale = int(totals["stale"])
+            counts = catalog.external_status_counts()
+            health = _catalog_health(None, totals, catalog.external_scopes())
+    merged = sorted(ida_rows + rows, key=_row_order)
+    page = merged[offset : offset + limit]
+    store_health = dict(ida_page["store_health"])
+    store_health["catalog"] = health
+    return {
+        "path": path,
+        "idb_path": idb_path or "",
+        "offset": offset,
+        "limit": limit,
+        "findings": page,
+        "page_total": len(page),
+        "target_total": ida_total + external_total,
+        "target_total_complete": idb_path is not None and catalog is not None,
+        "stale_total": int(ida_page["stale_total"]) + stale,
+        "status_counts": _merged_counts(ida_page["status_counts"], counts),
+        "store_health": store_health,
+        "sync_state": SYNC_STATE,
+        "warnings": _warnings(
+            [*ida_page["warnings"], *([reason] if reason is not None else [])]
+        ),
+    }
+
+
+def _row_order(row: Finding) -> tuple[str, int, str]:
+    """Verified address space, then location, then id. Total and stable."""
+    address = str(row.get("address") or "")
+    try:
+        location = int(address, 16 if address.lower().startswith("0x") else 10)
+    except ValueError:
+        location = -1
+    return str(row.get("address_space") or ""), location, str(row.get("id") or "")
+
+
+def _ida_rows(idb_path: str, needed: int) -> list[Finding]:
+    """Up to ``needed`` stored IDA rows, in the record's own order."""
+    rows: list[Finding] = []
+    while len(rows) < needed:
+        window = invoke_ida(
+            idb_path,
+            "findings_page",
+            {"offset": len(rows), "limit": min(200, needed - len(rows))},
+        )
+        page = [item for item in _entries(window.get("findings"))]
+        rows.extend(page)
+        if not page:
+            break
+    return rows
+
+
+def _external_rows(catalog: Catalog, needed: int) -> list[Finding]:
+    rows: list[Finding] = []
+    while len(rows) < needed:
+        window = catalog.page_external_findings(
+            len(rows), min(200, needed - len(rows))
+        )
+        page = [item for item in _entries(window.get("findings"))]
+        rows.extend(page)
+        if not page:
+            break
+    return rows
+
+
+def triage_across_backends(
+    path: str,
+    finding_id: str,
+    status: str,
+    rationale: str,
+    binary_path: str | None = None,
+) -> TriageResult:
+    """Assess one stored row, in whichever store authored it.
+
+    The row's own authority and nothing else. An IDA row is committed to the
+    managed database's record; an external row is committed to the catalog;
+    neither is copied into the other, because this build creates no links and
+    a copy without one would be a second answer to the same question.
+    """
+    if not isinstance(finding_id, str) or not finding_id:
+        raise PreparationError("finding_id must be a non-empty string")
+    try:
+        status = validate_status(status)
+        rationale = validate_rationale(rationale)
+    except OperationError as refused:
+        raise PreparationError(str(refused)) from refused
+    backend = finding_id.split(":", 1)[0]
+    if backend not in EXTERNAL_BACKENDS:
+        idb_path = existing_managed_idb(path)
+        if idb_path is None:
+            raise UnknownFindingError(
+                f"no stored finding carries the id {finding_id!r}:"
+                f" {NO_DATABASE_REASON}. Nothing was written"
+            )
+        result = triage_ida(idb_path, finding_id, status, rationale, path=path)
+        return _completed_triage(path, binary_path, result)
+    catalog, reason = _verified_catalog(path, binary_path, writable=True)
+    if catalog is None:
+        raise UnknownFindingError(
+            f"the id {finding_id!r} names a {backend} row, and this target's"
+            f" external store cannot be reached: {reason}. Nothing was written"
+        )
+    with catalog:
+        stored = catalog.assess_external_finding(finding_id, status, rationale)
+        totals = catalog.external_totals()
+        counts = catalog.external_status_counts()
+        health = _catalog_health(None, totals, catalog.external_scopes())
+    idb_path = existing_managed_idb(path)
+    ida_total = 0
+    ida_counts: dict[str, dict[str, int]] = {}
+    store_health: dict[str, JsonValue] = {
+        BACKEND: {
+            "available": False,
+            "reason": "this target has no managed IDA database",
+        }
+    }
+    if idb_path is not None:
+        page = findings_ida(idb_path, 0, 1, path=path)
+        ida_total = int(page["target_total"])
+        ida_counts = page["status_counts"]
+        store_health = dict(page["store_health"])
+    store_health["catalog"] = health
+    return {
+        "path": path,
+        "idb_path": idb_path or "",
+        "finding": stored,
+        "triage_revision": int(stored["triage_revision"]),
+        "target_total": ida_total + int(totals["total"]),
+        "target_total_complete": idb_path is not None,
+        "status_counts": _merged_counts(ida_counts, counts),
+        "store_health": store_health,
+        "sync_state": SYNC_STATE,
+        "warnings": [],
+    }
+
+
+def _completed_triage(
+    path: str, binary_path: str | None, result: TriageResult
+) -> TriageResult:
+    """One IDA assessment, with the external store's own counts beside it."""
+    catalog, reason = _verified_catalog(path, binary_path)
+    if catalog is None:
+        result["store_health"] = {
+            **result["store_health"],
+            "catalog": {"available": False, "reason": reason},
+        }
+        return result
+    with catalog:
+        totals = catalog.external_totals()
+        counts = catalog.external_status_counts()
+        health = _catalog_health(None, totals, catalog.external_scopes())
+    result["target_total"] = int(result["target_total"]) + int(totals["total"])
+    result["target_total_complete"] = True
+    result["status_counts"] = _merged_counts(result["status_counts"], counts)
+    result["store_health"] = {**result["store_health"], "catalog": health}
+    return result
+
+
+def _verified_catalog(
+    path: str, binary_path: str | None, *, writable: bool = False
+) -> tuple[Catalog | None, str | None]:
+    """This target's catalog, but only when its source identity verifies.
+
+    External rows belong to the original binary's SHA-256 namespace, so they
+    may only be joined to a target whose bytes this process has really
+    hashed. That is automatic when ``path`` *is* the binary. When ``path`` is
+    a database, ``binary_path`` supplies the bytes and they are checked
+    against the input digest the database itself records — never against a
+    matching file name, and never on a caller's say-so.
+
+    A refusal returns ``(None, reason)`` rather than raising, so a read still
+    answers with the rows it really has and says which store it could not
+    join. The one exception is a supplied binary that is simply the wrong
+    binary: that is a caller error and is raised, because quietly answering
+    about a different image is the failure this whole check exists to stop.
+    """
+    idb_path = existing_managed_idb(path)
+    is_database = Path(path).suffix.lower() in IDB_SUFFIXES
+    managed_idb_id: str | None = None
+    recorded_sha: str | None = None
+    if idb_path is not None:
+        summary = _summary(idb_path)
+        managed_idb_id = _text(summary.get("managed_idb_id"))
+        recorded_sha = _text(summary.get("input_sha256"))
+    if binary_path is not None:
+        source = Path(binary_path).expanduser()
+        if not source.is_file():
+            raise UnverifiedBinaryError(
+                f"binary_path={binary_path!r} is not a file, so it cannot"
+                " identify this target's original bytes. Nothing was joined"
+            )
+        supplied = _digest(source.resolve())
+        if recorded_sha is not None and supplied != recorded_sha:
+            raise UnverifiedBinaryError(
+                f"binary_path={binary_path!r} hashes to {supplied}, and this"
+                f" target's managed database was built from {recorded_sha}."
+                " These are different images, so their stores were not joined"
+                " and nothing was read from the other one."
+            )
+        if not is_database and _digest(Path(path).expanduser().resolve()) != supplied:
+            raise UnverifiedBinaryError(
+                f"binary_path={binary_path!r} hashes to {supplied}, which is"
+                f" not the file named by path={path!r}. One request names one"
+                " image; nothing was joined."
+            )
+    catalog = get_catalog(path, managed_idb_id)
+    if catalog is None:
+        return None, CATALOG_UNAVAILABLE_REASON
+    established = catalog.source_sha256 is not None
+    catalog.close()
+    if not established:
+        if binary_path is None:
+            return None, (
+                f"{path} is a database, and this target's original bytes are"
+                " not established, so its external scopes cannot be"
+                " identified: an external row belongs to the original"
+                " binary's SHA-256 namespace. Supply binary_path to join"
+                " them."
+            )
+        if recorded_sha is None:
+            raise UnverifiedBinaryError(
+                f"this target's managed database records no input digest, so"
+                f" binary_path={binary_path!r} cannot be checked against the"
+                " bytes it was built from. The two stores were not joined."
+            )
+        # Proving the association is a write, and it is made only because a
+        # caller explicitly asked to join the two stores. A read that was
+        # never asked to join anything never reaches here and never creates
+        # a thing.
+        try:
+            with open_catalog(path, managed_idb_id) as writer:
+                writer.attach_source(
+                    str(Path(binary_path).expanduser().resolve()),
+                    {"kind": "input_fingerprint", "sha256": recorded_sha},
+                )
+        except CatalogError as refused:
+            raise UnverifiedBinaryError(
+                f"binary_path={binary_path!r} could not be shown to be this"
+                f" target's original bytes: {refused}. The two stores were not"
+                " joined and nothing was read from the external one."
+            ) from refused
+    opener = open_catalog if writable else get_catalog
+    try:
+        joined = opener(path, managed_idb_id)
+    except CatalogError as refused:
+        return None, str(refused)
+    if joined is None:  # pragma: no cover - it answered a moment ago
+        return None, CATALOG_UNAVAILABLE_REASON
+    return joined, None
 
 
 # --------------------------------------------------------------------------
@@ -550,52 +1672,78 @@ def propose_recovery(
     Raises :class:`PreparationError` when the request itself cannot be
     answered: a target nothing has prepared, a catalog that is not there, or
     a revision this target does not hold. None of those creates anything.
+
+    A proposal about a candidate an external backend recovered is not
+    answered from the IDA database — that candidate's address is in the
+    provider's space, and refusing it because *IDA* already defines something
+    there would be a cross-backend conflation this project does not make. It
+    is checked against the candidate the catalog holds, stored against that
+    backend's own artifact revision, and revalidated by that backend's own
+    writer at the moment an operator approves it.
     """
     wanted = _analysis_argument(analysis_id)
     requested = _proposal_request(proposals)
     # A read of an existing analysis, so it resolves the managed database and
     # never makes one: only vulfi_scan and vulfi_prepare may do that.
     idb_path = existing_managed_idb(path)
-    if idb_path is None:
-        raise PreparationError(
-            f"nothing can be proposed for {path!r}: {NO_MANAGED_DATABASE_REASON}."
-            " Nothing was analyzed, created or stored"
-        )
     checked = [_checked_proposal(item) for item in requested]
     accepted = [body for body, _ in checked if body is not None]
-    # One lease, read-only: the current state of every proposed range, and
-    # the managed record's own summary, from the one operation that reports
-    # both. A submission never costs a save.
-    observed = invoke_ida(
-        idb_path,
-        _EVIDENCE,
-        {"proposals": [proposal_payload(body) for body in accepted]},
-    )
-    sites = _sites(observed, accepted)
-    revision = _revision(_preparation(observed))
-    managed_idb_id = _text(observed.get("managed_idb_id"))
-    probe = get_catalog(path, managed_idb_id)
+    probe = get_catalog(path, _managed_identity(idb_path, path))
     if probe is None:
         raise PreparationError(
             f"nothing can be proposed for {path!r}: {CATALOG_UNAVAILABLE_REASON}"
         )
-    probe.close()
-    with open_catalog(path, managed_idb_id) as catalog:
-        if catalog.analysis(wanted) is None:
+    with probe:
+        if probe.analysis(wanted) is None:
             raise PreparationError(
                 f"analysis_id={analysis_id!r} names no preparation revision of"
                 " this target, so there are no candidates to propose anything"
                 " about. Call vulfi_preparation to see the revision this"
                 " target holds. Nothing was stored"
             )
+        owners = {
+            body["candidate_id"]: _candidate_backend(probe, wanted, body)
+            for body in accepted
+        }
+        revisions = {
+            str(entry["backend"]): int(entry["artifact_revision"] or 0)
+            for entry in probe.pass_results(wanted)
+        }
+    mine = [body for body in accepted if owners[body["candidate_id"]] == BACKEND]
+    if mine and idb_path is None:
+        raise PreparationError(
+            f"nothing can be proposed for {path!r}: {NO_MANAGED_DATABASE_REASON}."
+            " Nothing was analyzed, created or stored"
+        )
+    sites: list[dict[str, Any]] = []
+    managed_idb_id: str | None = None
+    if idb_path is not None:
+        # One lease, read-only: the current state of every proposed IDA range,
+        # and the managed record's own summary, from the one operation that
+        # reports both. A submission never costs a save.
+        observed = invoke_ida(
+            idb_path,
+            _EVIDENCE,
+            {"proposals": [proposal_payload(body) for body in mine]},
+        )
+        sites = _sites(observed, mine)
+        revisions[BACKEND] = _revision(_preparation(observed))
+        managed_idb_id = _text(observed.get("managed_idb_id"))
+    sites.extend(
+        _external_site(owners[body["candidate_id"]], body)
+        for body in accepted
+        if owners[body["candidate_id"]] != BACKEND
+    )
+    revision = revisions.get(BACKEND, 0)
+    with open_catalog(path, managed_idb_id) as catalog:
         taken: set[int] = set()
         submissions = [
-            _submit(catalog, wanted, index, body, refusal, sites, taken, revision)
+            _submit(catalog, wanted, index, body, refusal, sites, taken, revisions)
             for index, (body, refusal) in enumerate(checked)
         ]
         report: ProposalResult = {
             "path": path,
-            "idb_path": idb_path,
+            "idb_path": idb_path or "",
             "backend": BACKEND,
             "analysis_id": wanted,
             "target_key": catalog.target_key,
@@ -615,6 +1763,49 @@ def propose_recovery(
             ],
         }
     return report
+
+
+def _managed_identity(idb_path: str | None, path: str) -> str | None:
+    """The provisional netnode identity, when the target needs one."""
+    if idb_path is None or Path(path).suffix.lower() not in IDB_SUFFIXES:
+        return None
+    return _text(invoke_ida(idb_path, _SUMMARY, {}).get("managed_idb_id"))
+
+
+def _candidate_backend(
+    catalog: Catalog, analysis_id: str, body: dict[str, Any]
+) -> str:
+    """Which backend recovered the candidate one proposal names.
+
+    A candidate the catalog does not hold answers ``ida``, so the refusal is
+    the one :func:`_submit` already writes — "no candidate is recorded under
+    this analysis" — rather than a second wording of it here.
+    """
+    candidate = catalog.candidate(analysis_id, body["candidate_id"])
+    if candidate is None:
+        return BACKEND
+    return str(candidate.get("backend") or BACKEND)
+
+
+def _external_site(backend: str, body: dict[str, Any]) -> dict[str, Any]:
+    """The site report for a range the managed IDA database does not own.
+
+    It carries no refusal, and that is the honest shape: this server has not
+    read the provider's artifact here, so it has nothing to refuse the
+    proposal *with*. What checks the range is the provider's own writer, at
+    the moment the operator approves — and it refuses there.
+    """
+    return {
+        "candidate_id": body["candidate_id"],
+        "kind": body["kind"],
+        "start": body["start"],
+        "end": body["end"],
+        "effect": (
+            f"{body['kind']} over {body['start']:#x}..{body['end']:#x} in the"
+            f" managed {backend} project"
+        ),
+        "refusal": None,
+    }
 
 
 def check_proposal_against_candidate(
@@ -746,9 +1937,17 @@ def _submit(
     refusal: str | None,
     sites: list[dict[str, Any]],
     taken: set[int],
-    revision: int,
+    revisions: dict[str, int],
 ) -> ProposalSubmission:
-    """Store one accepted proposal, or report why this one is not stored."""
+    """Store one accepted proposal, or report why this one is not stored.
+
+    ``revisions`` holds one artifact revision per backend, and the one this
+    proposal is recorded against is the one belonging to the backend that
+    recovered its candidate. An approval is compared against that artifact's
+    revision and no other: a Ghidra proposal is not made stale by the managed
+    IDA database moving on, and an IDA proposal is not made stale by Ghidra's
+    project moving on.
+    """
     if body is None:
         return _refused(index, {}, str(refusal))
     # Each site report names the range it is about, so a report is matched to
@@ -756,6 +1955,7 @@ def _submit(
     position = _position(sites, body, taken)
     taken.add(position)
     site = sites[position]
+    revision = revisions.get(BACKEND, 0)
     try:
         candidate = catalog.candidate(analysis_id, body["candidate_id"])
         if candidate is None:
@@ -764,6 +1964,7 @@ def _submit(
                 f" analysis {analysis_id!r} of this target, so there is"
                 " nothing for this proposal to be about"
             )
+        revision = revisions.get(str(candidate.get("backend")), revision)
         check_proposal_against_candidate(body, candidate)
         refusal = _text(site.get("refusal"))
         if refusal is not None:
@@ -879,27 +2080,141 @@ def _review_command(path: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def resolve_backend(backend: object) -> str:
-    """The backend that will really run, or a refusal naming what will not.
+def backend_chain(backend: object) -> tuple[str, ...]:
+    """The backends one selector runs, in order, or a refusal naming it.
 
     One wording, used by every tool that takes a ``backend`` selector, so a
     caller never has to learn two ways of being told the same thing.
     """
-    if backend in IMPLEMENTED_BACKENDS:
-        return BACKEND
-    if backend in BACKENDS:
+    chain = BACKEND_CHAINS.get(backend) if isinstance(backend, str) else None
+    if chain is None:
         raise PreparationError(
-            f"backend={backend!r} is unavailable in this build: the {backend}"
-            " provider arrives with Plan 3, so no pass ran, nothing was"
-            " prepared, nothing was scanned and nothing was stored. This is a"
-            " missing capability, not an empty result, and nothing fell back"
-            f" to IDA — a result produced by IDA is not a {backend} result."
-            " Pass 'ida' or 'auto' to use the backend this build does have."
+            f"backend={backend!r} is not a backend this design names; the"
+            f" selectors are {', '.join(BACKENDS)}"
         )
-    raise PreparationError(
-        f"backend={backend!r} is not a backend this design names; the"
-        f" selectors are {', '.join(BACKENDS)}"
+    return chain
+
+
+def resolve_backend(backend: object) -> str:
+    """The backend a selector starts at, or a refusal naming what will not.
+
+    The *head* of the chain, not the whole of it: this is the backend whose
+    analysis record a preparation hangs from, and the one a scope is recorded
+    under when it is the only one that answers. Which backend really answered
+    each pass and each rule is in the routing rows, because under ``auto``
+    that is a different question for every one of them.
+    """
+    return backend_chain(backend)[0]
+
+
+def adapter_fingerprint(backend: str) -> str:
+    """What an external adapter's contract was when it produced a revision.
+
+    A digest of the backend name and the tool schemas the adapter is pinned
+    against. It attests exactly that much: a recorded revision was produced
+    by this code against these pins, and a session whose provider had drifted
+    off them would have refused the call rather than answered it.
+
+    It is deliberately **not** the live provider's capability fingerprint,
+    which only an open session can state, and that is why an external
+    revision is never reused: reuse needs a claim about the provider that is
+    there now, and this is a claim about the adapter that ran then.
+    """
+    adapter = _ADAPTERS[backend]
+    digest = hashlib.sha256()
+    digest.update(backend.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(
+        json.dumps(adapter.PINNED_SCHEMAS, sort_keys=True).encode("utf-8")
     )
+    return f"adapter-{digest.hexdigest()}"
+
+
+def run_provider(coroutine: Any) -> Any:
+    """Drive one provider coroutine from this synchronous call.
+
+    The MCP tools this module serves are ordinary functions and the adapters
+    are coroutines, so somebody has to own an event loop. If this thread has
+    none, it gets one for the duration. If it already has one running — a
+    caller that embedded this in an async host — the provider is given its
+    own loop on its own thread rather than this one being reentered, which
+    ``asyncio`` does not allow and which would otherwise surface as a failure
+    that has nothing to do with the provider.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coroutine).result()
+
+
+def _attempt(backend: str, outcome: str, reason: str | None) -> BackendAttempt:
+    return {"backend": backend, "outcome": outcome, "reason": reason}
+
+
+class UnverifiedBinaryError(PreparationError):
+    """The bytes a backend would read could not be shown to be these bytes."""
+
+
+def _identity_refusal(backend: str, path: str) -> str | None:
+    """Why this backend cannot be shown to be looking at ``path``, or ``None``.
+
+    Checked here, before a session is opened, for one reason: an identity
+    that cannot be proven must **stop** this pass or rule rather than fall
+    through to the next backend. "We cannot prove this provider is reading
+    the same binary" is not "this provider had nothing to offer", and
+    advancing past it is exactly how a result from one image ends up
+    aggregated against another.
+
+    The two checks the operator's configuration makes possible are made.
+    A path outside the configured map is refused by name. A mapped path this
+    host can read is hashed and compared, so a same-name different-bytes file
+    is caught before anything is analysed. A mapped path this host cannot
+    read is left to the session's own attestation, and
+    :class:`~vulfi_mcp.providers.ProviderIdentityError` from there is caught
+    by the caller and reported as the same refusal.
+    """
+    try:
+        config = load_provider_config().get(backend)
+    except Exception as refused:  # noqa: BLE001 - any config fault is a refusal
+        return (
+            f"the {backend} provider's configuration could not be read, so"
+            f" nothing can be said about the bytes it would open: {refused}"
+        )
+    if config is None:
+        return None
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        return f"{source} is not a file, so there are no bytes to identify"
+    try:
+        remote = config.remote_path(str(source))
+    except KeyError:
+        return (
+            f"{source} is not in the operator-configured binary map for the"
+            f" {backend} provider, so it is not a file this server will ask"
+            " that provider about"
+        )
+    mapped = Path(remote)
+    if not mapped.is_file():
+        return None
+    here, there = _digest(source), _digest(mapped)
+    if here != there:
+        return (
+            f"the {backend} provider's path for {source} is {remote}, which"
+            f" does not hash to the same bytes: the original is {here} and the"
+            f" mapped file is {there}. Nothing was analysed and nothing was"
+            " written."
+        )
+    return None
+
+
+def _digest(source: Path) -> str:
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _requested_passes(passes: object) -> tuple[str, ...]:
@@ -1003,16 +2318,318 @@ def _reuse(
             path=path,
             idb_path=idb_path,
             requested_backend=requested_backend,
+            backend=BACKEND,
             analysis_id=recorded,
             catalog=catalog,
             fingerprint=str(summary.get("capability_fingerprint")),
             revision=revision,
             requested=requested,
             recorded=covered,
+            routing=_reused_routing(requested, covered),
             reused=True,
             skipped=[],
             warnings=[],
         )
+
+
+class _Routed(NamedTuple):
+    """What one routed preparation run produced, before anything is stored.
+
+    ``results`` is one entry per pass a backend really answered, paired with
+    the candidate rows that pass named. ``routing`` is one row per *requested*
+    pass, answered or not. ``ida`` is the IDA worker's own report when IDA
+    ran, and ``None`` when the chain never reached it — which is what decides
+    whether there is a managed database to record a summary into.
+    """
+
+    results: list[tuple[dict[str, Any], dict[str, dict[str, Any]]]]
+    routing: list[PassRouting]
+    skipped: list[dict[str, object]]
+    warnings: list[str]
+    idb_path: str | None
+    ida: dict[str, Any] | None
+    answered_by: list[str]
+
+
+def _route_passes(
+    path: str, chain: tuple[str, ...], requested: tuple[str, ...]
+) -> _Routed:
+    """Ask each backend in turn for the passes nobody has answered yet.
+
+    The loop below is the whole of per-pass routing, and every branch in it
+    is one of the five outcomes :data:`vulfi_mcp.contracts.AttemptOutcome`
+    names. A pass a backend produced a result for is answered and is never
+    asked of another backend. A pass a backend produced an ``unavailable``
+    result for is that backend stating it cannot establish this pass at all,
+    and the chain advances. A backend that could not be reached advances the
+    chain too. A backend that opened a session and failed advances it as
+    well — and its failure stays in ``attempts``, is carried into the stored
+    revision's warnings, and keeps the pass from being read as clean.
+
+    The one outcome that stops a pass is an identity this server could not
+    prove, because no other backend can stand in for that: "we cannot show
+    this provider is reading the same bytes" is not "this provider had
+    nothing to offer".
+    """
+    answered: dict[str, dict[str, Any]] = {}
+    owners: dict[str, dict[str, dict[str, Any]]] = {}
+    attempts: dict[str, list[BackendAttempt]] = {name: [] for name in requested}
+    stopped: dict[str, str] = {}
+    warnings: list[str] = []
+    skipped: list[dict[str, object]] = []
+    idb_path: str | None = None
+    ida_result: dict[str, Any] | None = None
+    answered_by: list[str] = []
+    extra: list[tuple[dict[str, Any], dict[str, dict[str, Any]]]] = []
+
+    for backend in chain:
+        pending = tuple(
+            name
+            for name in requested
+            if name not in answered and name not in stopped
+        )
+        if not pending:
+            break
+        if backend == BACKEND:
+            produced, candidates, note, idb_path, ida_result = _ida_passes(
+                path, pending
+            )
+            if ida_result is not None:
+                skipped.extend(_skipped(ida_result))
+                warnings.extend(_strings(ida_result.get("warnings")))
+        else:
+            produced, candidates, note = _external_passes(backend, path, pending)
+        if note is not None:
+            outcome, reason = note
+            for name in pending:
+                attempts[name].append(_attempt(backend, outcome, reason))
+                if outcome == "unverified":
+                    stopped[name] = reason
+            continue
+        by_name = {str(entry.get("pass")): entry for entry in produced}
+        for name in pending:
+            entry = by_name.get(name)
+            if entry is None:
+                attempts[name].append(
+                    _attempt(
+                        backend,
+                        "failed",
+                        f"the {backend} backend ran and returned no result for"
+                        f" the {name!r} pass, so nothing is known about it"
+                        " from there",
+                    )
+                )
+                continue
+            if str(entry.get("coverage")) == "unavailable":
+                attempts[name].append(
+                    _attempt(backend, "unsupported", _range_reason(entry))
+                )
+                # Recorded anyway. "This backend looked and cannot establish
+                # this" is a fact about the image worth keeping, and it is
+                # what lets a later read tell it from a pass nobody asked
+                # about — but it does not answer the pass, so the chain
+                # advances.
+                extra.append((entry, candidates))
+                continue
+            attempts[name].append(_attempt(backend, "answered", None))
+            answered[name] = entry
+            owners[name] = candidates
+            if backend not in answered_by:
+                answered_by.append(backend)
+
+    results = [(answered[name], owners[name]) for name in answered]
+    results.extend(extra)
+    routing = [
+        _pass_routing(name, answered.get(name), attempts[name], stopped.get(name))
+        for name in requested
+    ]
+    return _Routed(
+        results=results,
+        routing=routing,
+        skipped=skipped,
+        warnings=warnings,
+        idb_path=idb_path,
+        ida=ida_result,
+        answered_by=answered_by,
+    )
+
+
+def _ida_passes(
+    path: str, pending: tuple[str, ...]
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+    tuple[str, str] | None,
+    str | None,
+    dict[str, Any] | None,
+]:
+    """Run the IDA passes, or say why this backend could not be asked."""
+    try:
+        idb_path = ensure_managed_idb(path)
+        result = run_ida_passes(idb_path, pending)
+    except ManagedDatabaseError as refused:
+        # No usable managed database is this backend being unavailable, not a
+        # pass that ran and found nothing. Under ``auto`` the chain goes on to
+        # the providers; under ``ida`` there is nowhere to go, and the routing
+        # rows say exactly that.
+        return [], {}, ("unavailable", str(refused)), None, None
+    return (
+        _entries(result.get("passes")),
+        _candidates_by_id(result),
+        None,
+        idb_path,
+        result,
+    )
+
+
+def _external_passes(
+    backend: str, path: str, pending: tuple[str, ...]
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], tuple[str, str] | None]:
+    """Run one provider's passes, or say which outcome happened instead."""
+    refusal = _identity_refusal(backend, path)
+    if refusal is not None:
+        return [], {}, ("unverified", refusal)
+    unavailable = _unavailable_error(backend)
+    try:
+        produced = run_provider(_PREPARE[backend](path, pending))
+    except ProviderIdentityError as refused:
+        return [], {}, ("unverified", str(refused))
+    except unavailable as refused:
+        return [], {}, ("unavailable", str(refused))
+    except ProviderError as refused:
+        return [], {}, ("failed", str(refused))
+    entries = [dict(entry) for entry in produced]
+    candidates: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        for row in _entries(entry.pop("candidates", None)):
+            identifier = row.get("candidate_id")
+            if not isinstance(identifier, str) or not identifier:
+                raise PreparationError(
+                    f"the {backend} adapter returned a candidate with no id:"
+                    f" {row!r}"
+                )
+            candidates[identifier] = row
+        # The provider's own image base rides along beside each pass and is
+        # not part of the published contract. It is dropped rather than
+        # defaulted: an address space this server cannot state is one it does
+        # not state, and a base of zero is a claim, not an absence.
+        entry.pop("image_base", None)
+    return entries, candidates, None
+
+
+def _unavailable_error(backend: str) -> type[BaseException]:
+    """The adapter's own "there was no provider to ask" exception type."""
+    adapter = _ADAPTERS[backend]
+    for name in ("GhidraUnavailableError", "R2UnavailableError"):
+        error = getattr(adapter, name, None)
+        if isinstance(error, type) and issubclass(error, BaseException):
+            return error
+    raise PreparationError(  # pragma: no cover - both adapters define one
+        f"the {backend} adapter declares no unavailability type, so a provider"
+        " that is simply absent could not be told from one that failed"
+    )
+
+
+def _range_reason(entry: dict[str, Any]) -> str:
+    """Why a pass reported ``unavailable``, in the backend's own words."""
+    for item in _entries(entry.get("ranges")):
+        reason = item.get("reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    return (
+        f"the {entry.get('backend')} backend reports the"
+        f" {entry.get('pass')!r} pass unavailable and named no reason"
+    )
+
+
+def _pass_routing(
+    name: str,
+    answered: dict[str, Any] | None,
+    attempts: list[BackendAttempt],
+    stopped: str | None,
+) -> PassRouting:
+    """One requested pass, and what the whole chain made of it.
+
+    ``coverage`` is the answering pass's own coverage, carried through
+    untouched. Routing never upgrades a pass summary: a blanket veto and a
+    per-range one are both that backend's claim about what it really read,
+    and ``unavailable`` is not upgraded by anything.
+    """
+    if answered is not None:
+        return {
+            "pass": name,
+            "backend": str(answered.get("backend")),
+            "state": "answered",
+            "coverage": str(answered.get("coverage")),
+            "attempts": attempts,
+            "reason": None,
+        }
+    if stopped is not None:
+        return {
+            "pass": name,
+            "backend": None,
+            "state": "unverified",
+            "coverage": "unavailable",
+            "attempts": attempts,
+            "reason": stopped,
+        }
+    outcomes = [item["outcome"] for item in attempts]
+    state = "unavailable"
+    for candidate in ("failed", "unsupported", "unavailable"):
+        if candidate in outcomes:
+            state = candidate
+            break
+    reason = "; ".join(
+        f"{item['backend']}: {item['outcome']}"
+        + (f" ({item['reason']})" if item["reason"] else "")
+        for item in attempts
+    ) or (
+        "no backend in this chain was asked for this pass, which is not the"
+        " same as a pass that ran and found nothing"
+    )
+    return {
+        "pass": name,
+        "backend": None,
+        "state": state,
+        "coverage": "unavailable",
+        "attempts": attempts,
+        "reason": reason,
+    }
+
+
+def _reused_routing(
+    requested: tuple[str, ...], recorded: list[dict[str, object]]
+) -> list[PassRouting]:
+    """Routing rows for a revision nothing was asked for.
+
+    ``attempts`` is empty on every row, and that is the honest thing to say:
+    this call consulted no backend at all. What each row carries is which
+    backend's result the store already holds for that pass.
+    """
+    held: dict[str, dict[str, object]] = {}
+    for entry in recorded:
+        name = str(entry["pass"])
+        if str(entry["coverage"]) == "unavailable" and name in held:
+            continue
+        if name not in held or str(held[name]["coverage"]) == "unavailable":
+            held[name] = entry
+    rows: list[PassRouting] = []
+    for name in requested:
+        entry = held.get(name)
+        if entry is None:
+            rows.append(_pass_routing(name, None, [], None))
+            continue
+        rows.append(
+            {
+                "pass": name,
+                "backend": str(entry["backend"]),
+                "state": "answered",
+                "coverage": str(entry["coverage"]),
+                "attempts": [],
+                "reason": None,
+            }
+        )
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -1022,15 +2639,14 @@ def _reuse(
 
 def _record(
     path: str,
-    idb_path: str,
     requested_backend: str,
-    resolved: str,
+    chain: tuple[str, ...],
     requested: tuple[str, ...],
-    result: dict[str, object],
+    routed: _Routed,
 ) -> PreparationResult:
-    """Store what one run produced, then tell the database about it.
+    """Store what one routed run produced, then tell the database about it.
 
-    The order is the contract. The run has already been saved by the lease
+    The order is the contract. An IDA run has already been saved by the lease
     that made it — a failed save raised out of :func:`run_ida_passes` and
     never reached here — so the catalog is written against an artifact that
     really carries the changes. The bounded summary goes into the managed
@@ -1038,68 +2654,157 @@ def _record(
     is one both stores agree on. A failure at that last step raises rather
     than returning: the catalog then holds passes the record does not name,
     the next request finds no reusable revision, and preparation runs again.
+
+    A run with no IDA in it has no managed record to tell and no artifact
+    whose revision it could claim. It is recorded in the catalog alone, under
+    a fingerprint that attests the adapter's pinned contract and nothing
+    about the provider that is there now — which is exactly why
+    :meth:`~vulfi_mcp.catalog.Catalog.record_analysis` is not called for it
+    and a later request runs the passes again rather than reusing them.
     """
-    fingerprint = result.get("capability_fingerprint")
-    if not isinstance(fingerprint, str) or not fingerprint:
+    ida = routed.ida
+    idb_path = routed.idb_path
+    primary = routed.answered_by[0] if routed.answered_by else chain[0]
+    managed_idb_id: str | None = None
+    if ida is not None and idb_path is not None:
+        fingerprint = ida.get("capability_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise PreparationError(
+                "the IDA worker reported no capability fingerprint, so this"
+                f" revision could never be reused: {fingerprint!r}"
+            )
+        revision = ida.get("artifact_revision")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+        ):
+            raise PreparationError(
+                f"the IDA worker reported artifact_revision={revision!r},"
+                " which is not a revision this run could have produced"
+            )
+        managed_idb_id = _text(ida.get("managed_idb_id"))
+    elif primary == BACKEND:
         raise PreparationError(
-            "the IDA worker reported no capability fingerprint, so this"
-            f" revision could never be reused: {fingerprint!r}"
+            f"no backend in the {requested_backend!r} chain prepared this"
+            " target, and this build will not record a revision nothing"
+            " made: "
+            + _routing_summary(routed.routing)
         )
-    revision = result.get("artifact_revision")
-    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-        raise PreparationError(
-            f"the IDA worker reported artifact_revision={revision!r}, which is"
-            " not a revision this run could have produced"
+    else:
+        fingerprint = adapter_fingerprint(primary)
+        revision = max(
+            (
+                int(entry.get("artifact_revision") or 0)
+                for entry, _ in routed.results
+            ),
+            default=0,
         )
-    with open_catalog(path, _text(result.get("managed_idb_id"))) as catalog:
-        analysis_id = _mint(catalog.target_key, resolved, idb_path, fingerprint)
-        stored = catalog.record_analysis(
-            analysis_id,
-            requested_backend=resolved,
-            artifact_path=idb_path,
-            capability_fingerprint=fingerprint,
-            revision=revision,
-        )
-        # From the store, not from the run: what a later reuse check compares
-        # against is the stored row, so that is what this reports.
-        revision = int(str(stored["revision"]))
-        kept = _record_passes(catalog, analysis_id, result)
+    artifact = idb_path or str(_external_artifact(primary, path))
+    with open_catalog(path, managed_idb_id) as catalog:
+        analysis_id = _mint(catalog.target_key, primary, artifact, fingerprint)
+        if ida is not None and idb_path is not None:
+            stored = catalog.record_analysis(
+                analysis_id,
+                requested_backend=primary,
+                artifact_path=artifact,
+                capability_fingerprint=fingerprint,
+                revision=revision,
+            )
+            # From the store, not from the run: what a later reuse check
+            # compares against is the stored row, so that is what this
+            # reports.
+            revision = int(str(stored["revision"]))
+        kept = _record_passes(catalog, analysis_id, routed.results)
         # Read back after recording, for the same reason: a pass this run did
         # not beat kept its earlier result, and the summary the managed record
         # carries — the one that decides a later reuse — has to name the
         # coverage the catalog really holds rather than the one this run
         # produced and did not store.
         recorded = catalog.pass_results(analysis_id)
-        coverage = {str(entry["pass"]): str(entry["coverage"]) for entry in recorded}
+        coverage = {
+            str(entry["pass"]): str(entry["coverage"])
+            for entry in recorded
+            if str(entry["backend"]) == BACKEND
+        }
         catalog_key = catalog.target_key
         report = _result(
             path=path,
             idb_path=idb_path,
             requested_backend=requested_backend,
+            backend=primary,
             analysis_id=analysis_id,
             catalog=catalog,
             fingerprint=fingerprint,
             revision=revision,
             requested=requested,
             recorded=recorded,
+            routing=routed.routing,
             reused=False,
-            skipped=_skipped(result),
-            warnings=[*_strings(result.get("warnings")), *kept],
+            skipped=routed.skipped,
+            warnings=[*routed.warnings, *kept, *_routing_warnings(routed.routing)],
         )
-    invoke_ida(
-        idb_path,
-        _RECORD,
-        {
-            "analysis_id": analysis_id,
-            "coverage": coverage,
-            "catalog_key": catalog_key,
-        },
-    )
+    if idb_path is not None:
+        invoke_ida(
+            idb_path,
+            _RECORD,
+            {
+                "analysis_id": analysis_id,
+                "coverage": coverage,
+                "catalog_key": catalog_key,
+            },
+        )
     return report
 
 
+def _external_artifact(backend: str, path: str) -> Path:
+    """Where an external backend keeps whatever it keeps for this target.
+
+    A real directory for Ghidra, which holds the managed project record. For
+    radare2 it is the directory that *would* hold one, and every pass
+    recorded under it carries ``artifact_revision: null`` because that
+    provider keeps nothing at all between sessions.
+    """
+    from vulfi_mcp.ida_adapter import data_dir
+
+    return data_dir() / backend / Path(path).name
+
+
+def _routing_summary(routing: list[PassRouting]) -> str:
+    return "; ".join(
+        f"{row['pass']}: {row['state']}"
+        + (f" ({row['reason']})" if row["reason"] else "")
+        for row in routing
+    )
+
+
+def _routing_warnings(routing: list[PassRouting]) -> list[str]:
+    """One warning per failure on the way, and per pass nobody answered.
+
+    A failure is sticky: it is said here even when a later backend answered
+    the same pass, because a clean answer reported *instead of* an earlier
+    failure is the one shape this project exists to rule out.
+    """
+    notes: list[str] = []
+    for row in routing:
+        for attempt in row["attempts"]:
+            if attempt["outcome"] == "failed":
+                notes.append(
+                    f"the {attempt['backend']} backend failed on the"
+                    f" {row['pass']!r} pass: {attempt['reason']}"
+                )
+        if row["state"] != "answered":
+            notes.append(
+                f"no backend established the {row['pass']!r} pass"
+                f" ({row['state']}): {row['reason']}"
+            )
+    return notes
+
+
 def _record_passes(
-    catalog: Catalog, analysis_id: str, result: dict[str, object]
+    catalog: Catalog,
+    analysis_id: str,
+    results: list[tuple[dict[str, Any], dict[str, dict[str, Any]]]],
 ) -> list[str]:
     """Store each pass with its own candidates, keeping what it cannot beat.
 
@@ -1107,13 +2812,21 @@ def _record_passes(
     the catalog replaces: re-running ``strings`` must not retire what
     ``functions`` found.
 
+    The unit is one pass **of one backend**, which is what makes the fallback
+    in this plan storable at all: Ghidra's ``strings`` and IDA's ``strings``
+    are two records of two different reads, and the catalog's own key is
+    ``(analysis, pass, backend)`` for exactly that reason. A run that routed
+    a pass to a second backend does not overwrite what the first one said
+    about a different pass, and neither of them can retire the other's
+    candidates.
+
     A pass is stored unless the result an earlier run recorded for this same
-    revision covered strictly more — read every address this run read, and
-    some this run never reached. A run that is cut short is not evidence that
-    the thing an earlier run saw has gone away, and replacing the stronger
-    record with the weaker one would delete the candidates that are the only
-    description of it. The skip is returned as a warning rather than
-    performed silently.
+    revision *and the same backend* covered strictly more — read every
+    address this run read, and some this run never reached. A run that is cut
+    short is not evidence that the thing an earlier run saw has gone away,
+    and replacing the stronger record with the weaker one would delete the
+    candidates that are the only description of it. The skip is returned as a
+    warning rather than performed silently.
 
     What is compared is what each run really covered, not how it ended. The
     cancellation this design actually produces is an exhausted budget, which
@@ -1121,16 +2834,28 @@ def _record_passes(
     phrased on a pass that failed outright would never fire on that, which is
     the ordinary case rather than the exotic one.
     """
-    candidates = _candidates_by_id(result)
     # The caller recorded the analysis row just now, so these are the passes
     # an *earlier* run of this same revision left behind.
-    held = {str(entry["pass"]): entry for entry in catalog.pass_results(analysis_id)}
+    try:
+        previous_results = catalog.pass_results(analysis_id)
+    except UnknownAnalysisError:
+        # An external-only revision has no ``analyses`` row until the first
+        # pass writes one: ``record_analysis`` is deliberately not called for
+        # it, because its four columns are a claim about reusability that
+        # only an open provider session could make. Nothing was recorded
+        # earlier, so there is nothing for this run to lose to.
+        previous_results = []
+    held = {
+        (str(entry["pass"]), str(entry["backend"])): entry
+        for entry in previous_results
+    }
     kept: list[str] = []
-    for entry in _entries(result.get("passes")):
+    for entry, candidates in results:
         name = str(entry.get("pass"))
-        previous = held.get(name)
+        backend = str(entry.get("backend"))
+        previous = held.get((name, backend))
         if previous is not None and _covers_more(previous, entry):
-            kept.append(_kept_reason(name, previous, entry))
+            kept.append(_kept_reason(f"{backend} {name}", previous, entry))
             continue
         catalog.record_pass(analysis_id, _pass_payload(entry, candidates))
     return kept
@@ -1278,8 +3003,9 @@ def _pass_payload(
     missing = [item for item in named if item not in candidates]
     if missing:
         raise PreparationError(
-            f"the IDA worker's {entry.get('pass')!r} pass named candidates it"
-            f" did not return: {', '.join(sorted(missing))}"
+            f"the {entry.get('backend')} backend's {entry.get('pass')!r} pass"
+            f" named candidates it did not return:"
+            f" {', '.join(sorted(missing))}"
         )
     payload = dict(entry)
     payload["candidates"] = [candidates[item] for item in named]
@@ -1320,14 +3046,16 @@ def _mint(target_key: str, backend: str, artifact: str, fingerprint: str) -> str
 def _result(
     *,
     path: str,
-    idb_path: str,
+    idb_path: str | None,
     requested_backend: str,
+    backend: str,
     analysis_id: str,
     catalog: Catalog,
     fingerprint: str,
     revision: int,
     requested: tuple[str, ...],
     recorded: list[dict[str, object]],
+    routing: list[PassRouting],
     reused: bool,
     skipped: list[dict[str, object]],
     warnings: list[str],
@@ -1337,13 +3065,18 @@ def _result(
     Both branches build the result the same way and from the same place: a
     reused revision and a fresh one are the same object, and a reader cannot
     be shown a field on one that the other could not produce.
+
+    ``backend`` is the one whose analysis record this revision hangs from —
+    the first backend in the chain that answered anything. It is not a claim
+    about who answered each pass: under ``auto`` that is a different answer
+    per pass, and ``routing`` is where it is said.
     """
     page = catalog.page_candidates(analysis_id, 0, INLINE_CANDIDATES)
     applied = catalog.applied_candidates(analysis_id)
     return {
         "path": path,
         "idb_path": idb_path,
-        "backend": BACKEND,
+        "backend": backend,
         "requested_backend": requested_backend,
         "analysis_id": analysis_id,
         "target_key": catalog.target_key,
@@ -1361,6 +3094,7 @@ def _result(
         "applied_ids": applied[:INLINE_APPLIED],
         "applied_total": len(applied),
         "skipped_prerequisites": skipped,
+        "routing": routing,
         "artifact_paths": {
             "managed_idb": idb_path,
             "catalog": str(catalog.database_path),

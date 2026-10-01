@@ -56,30 +56,21 @@ from vulfi_mcp.contracts import (
     ScanResult,
     TriageResult,
 )
-from vulfi_mcp.ida_adapter import (
-    NO_DATABASE_REASON,
-    existing_managed_idb,
-    findings_ida,
-    scan_ida,
-    triage_ida,
-    unscanned_findings_page,
-)
 from vulfi_mcp.ida_runtime import (
     CUSTOM_SCOPE_PREFIX,
     DEFAULT_SCOPE,
-    UnknownFindingError,
     validate_page,
-    validate_rationale,
     validate_scan_name,
-    validate_status,
 )
 from vulfi_mcp.prepare import (
     ProposalResult,
-    ensure_prepared,
+    backend_chain,
+    findings_across_backends,
     prepare_target,
     preparation_page,
     propose_recovery,
-    resolve_backend,
+    scan_target,
+    triage_across_backends,
 )
 from vulfi_mcp.rules import Rule, load_stock_rules, rule_template, validate_rules
 
@@ -93,18 +84,6 @@ __all__ = [
     "vulfi_scan",
     "vulfi_triage",
 ]
-
-
-def _require_no_external_store(binary_path: object, where: str) -> None:
-    """Refuse to aggregate a findings store this build never writes."""
-    if binary_path is None:
-        return
-    raise ValueError(
-        f"binary_path={binary_path!r} asks {where} to aggregate an external"
-        " findings store with the managed IDB, and that store is not"
-        " implemented in this build. The managed IDB's own rows are the only"
-        " rows that exist; omit binary_path to read them."
-    )
 
 
 def _scope_and_rules(
@@ -166,9 +145,12 @@ def vulfi_scan(
     ] = "agent",
     backend: Annotated[
         str,
-        "Analysis backend: 'ida' or 'auto'. The 'ghidra' and 'r2' providers"
-        " this design names are not implemented in this build and are refused"
-        " by name rather than quietly served by IDA.",
+        "Analysis backend: 'auto', 'ida', 'ghidra' or 'r2'. 'auto' decides"
+        " per rule — IDA first, then a configured Ghidra MCP, then a"
+        " configured radare2 MCP — and only for rules the previous backend"
+        " could not establish the facts for. Naming one backend runs exactly"
+        " that one, with no fallback: a result produced by IDA is not a"
+        " Ghidra result.",
     ] = "auto",
     analysis_id: Annotated[
         str | None,
@@ -179,33 +161,35 @@ def vulfi_scan(
     ] = None,
 ) -> ScanResult:
     """Scan a binary or IDA database for VulFi rule matches and store the rows
-    in the managed IDB's own record. Rules are validated in full before any
+    in each backend's own scope. Rules are validated in full before any
     database is created or opened. The target is then prepared — hidden
     functions, undefined strings, structure fields and pointer tables
-    recovered where the evidence justifies it — unless a recorded preparation
-    revision already matches this request, in which case it is reused and
-    nothing is applied again. IDA then extracts call-site evidence from that
-    prepared analysis and every `mark_if` branch is evaluated outside IDA by a
-    restricted interpreter. The result reports the preparation revision it
-    read, per-rule coverage (evaluated, unsupported or failed with a reason),
-    the first page of the scope's stored rows, triage counts across the whole
-    target, and store health — an unsupported rule is never reported as a
-    clean negative. Rescanning a scope preserves earlier assessments by exact
-    finding ID. This build implements the IDA backend only.
+    recovered where the evidence justifies it, by whichever backend can
+    justify each pass — unless a recorded preparation revision already
+    matches this request, in which case it is reused and nothing is applied
+    again. Every rule is then routed on its own: IDA evaluates what its
+    evidence supports, and each rule it reported unsupported or failed is
+    asked of the configured external providers in turn. Only complete facts
+    become a verdict; partial facts stay unsupported, and a decompiled-C
+    mention of a dangerous call is never one. Every `mark_if` branch is
+    evaluated outside every backend by one restricted interpreter, so two
+    backends cannot reach different conclusions from the same facts. The
+    result reports the preparation revision it read, per-rule coverage per
+    backend (evaluated, unsupported or failed with a reason), which backend
+    answered each rule and what every other one said, the first page of this
+    scope's stored rows, triage counts per backend and in aggregate, and
+    store health — an unsupported rule is never reported as a clean negative
+    and a store that was not consulted is never reported as an empty one.
+    Rescanning a scope preserves earlier assessments by exact finding ID and
+    touches no other backend's scope.
     """
-    resolve_backend(backend)
+    backend_chain(backend)
     scope, selected = _scope_and_rules(rules, scan_name)
     # Only now may a database exist: no malformed rule and no malformed scan
     # name can be the reason a managed IDB or its netnode was ever created.
-    prepared = ensure_prepared(path, backend=backend, analysis_id=analysis_id)
-    result = scan_ida(prepared["idb_path"], selected, scope, path=path)
-    # What the rows were read out of, named on the rows themselves: a scan of
-    # a prepared analysis that did not say which one would leave a reader
-    # unable to tell it from a scan of the raw auto-analysis.
-    result["analysis_id"] = prepared["analysis_id"]
-    result["preparation_revision"] = prepared["preparation_revision"]
-    result["warnings"] = [*result["warnings"], *prepared["warnings"]]
-    return result
+    return scan_target(
+        path, selected, scope, backend=backend, analysis_id=analysis_id
+    )
 
 
 @tool(title="Prepare a target's managed analysis before scanning")
@@ -218,9 +202,11 @@ def vulfi_prepare(
     ],
     backend: Annotated[
         str,
-        "Analysis backend: 'ida' or 'auto'. The 'ghidra' and 'r2' providers"
-        " this design names are not implemented in this build and are refused"
-        " by name; nothing falls back to IDA in their place.",
+        "Analysis backend: 'auto', 'ida', 'ghidra' or 'r2'. 'auto' decides"
+        " per pass — IDA first, then a configured Ghidra MCP, then a"
+        " configured radare2 MCP — and only for passes the previous backend"
+        " could not establish. Naming one backend runs exactly that one, with"
+        " no fallback.",
     ] = "auto",
     passes: Annotated[
         list[str] | None,
@@ -230,20 +216,27 @@ def vulfi_prepare(
         " its missing prerequisites cost. An empty list is an error.",
     ] = None,
 ) -> PreparationResult:
-    """Recover what a managed IDA analysis can justify before it is scanned:
+    """Recover what a managed analysis can justify before it is scanned:
     functions in executable bytes nothing references, strings in mapped bytes
     and in the instructions that assemble them, structure layouts proven from
     consistent sized accesses, and pointer tables every slot of which carries
-    a relocation. Every recovery carries the bytes, instructions, accesses or
-    relocation records it rests on, and anything that cannot be justified
-    stays a candidate with the reason — `state` is `applied` only where the
-    managed database really changed. Coverage is reported per address range:
+    a relocation. Each requested pass is routed on its own, and `routing`
+    reports which backend answered it, what every other backend in the chain
+    said, and — for a pass none of them could establish — the reason each
+    one gave, rather than leaving it out as if it had run and found nothing.
+    Every recovery carries the bytes, instructions, accesses or relocation
+    records it rests on, and anything that cannot be justified stays a
+    candidate with the reason — `state` is `applied` only where the managed
+    artifact really changed. Coverage is reported per address range:
     `partial` is the ordinary answer on a real image and means some range was
-    not reached, not that the pass failed. Candidates are stored in the
+    not reached, not that the pass failed, and nothing a later backend
+    answers upgrades an earlier `unavailable`. Candidates are stored in the
     preparation catalog and paged by vulfi_preparation; only the first page
     is returned here. Re-running an unchanged target reuses the recorded
-    revision and applies nothing, which `reused` reports. Passes and backend
-    are validated before any database or catalog is created.
+    revision and applies nothing, which `reused` reports; only an IDA-headed
+    chain has a reusable revision, because an external one would be a claim
+    about a provider session that is open now. Passes and backend are
+    validated before any database or catalog is created.
     """
     return prepare_target(path, backend=backend, passes=passes)
 
@@ -332,32 +325,35 @@ def vulfi_findings(
     ],
     binary_path: Annotated[
         str | None,
-        "Reserved for aggregating an external findings store with the managed"
-        " IDB. That store is not implemented in this build, so any value is"
-        " refused rather than silently ignored.",
+        "The original binary, when 'path' is a saved .i64/.idb. External"
+        " backends' rows belong to the original binary's SHA-256 namespace,"
+        " so a database-only target cannot be joined to them until these"
+        " bytes are supplied and proved against the input digest the database"
+        " itself records. An unrelated binary is refused, never guessed at.",
     ] = None,
     offset: Annotated[int, "Zero-based index of the first row to return."] = 0,
     limit: Annotated[int, "Rows to return; 1 to 200."] = 100,
 ) -> FindingsPage:
     """Read the VulFi findings already stored for a target: no rule is
     evaluated, no stored row is rewritten, and no database is analyzed or
-    created. Returns one page of rows across every scope of the IDA backend in
-    one stable order (address space, then location, then finding ID), together
-    with the target's triage counts, how many rows a later partial scan did not
-    observe again, and which stores answered — a store that is absent is
-    reported unavailable, never as zero rows. A target no vulfi_scan has ever
-    run against has no managed database and therefore no store: that is
-    reported as an unavailable IDA store with a reason, not as a target
-    without findings. Only vulfi_scan creates a database.
+    created. Returns one page of rows across every scope of every backend in
+    one stable order (verified address space, then location, then finding ID).
+    Two backends never share an address space, so a reader is never shown one
+    backend's address as if it were another's. Also returned are the target's
+    triage counts per backend and in aggregate — counting findings, not
+    deduplicated vulnerabilities — how many rows a later partial or failed
+    scan did not observe again and were therefore kept as stale, and which
+    stores answered. A store that is absent, or that could not be joined
+    because source identity does not verify, is reported unavailable with the
+    reason, never as zero rows. A target no vulfi_scan has ever run against
+    has no managed database and therefore no store: that too is reported as
+    unavailable with a reason, not as a target without findings. Only
+    vulfi_scan and vulfi_prepare create anything.
     """
-    _require_no_external_store(binary_path, "vulfi_findings")
     # Refused before a database is even looked for, so an out-of-range page
     # never costs a workspace lookup to say no.
     validate_page(offset, limit)
-    idb_path = existing_managed_idb(path)
-    if idb_path is None:
-        return unscanned_findings_page(path, offset, limit)
-    return findings_ida(idb_path, offset, limit, path=path)
+    return findings_across_backends(path, binary_path, offset, limit)
 
 
 @tool(title="Assess one VulFi finding")
@@ -370,7 +366,8 @@ def vulfi_triage(
     finding_id: Annotated[
         str,
         "Exact id of the stored finding, as vulfi_scan or vulfi_findings"
-        " reported it. An id the record does not hold is refused.",
+        " reported it. Its backend prefix decides which store is updated. An"
+        " id no store holds is refused.",
     ],
     status: Annotated[
         str,
@@ -382,36 +379,27 @@ def vulfi_triage(
     ],
     binary_path: Annotated[
         str | None,
-        "Reserved for mirroring the assessment into an external findings"
-        " store. That store is not implemented in this build, so any value is"
-        " refused rather than silently ignored.",
+        "The original binary, when 'path' is a saved .i64/.idb and the finding"
+        " belongs to an external backend. The same proof vulfi_findings wants,"
+        " for the same reason: an external row is identified by the original"
+        " binary's SHA-256, and an unrelated binary is refused.",
     ] = None,
 ) -> TriageResult:
     """Record an assessment of one stored VulFi finding, by its exact id. The
     status, the rationale and the id are all checked before any database is
     opened, and a refused update writes nothing at all. An accepted one is
-    committed to the managed IDB and survives reopening it; it returns the
-    finding exactly as the store committed it, its assessment revision, and the
-    target's triage counts. Assessing a target no vulfi_scan has run against is
-    refused outright: there is no store, so there is no id it could hold, and
-    no database is analyzed or created to establish that. Assessments in this
-    build are unlinked: they update the IDA row's own authority and nothing
-    else.
+    committed to the store that authored the row — the managed IDB for an IDA
+    finding, the catalog for a Ghidra or radare2 one — and survives reopening
+    it; it returns the finding exactly as that store committed it, its
+    assessment revision, and the target's triage counts across every store
+    that answered. Assessing a target with no such store is refused outright:
+    there is no id it could hold, and no database is analyzed or created to
+    establish that. Assessments in this build are unlinked: they update one
+    row's own authority and nothing else, and are never copied into another
+    backend's store as a substitute for the reviewer-created link Plan 4
+    adds.
     """
-    _require_no_external_store(binary_path, "vulfi_triage")
-    # Refused before a database can exist, for the same reason vulfi_findings
-    # checks its page window first.
-    if not isinstance(finding_id, str) or not finding_id:
-        raise ValueError("finding_id must be a non-empty string")
-    validate_status(status)
-    validate_rationale(rationale)
-    idb_path = existing_managed_idb(path)
-    if idb_path is None:
-        raise UnknownFindingError(
-            f"no stored finding carries the id {finding_id!r}:"
-            f" {NO_DATABASE_REASON}. Nothing was written"
-        )
-    return triage_ida(idb_path, finding_id, status, rationale, path=path)
+    return triage_across_backends(path, finding_id, status, rationale, binary_path)
 
 
 def main() -> None:

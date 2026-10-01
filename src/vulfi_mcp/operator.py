@@ -86,8 +86,15 @@ from vulfi_mcp.ida_runtime import (
 )
 from vulfi_mcp.prepare import (
     NO_MANAGED_DATABASE_REASON,
+    WRITABLE_BACKENDS,
     PreparationError,
     check_proposal_against_candidate,
+    run_provider,
+)
+from vulfi_mcp.providers import ProviderError
+from vulfi_mcp.providers.ghidra import (
+    GhidraUnavailableError,
+    apply_ghidra_review,
 )
 
 __all__ = [
@@ -225,7 +232,9 @@ def list_proposals(
     """The proposals recorded for one target, newest last.
 
     A read, and only a read: no database is opened, nothing is analyzed and
-    no store is created to answer with an empty queue.
+    no store is created to answer with an empty queue. A target prepared by
+    an external backend has no managed IDA database and still has a queue,
+    so one is not required to see it.
     """
     try:
         offset, limit = validate_page(offset, limit)
@@ -235,7 +244,7 @@ def list_proposals(
         raise ReviewError(
             f"state={state!r} is not one of {', '.join(PROPOSAL_STATES)}"
         )
-    idb_path = _managed_database(path)
+    idb_path = existing_managed_idb(path)
     with _catalog(path, idb_path) as catalog:
         page = catalog.page_proposals(
             analysis_id, state=state, offset=offset, limit=limit
@@ -244,19 +253,29 @@ def list_proposals(
 
 
 def proposal_briefing(path: str, proposal_id: str) -> Briefing:
-    """One proposal, and the state of the database it is about right now.
+    """One proposal, and the state of the artifact it is about right now.
 
-    This is what the command prints before it asks, and it is read fresh out
-    of the managed artifact every time: a reviewer is never shown a cached
-    description of a database that has since changed.
+    This is what the command prints before it asks. For an IDA candidate it
+    is read fresh out of the managed database every time, so a reviewer is
+    never shown a cached description of a database that has since changed.
+
+    For a candidate an external backend recovered there is no managed IDA
+    database to read, and this shows the catalog's own record of the
+    candidate instead — saying so in ``reason``, because the two are not the
+    same claim. The live check is not skipped, only moved: Ghidra's own
+    writer revalidates the overlap and the project revision at the moment it
+    applies, and refuses there.
     """
-    idb_path = _managed_database(path)
+    idb_path = existing_managed_idb(path)
     with _catalog(path, idb_path) as catalog:
         held = _held(catalog, proposal_id, path)
         candidate = catalog.candidate(
             str(held["analysis_id"]), str(held["candidate_id"])
         )
     body = _body(held)
+    backend = str((candidate or {}).get("backend") or BACKEND)
+    if backend != BACKEND or idb_path is None:
+        return _external_briefing(path, idb_path, backend, held, candidate, body)
     observed = invoke_ida(idb_path, _EVIDENCE, {"proposals": [proposal_payload(body)]})
     reviewed = _reviewed(observed)
     reason = _unreviewable(held, candidate, body)
@@ -272,6 +291,47 @@ def proposal_briefing(path: str, proposal_id: str) -> Briefing:
         "effect": str(reviewed["effect"]),
         "reviewable": reason is None and not reviewed.get("refusal"),
         "reason": reason,
+    }
+
+
+def _external_briefing(
+    path: str,
+    idb_path: str | None,
+    backend: str,
+    held: dict[str, object],
+    candidate: dict[str, Any] | None,
+    body: dict[str, Any],
+) -> Briefing:
+    """What a reviewer is shown for a candidate an external backend found."""
+    reason = _unreviewable(held, candidate, body)
+    if reason is None and backend not in WRITABLE_BACKENDS:
+        reason = (
+            f"the {backend!r} backend exposes no typed writer whose result"
+            " outlives the session that made it, so this proposal can be"
+            " rejected but never applied"
+        )
+    return {
+        "path": path,
+        "idb_path": idb_path or "",
+        "backend": backend,
+        # The managed artifact here is the provider's, and its revision is a
+        # thing only an open session states. The proposal's own expected
+        # revision is what the writer compares against, and it is on the
+        # proposal below rather than invented here.
+        "artifact_revision": _whole(held.get("expected_revision")),
+        "proposal": dict(held),
+        "candidate": candidate,
+        "site": (candidate or {}).get("evidence") or {},
+        "conflicts": [],
+        "effect": _external_effect(backend, body),
+        "reviewable": reason is None,
+        "reason": reason
+        or (
+            f"this site is the {backend} candidate as the catalog recorded"
+            " it, not a fresh read of the provider's project; the write"
+            " itself is revalidated against that project, and refused there,"
+            " at the moment it is applied"
+        ),
     }
 
 
@@ -315,6 +375,11 @@ def review_proposal(
             " and the next reviewer, both read it"
         )
     who = (reviewer or _reviewer()).strip() or _UNKNOWN_REVIEWER
+    backend = _proposal_backend(path, proposal_id)
+    if backend != BACKEND:
+        return _review_external(
+            path, backend, proposal_id, decision, expected_revision, reason, who
+        )
     idb_path = _managed_database(path)
     with _catalog(path, idb_path, writable=True) as catalog:
         held = _held(catalog, proposal_id, path)
@@ -381,6 +446,161 @@ def review_proposal(
         return _approve(
             catalog, idb_path, report, body, candidate, who, reason, expected_revision
         )
+
+
+def _proposal_backend(path: str, proposal_id: str) -> str:
+    """Which backend recovered the candidate this proposal is about.
+
+    Read before anything is opened for writing, because it decides which of
+    two entirely different review paths runs — and, for a target no IDA
+    database was ever made for, whether requiring one would be right at all.
+    """
+    with _catalog(path, existing_managed_idb(path)) as probe:
+        held = _held(probe, proposal_id, path)
+        candidate = probe.candidate(
+            str(held["analysis_id"]), str(held["candidate_id"])
+        )
+    if candidate is None:
+        # The candidate is gone, so there is nothing to tell the backend
+        # from. The IDA path says so properly, with the evidence; sending it
+        # there keeps one wording for one refusal.
+        return BACKEND
+    return str(candidate.get("backend") or BACKEND)
+
+
+def _review_external(
+    path: str,
+    backend: str,
+    proposal_id: str,
+    decision: str,
+    expected_revision: int,
+    reason: str | None,
+    who: str,
+) -> ReviewResult:
+    """Decide one proposal about a candidate an external backend recovered.
+
+    Ghidra is the only external backend with a write path, and it is reached
+    only through :func:`~vulfi_mcp.providers.ghidra.apply_ghidra_review`,
+    which revalidates against the live managed project — the overlap checks,
+    the revision comparison and the save are all its own, and this function
+    never writes to a provider by any other route.
+
+    radare2 is refused by name. That provider has no project and no save, so
+    a mutation would not outlive the session that made it; approving one
+    would record an applied change nothing holds. The refusal is explicit
+    rather than a quiet no-op, and it certainly is not served by applying the
+    change to some other backend's analysis instead.
+    """
+    if backend not in WRITABLE_BACKENDS:
+        raise ReviewError(
+            f"proposal {proposal_id} is about a candidate the {backend!r}"
+            " backend recovered, and this build has no safe way to write a"
+            f" reviewed change back to it: the {backend} provider exposes no"
+            " typed writer whose result outlives the session that made it."
+            " Nothing was applied, nothing was approved and no other"
+            " backend's analysis was changed in its place."
+        )
+    idb_path = existing_managed_idb(path)
+    with _catalog(path, idb_path, writable=True) as catalog:
+        held = _held(catalog, proposal_id, path)
+        body = _body(held)
+        candidate = catalog.candidate(
+            str(held["analysis_id"]), str(held["candidate_id"])
+        )
+        report = _outcome(
+            path,
+            idb_path or "",
+            held,
+            body,
+            _external_effect(backend, body),
+            decision,
+            expected_revision,
+            who,
+            expected_revision,
+            backend=backend,
+        )
+        if held["state"] != "pending":
+            report["reason"] = (
+                f"proposal {proposal_id} is {held['state']!r} and only a"
+                " pending proposal can be decided. Nothing was applied and no"
+                " revision was approved"
+                + (
+                    f". {_reopen_hint(path, proposal_id)}"
+                    if held["state"] == "approved"
+                    else ""
+                )
+            )
+            return report
+        drift = _unreviewable(held, candidate, body)
+        if drift is not None:
+            return _stale(catalog, report, who, drift)
+        if decision == "reject":
+            stored = catalog.decide_proposal(
+                proposal_id, state="rejected", decided_by=who, reason=str(reason)
+            )
+            report.update(
+                state=str(stored["state"]),
+                confirmed=True,
+                decided_at=_text(stored["decided_at"]),
+                reason=str(reason),
+            )
+            return report
+        why = (reason or "").strip() or "approved after reviewing the evidence"
+        catalog.decide_proposal(
+            proposal_id,
+            state="approved",
+            decided_by=who,
+            reason=why,
+            expected_revision=expected_revision,
+        )
+        try:
+            applied = run_provider(
+                apply_ghidra_review(path, proposal_payload(body), expected_revision)
+            )
+        except GhidraUnavailableError as absent:
+            return _return_to_pending(
+                catalog,
+                report,
+                who,
+                f"the {backend} provider could not be reached, so nothing was"
+                f" applied and nothing was saved: {absent}",
+            )
+        except ProviderError as failed:
+            return _return_to_pending(
+                catalog,
+                report,
+                who,
+                f"the change was not applied and nothing was saved: {failed}",
+            )
+        report["artifact_revision"] = _whole(applied.get("revision"))
+        report["effect"] = str(applied.get("effect") or report["effect"])
+        if not applied.get("applied"):
+            refused = (
+                _text(applied.get("reason"))
+                or f"the {backend} provider applied nothing"
+            )
+            if applied.get("stale"):
+                return _stale(catalog, report, who, refused)
+            return _return_to_pending(catalog, report, who, refused)
+        stored = catalog.decide_proposal(
+            proposal_id, state="applied", decided_by=who, reason=why
+        )
+        report.update(
+            state=str(stored["state"]),
+            confirmed=True,
+            applied=True,
+            approved_revision=report["artifact_revision"],
+            decided_at=_text(stored["decided_at"]),
+            reason=None,
+        )
+        return report
+
+
+def _external_effect(backend: str, body: dict[str, Any]) -> str:
+    return (
+        f"{body['kind']} over {body['start']:#x}..{body['end']:#x} in the"
+        f" managed {backend} project"
+    )
 
 
 def _approve(
@@ -728,12 +948,13 @@ def _outcome(
     expected_revision: int,
     who: str,
     revision: int,
+    backend: str = BACKEND,
 ) -> ReviewResult:
     """The result every path below fills in, refused by default."""
     return {
         "path": path,
         "idb_path": idb_path,
-        "backend": BACKEND,
+        "backend": backend,
         "proposal_id": str(held["proposal_id"]),
         "analysis_id": str(held["analysis_id"]),
         "candidate_id": str(held["candidate_id"]),
@@ -774,16 +995,20 @@ def _managed_database(path: str) -> str:
     return idb_path
 
 
-def _catalog(path: str, idb_path: str, *, writable: bool = False) -> Catalog:
+def _catalog(
+    path: str, idb_path: str | None, *, writable: bool = False
+) -> Catalog:
     """This target's catalog, opened for reading or for a decision.
 
     A database-only target is keyed by the provisional identity its managed
     record minted, which costs one read of that record; a target whose
     original bytes are in hand is keyed by their digest and costs nothing.
-    Either way the catalog has to already exist: a review never creates one.
+    A target with no managed database at all is the second of those, and is
+    the ordinary case for a preparation an external backend produced. Either
+    way the catalog has to already exist: a review never creates one.
     """
     identity = None
-    if Path(path).suffix.lower() in IDB_SUFFIXES:
+    if idb_path is not None and Path(path).suffix.lower() in IDB_SUFFIXES:
         summary = invoke_ida(idb_path, _SUMMARY, {})
         identity = _text(summary.get("managed_idb_id"))
     probe = get_catalog(path, identity)

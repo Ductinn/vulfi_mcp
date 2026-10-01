@@ -48,11 +48,15 @@ from typing import Any, Final
 
 from vulfi_mcp.ida_adapter import IDB_SUFFIXES, data_dir
 from vulfi_mcp.ida_runtime import (
+    PRIORITIES,
     PROPOSAL_KINDS,
     PROPOSAL_STATES,
+    TRIAGE_STATUSES,
     OperationError,
     utc_now,
     validate_page,
+    validate_rationale,
+    validate_status,
 )
 
 __all__ = [
@@ -60,15 +64,19 @@ __all__ = [
     "ASSOCIATION_VERIFIED",
     "CATALOG_NAME",
     "CATALOG_UNAVAILABLE_REASON",
+    "EXTERNAL_BACKENDS",
     "MIN_SEGMENT_PROOF_BYTES",
     "PROPOSAL_KINDS",
     "PROPOSAL_STATES",
+    "SCAN_COVERAGES",
     "SCHEMA_VERSION",
+    "SCOPE_STATES",
     "Catalog",
     "CatalogError",
     "CatalogSchemaError",
     "ReadOnlyCatalogError",
     "UnknownAnalysisError",
+    "UnknownExternalFindingError",
     "UnverifiedAssociationError",
     "catalog_path",
     "get_catalog",
@@ -80,7 +88,15 @@ CATALOG_NAME: Final = "catalog.sqlite3"
 
 #: Version of the schema below. Bumped only with a migration, never to paper
 #: over a database some other build wrote.
-SCHEMA_VERSION: Final = 1
+#:
+#: Version 2 is Plan 3 Task 4: it gives ``external_scopes`` the routing state,
+#: the reason, the rules and the per-rule coverage a reader needs after a
+#: restart, and gives ``external_findings`` the columns a published
+#: :class:`vulfi_mcp.contracts.Finding` really has — including ``stale``,
+#: which is the difference between a row a later partial scan did not observe
+#: again and a row that is gone. Version 1 created both tables and wrote
+#: neither, so the migration below only widens them.
+SCHEMA_VERSION: Final = 2
 
 #: Why a read reports the catalog unavailable. It is deliberately not phrased
 #: as "no candidates": nothing has been prepared *and recorded here*, which a
@@ -133,6 +149,26 @@ CANDIDATE_STATES: Final = frozenset({"candidate", "applied", "rejected"})
 
 #: Backends that may author a row, matching ``contracts.Backend``.
 BACKENDS: Final = frozenset({"ida", "ghidra", "r2"})
+
+#: Backends whose findings live *here* rather than in the managed IDB's
+#: netnode. IDA is not among them: its rows have their own authority, and a
+#: copy of them here would be a second answer to the same question.
+EXTERNAL_BACKENDS: Final = frozenset({"ghidra", "r2"})
+
+#: What a stored external scope says about the scan that wrote it.
+#: ``evaluated`` means a backend really ran these rules over this scope;
+#: ``failed`` means it opened a session and could not finish; ``unavailable``
+#: means nothing was reachable to ask; ``unverified`` means the backend could
+#: not be shown to be looking at the same bytes. Only the first may retire a
+#: row, and only then over ``complete`` coverage.
+SCOPE_STATES: Final = frozenset(
+    {"evaluated", "failed", "unavailable", "unverified"}
+)
+
+#: What a scan may claim about how much of the image it covered. A scope that
+#: never ran has no coverage at all, which is ``None`` rather than a third
+#: word: "it covered nothing" and "it did not run" are different answers.
+SCAN_COVERAGES: Final = frozenset({"complete", "partial"})
 
 #: Characters a ``managed_idb_id`` may use: ``uuid.uuid4().hex`` as minted, and
 #: the dashed spelling of the same value.
@@ -276,6 +312,12 @@ _SCHEMA: Final = (
         scanned_at             TEXT,
         coverage               TEXT,
         capability_fingerprint TEXT,
+        state                  TEXT NOT NULL DEFAULT 'unavailable',
+        reason                 TEXT,
+        rules                  TEXT NOT NULL DEFAULT '[]',
+        rule_coverage          TEXT NOT NULL DEFAULT '[]',
+        warnings               TEXT NOT NULL DEFAULT '[]',
+        updated_at             TEXT,
         UNIQUE (target_key, backend, scope)
     )
     """,
@@ -295,9 +337,21 @@ _SCHEMA: Final = (
         triage_revision   INTEGER NOT NULL DEFAULT 0,
         last_seen_scan_id TEXT,
         updated_at        TEXT NOT NULL,
+        rule_index        INTEGER NOT NULL DEFAULT -1,
+        rule_name         TEXT NOT NULL DEFAULT '',
+        function_name     TEXT NOT NULL DEFAULT '',
+        found_in          TEXT NOT NULL DEFAULT '',
+        relative_address  TEXT,
+        priority          TEXT NOT NULL DEFAULT 'Info',
+        assessed_at       TEXT,
+        stale             INTEGER NOT NULL DEFAULT 0,
         UNIQUE (scope_id, rule_id, address_space, address, occurrence)
     )
     """,
+    "CREATE INDEX IF NOT EXISTS external_findings_by_scope"
+    " ON external_findings(scope_id)",
+    "CREATE INDEX IF NOT EXISTS external_scopes_by_target"
+    " ON external_scopes(target_key)",
     """
     CREATE TABLE IF NOT EXISTS links (
         link_id             TEXT PRIMARY KEY,
@@ -339,6 +393,68 @@ _SCHEMA: Final = (
     "CREATE INDEX IF NOT EXISTS sync_events_by_state ON sync_events(state)",
 )
 
+#: What one stored version has to run to become the next one, keyed by the
+#: version it is now. Applied in order, each in the same transaction that
+#: moves ``user_version``, so a catalog is never half migrated.
+#:
+#: ``1 -> 2`` only widens the two external tables. Version 1 created both and
+#: declared, in this module's own words, that it wrote neither — so there is
+#: no row to rewrite and no value to recompute, and ``ADD COLUMN`` with a
+#: non-null default is the whole of it. A ``stale`` default of ``0`` is right
+#: for the rows that cannot exist: a row nothing ever wrote is not a row a
+#: later scan failed to observe again.
+_MIGRATIONS: Final[dict[int, tuple[str, ...]]] = {
+    1: (
+        "ALTER TABLE external_scopes ADD COLUMN state TEXT NOT NULL"
+        " DEFAULT 'unavailable'",
+        "ALTER TABLE external_scopes ADD COLUMN reason TEXT",
+        "ALTER TABLE external_scopes ADD COLUMN rules TEXT NOT NULL"
+        " DEFAULT '[]'",
+        "ALTER TABLE external_scopes ADD COLUMN rule_coverage TEXT NOT NULL"
+        " DEFAULT '[]'",
+        "ALTER TABLE external_scopes ADD COLUMN warnings TEXT NOT NULL"
+        " DEFAULT '[]'",
+        "ALTER TABLE external_scopes ADD COLUMN updated_at TEXT",
+        "ALTER TABLE external_findings ADD COLUMN rule_index INTEGER NOT NULL"
+        " DEFAULT -1",
+        "ALTER TABLE external_findings ADD COLUMN rule_name TEXT NOT NULL"
+        " DEFAULT ''",
+        "ALTER TABLE external_findings ADD COLUMN function_name TEXT NOT NULL"
+        " DEFAULT ''",
+        "ALTER TABLE external_findings ADD COLUMN found_in TEXT NOT NULL"
+        " DEFAULT ''",
+        "ALTER TABLE external_findings ADD COLUMN relative_address TEXT",
+        "ALTER TABLE external_findings ADD COLUMN priority TEXT NOT NULL"
+        " DEFAULT 'Info'",
+        "ALTER TABLE external_findings ADD COLUMN assessed_at TEXT",
+        "ALTER TABLE external_findings ADD COLUMN stale INTEGER NOT NULL"
+        " DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS external_findings_by_scope"
+        " ON external_findings(scope_id)",
+        "CREATE INDEX IF NOT EXISTS external_scopes_by_target"
+        " ON external_scopes(target_key)",
+    ),
+}
+
+#: Page order for external rows: the design's own order, derived entirely
+#: from stored values so two processes page the same rows the same way. A row
+#: whose address could not be proven sorts last rather than at zero.
+_EXTERNAL_PAGE_ORDER: Final = (
+    "ORDER BY f.address_space ASC, f.address IS NULL ASC, f.address ASC,"
+    " f.finding_id ASC"
+)
+
+#: Exactly the columns :meth:`Catalog._finding_row` reads, in the order it
+#: reads them. Written once rather than at each call site so the two can
+#: never drift into reading one column as another.
+_EXTERNAL_COLUMNS: Final = (
+    "f.finding_id, s.backend, s.scope, f.rule_index, f.rule_digest,"
+    " f.rule_name, f.function_name, f.found_in, f.address_space, f.address,"
+    " f.relative_address, f.occurrence, f.priority, f.status, f.rationale,"
+    " f.assessed_at, f.triage_revision, f.last_seen_scan_id, l.link_id,"
+    " l.link_revision, f.stale, f.evidence"
+)
+
 #: Page order. Fully derived from stored values, so the same rows page the same
 #: way in every process: by pass, then by address with the unprovable ones
 #: last, then by id.
@@ -369,6 +485,15 @@ class UnknownAnalysisError(CatalogError):
     """No analysis of this target carries the requested id.
 
     Distinct from an analysis with no candidates: that is an empty page.
+    """
+
+
+class UnknownExternalFindingError(CatalogError):
+    """No external row of this target carries the requested id.
+
+    Distinct from a target whose external store is empty, and distinct again
+    from one whose store could not be read: an id nobody holds is a question
+    with no answer, not a clean negative.
     """
 
 
@@ -1272,6 +1397,410 @@ class Catalog:
             )
         return _proposal_row(row)
 
+    # -- external scopes ----------------------------------------------------
+
+    def record_external_scan(
+        self,
+        *,
+        backend: str,
+        scope: str,
+        scan_id: str,
+        scanned_at: str,
+        state: str,
+        coverage: str | None,
+        reason: str | None = None,
+        capability_fingerprint: str | None = None,
+        rules: list[dict[str, object]] | None = None,
+        rule_coverage: list[dict[str, object]] | None = None,
+        warnings: list[str] | None = None,
+        findings: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Commit one external backend's scan of one of its own scopes.
+
+        Scopes are independent, and this is where that is enforced rather
+        than hoped for: everything below is keyed on ``(target, backend,
+        scope)``, so a Ghidra ``custom:nightly`` scan cannot see, retire or
+        stale a single row of Ghidra ``default``, of r2 anything, or of the
+        IDA netnode — which this module has no path to at all.
+
+        An assessment is preserved by exact finding ID. A row this scan
+        observed again keeps its ``status``, ``rationale``,
+        ``triage_revision`` and ``assessed_at`` and takes everything else
+        from the fresh evidence; only its own triage may change those four.
+
+        What happens to a row this scan did **not** observe is the whole of
+        the stale contract, and it turns on two facts together. A scan that
+        ran (``state="evaluated"``) and saw the whole image
+        (``coverage="complete"``) retires it: the call site really is gone.
+        Anything else — partial coverage, a failure, an unreachable
+        provider, an identity this could not prove — keeps it and marks it
+        ``stale``. A run that was cut short is not evidence that the thing an
+        earlier run saw has gone away.
+
+        External rows belong to the original binary's SHA-256 namespace, so a
+        target whose source bytes are not established refuses outright:
+        storing them under a provisional database-only key would mean rows
+        that could never be joined to the image they describe.
+        """
+        self._require_writable()
+        name = _validate_external_backend(backend)
+        scope_name = _validate_scope(scope)
+        held = _validate_scope_state(state)
+        covered = _validate_scan_coverage(coverage, held)
+        if self._target.source_sha256 is None:
+            raise UnverifiedAssociationError(
+                f"this target is {self._target.key}, whose original bytes are"
+                f" not established, and an external {name} scope belongs to"
+                " the original binary's SHA-256 namespace: supply the binary"
+                " and prove the association first. Nothing was stored."
+            )
+        identifier = _validate_id(scan_id, "scan_id")
+        when = _validate_id(scanned_at, "scanned_at")
+        rows = [
+            _external_finding_row(item, index, name, scope_name)
+            for index, item in enumerate(findings or [])
+        ]
+        seen = {row["finding_id"] for row in rows}
+        if len(seen) != len(rows):
+            raise CatalogError(
+                "two findings in this scan carry the same id, so one would"
+                " silently replace the other; a finding id names one call"
+                " site of one rule"
+            )
+        scope_id = _external_scope_id(self._target.key, name, scope_name)
+        now = utc_now()
+        with self._transaction() as connection:
+            self._ensure_target(connection)
+            connection.execute(
+                "INSERT INTO external_scopes (scope_id, target_key, backend,"
+                " scope, scan_id, scanned_at, coverage,"
+                " capability_fingerprint, state, reason, rules,"
+                " rule_coverage, warnings, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(scope_id) DO UPDATE SET"
+                " scan_id = excluded.scan_id,"
+                " scanned_at = excluded.scanned_at,"
+                " coverage = excluded.coverage,"
+                " capability_fingerprint = excluded.capability_fingerprint,"
+                " state = excluded.state, reason = excluded.reason,"
+                " rules = excluded.rules,"
+                " rule_coverage = excluded.rule_coverage,"
+                " warnings = excluded.warnings,"
+                " updated_at = excluded.updated_at",
+                (
+                    scope_id,
+                    self._target.key,
+                    name,
+                    scope_name,
+                    identifier,
+                    when,
+                    covered,
+                    capability_fingerprint,
+                    held,
+                    reason,
+                    _json_array(list(rules or []), "rules"),
+                    _json_array(list(rule_coverage or []), "rule_coverage"),
+                    _json_array(list(warnings or []), "warnings"),
+                    now,
+                ),
+            )
+            for row in rows:
+                connection.execute(
+                    "INSERT INTO external_findings (finding_id, scope_id,"
+                    " rule_id, rule_digest, address_space, address,"
+                    " occurrence, evidence, status, rationale,"
+                    " triage_revision, last_seen_scan_id, updated_at,"
+                    " rule_index, rule_name, function_name, found_in,"
+                    " relative_address, priority, assessed_at, stale)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Not Checked', '', 0,"
+                    " ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)"
+                    " ON CONFLICT(finding_id) DO UPDATE SET"
+                    " rule_id = excluded.rule_id,"
+                    " rule_digest = excluded.rule_digest,"
+                    " address_space = excluded.address_space,"
+                    " address = excluded.address,"
+                    " occurrence = excluded.occurrence,"
+                    " evidence = excluded.evidence,"
+                    " last_seen_scan_id = excluded.last_seen_scan_id,"
+                    " updated_at = excluded.updated_at,"
+                    " rule_index = excluded.rule_index,"
+                    " rule_name = excluded.rule_name,"
+                    " function_name = excluded.function_name,"
+                    " found_in = excluded.found_in,"
+                    " relative_address = excluded.relative_address,"
+                    " priority = excluded.priority,"
+                    " stale = 0",
+                    (
+                        row["finding_id"],
+                        scope_id,
+                        row["rule_id"],
+                        row["rule_digest"],
+                        row["address_space"],
+                        row["address"],
+                        row["occurrence"],
+                        row["evidence_json"],
+                        identifier,
+                        now,
+                        row["rule_index"],
+                        row["rule_name"],
+                        row["function_name"],
+                        row["found_in"],
+                        row["relative_address"],
+                        row["priority"],
+                    ),
+                )
+            unseen = [
+                str(item[0])
+                for item in connection.execute(
+                    "SELECT finding_id FROM external_findings WHERE scope_id"
+                    " = ? AND finding_id NOT IN"
+                    " (SELECT finding_id FROM external_findings WHERE"
+                    " scope_id = ? AND last_seen_scan_id = ?)",
+                    (scope_id, scope_id, identifier),
+                )
+            ]
+            retired: list[str] = []
+            staled: list[str] = []
+            if held == "evaluated" and covered == "complete":
+                retired = unseen
+                for finding_id in unseen:
+                    connection.execute(
+                        "DELETE FROM external_findings WHERE finding_id = ?",
+                        (finding_id,),
+                    )
+            else:
+                staled = unseen
+                for finding_id in unseen:
+                    connection.execute(
+                        "UPDATE external_findings SET stale = 1,"
+                        " updated_at = ? WHERE finding_id = ?",
+                        (now, finding_id),
+                    )
+        stored = self.external_scope(name, scope_name)
+        if stored is None:  # pragma: no cover - the transaction just wrote it
+            raise CatalogError(
+                f"the {name} scope {scope_name!r} was written and cannot be"
+                " read back"
+            )
+        return {
+            "scope": stored,
+            "observed": len(rows),
+            "retired": retired,
+            "stale": staled,
+        }
+
+    def external_scope(self, backend: str, scope: str) -> dict[str, object] | None:
+        """One stored external scope of this target, or ``None``."""
+        name = _validate_external_backend(backend)
+        scope_name = _validate_scope(scope)
+        row = self._connection.execute(
+            "SELECT backend, scope, scan_id, scanned_at, state, coverage,"
+            " reason, capability_fingerprint, rule_coverage, warnings,"
+            " scope_id FROM external_scopes WHERE target_key = ?"
+            " AND backend = ? AND scope = ?",
+            (self._target.key, name, scope_name),
+        ).fetchone()
+        return None if row is None else self._scope_row(row)
+
+    def external_scopes(self, backend: str | None = None) -> list[dict[str, object]]:
+        """Every external scope this target holds, in a stable order."""
+        where = ["target_key = ?"]
+        parameters: list[object] = [self._target.key]
+        if backend is not None:
+            where.append("backend = ?")
+            parameters.append(_validate_external_backend(backend))
+        rows = self._connection.execute(
+            "SELECT backend, scope, scan_id, scanned_at, state, coverage,"
+            " reason, capability_fingerprint, rule_coverage, warnings,"
+            f" scope_id FROM external_scopes WHERE {' AND '.join(where)}"
+            " ORDER BY backend ASC, scope ASC",
+            tuple(parameters),
+        ).fetchall()
+        return [self._scope_row(row) for row in rows]
+
+    def external_totals(self) -> dict[str, object]:
+        """How many external rows this target holds, and how many are stale.
+
+        Counted per backend and over all of them. The aggregate counts
+        *findings*, not deduplicated vulnerabilities, exactly as the design
+        says it must: a reviewer-linked pair contributes two rows.
+        """
+        rows = self._connection.execute(
+            "SELECT s.backend, count(*), sum(f.stale) FROM external_findings f"
+            " JOIN external_scopes s ON s.scope_id = f.scope_id"
+            " WHERE s.target_key = ? GROUP BY s.backend ORDER BY s.backend",
+            (self._target.key,),
+        ).fetchall()
+        per_backend = {
+            str(row[0]): {"total": int(row[1]), "stale": int(row[2] or 0)}
+            for row in rows
+        }
+        return {
+            "by_backend": per_backend,
+            "total": sum(entry["total"] for entry in per_backend.values()),
+            "stale": sum(entry["stale"] for entry in per_backend.values()),
+        }
+
+    def external_status_counts(self) -> dict[str, dict[str, int]]:
+        """Triage counts over every external row of this target, by backend."""
+        counts: dict[str, dict[str, int]] = {}
+        for row in self._connection.execute(
+            "SELECT s.backend, f.status, count(*) FROM external_findings f"
+            " JOIN external_scopes s ON s.scope_id = f.scope_id"
+            " WHERE s.target_key = ? GROUP BY s.backend, f.status",
+            (self._target.key,),
+        ):
+            table = counts.setdefault(
+                str(row[0]), {status: 0 for status in TRIAGE_STATUSES}
+            )
+            table[str(row[1])] = int(row[2])
+        return counts
+
+    def page_external_findings(
+        self, offset: int = 0, limit: int = 100, *, backend: str | None = None
+    ) -> dict[str, object]:
+        """One window of this target's external rows, in the design's order."""
+        try:
+            offset, limit = validate_page(offset, limit)
+        except OperationError as error:
+            raise CatalogError(str(error)) from error
+        where = ["s.target_key = ?"]
+        parameters: list[object] = [self._target.key]
+        if backend is not None:
+            where.append("s.backend = ?")
+            parameters.append(_validate_external_backend(backend))
+        clause = " AND ".join(where)
+        total = self._connection.execute(
+            "SELECT count(*) FROM external_findings f JOIN external_scopes s"
+            f" ON s.scope_id = f.scope_id WHERE {clause}",
+            tuple(parameters),
+        ).fetchone()[0]
+        rows = self._connection.execute(
+            f"SELECT {_EXTERNAL_COLUMNS} FROM external_findings f"
+            " JOIN external_scopes s ON s.scope_id = f.scope_id"
+            " LEFT JOIN links l ON l.external_finding_id = f.finding_id"
+            f" WHERE {clause} {_EXTERNAL_PAGE_ORDER} LIMIT ? OFFSET ?",
+            (*parameters, limit, offset),
+        ).fetchall()
+        findings = [self._finding_row(row) for row in rows]
+        return {
+            "offset": offset,
+            "limit": limit,
+            "total": int(total),
+            "loaded": len(findings),
+            "findings": findings,
+        }
+
+    def external_finding(self, finding_id: str) -> dict[str, object] | None:
+        """One external row *of this target*, or ``None``.
+
+        A row another target owns answers ``None`` rather than that target's
+        finding, for the same reason :meth:`analysis` does: an assessment of
+        one image may never be recorded against another.
+        """
+        row = self._connection.execute(
+            f"SELECT {_EXTERNAL_COLUMNS} FROM external_findings f"
+            " JOIN external_scopes s ON s.scope_id = f.scope_id"
+            " LEFT JOIN links l ON l.external_finding_id = f.finding_id"
+            " WHERE f.finding_id = ? AND s.target_key = ?",
+            (_validate_id(finding_id, "finding_id"), self._target.key),
+        ).fetchone()
+        return None if row is None else self._finding_row(row)
+
+    def assess_external_finding(
+        self, finding_id: str, status: str, rationale: str
+    ) -> dict[str, object]:
+        """Record one assessment of one external row, by its exact id.
+
+        The row's own authority and nothing else: this writes no IDA
+        netnode, touches no other backend's scope, and leaves the evidence
+        exactly as the scan that found it reported. ``triage_revision``
+        counts accepted updates to this one row. An id this target does not
+        hold is refused rather than created.
+        """
+        self._require_writable()
+        identifier = _validate_id(finding_id, "finding_id")
+        try:
+            chosen = validate_status(status)
+            why = validate_rationale(rationale)
+        except OperationError as refused:
+            raise CatalogError(str(refused)) from refused
+        now = utc_now()
+        with self._transaction() as connection:
+            held = connection.execute(
+                "SELECT f.finding_id FROM external_findings f"
+                " JOIN external_scopes s ON s.scope_id = f.scope_id"
+                " WHERE f.finding_id = ? AND s.target_key = ?",
+                (identifier, self._target.key),
+            ).fetchone()
+            if held is None:
+                raise UnknownExternalFindingError(
+                    f"no external finding carries the id {identifier!r} for"
+                    f" target {self._target.key}. Nothing was written"
+                )
+            connection.execute(
+                "UPDATE external_findings SET status = ?, rationale = ?,"
+                " assessed_at = ?, triage_revision = triage_revision + 1,"
+                " updated_at = ? WHERE finding_id = ?",
+                (chosen, why, now, now, identifier),
+            )
+        stored = self.external_finding(identifier)
+        if stored is None:  # pragma: no cover - the transaction just wrote it
+            raise CatalogError(
+                f"external finding {identifier!r} was assessed and cannot be"
+                " read back"
+            )
+        return stored
+
+    def _scope_row(self, row: tuple[Any, ...]) -> dict[str, object]:
+        counts = self._connection.execute(
+            "SELECT count(*), sum(stale) FROM external_findings"
+            " WHERE scope_id = ?",
+            (row[10],),
+        ).fetchone()
+        return {
+            "backend": row[0],
+            "scope": row[1],
+            "scan_id": row[2],
+            "scanned_at": row[3],
+            "state": row[4],
+            "coverage": row[5],
+            "reason": row[6],
+            "capability_fingerprint": row[7],
+            "rule_coverage": json.loads(row[8]),
+            "warnings": json.loads(row[9]),
+            "total": int(counts[0] or 0),
+            "stale_total": int(counts[1] or 0),
+        }
+
+    def _finding_row(self, row: tuple[Any, ...]) -> dict[str, object]:
+        """One stored external row, in the published ``Finding`` shape."""
+        return {
+            "id": row[0],
+            "backend": row[1],
+            "source": row[2],
+            "binary_sha256": self._target.source_sha256,
+            "rule_index": int(row[3]),
+            "rule_digest": row[4],
+            "rule_name": row[5],
+            "function_name": row[6],
+            "found_in": row[7],
+            "address_space": row[8],
+            "address": "" if row[9] is None else f"0x{int(row[9]):x}",
+            "relative_address": row[10],
+            "occurrence": int(row[11]),
+            "priority": row[12],
+            "status": row[13],
+            "rationale": row[14] or "",
+            "assessed_at": row[15],
+            "triage_revision": int(row[16]),
+            "link_id": row[18],
+            "link_revision": row[19],
+            "last_seen_scan_id": row[17],
+            "stale": bool(row[20]),
+            "evidence": json.loads(row[21]),
+        }
+
     # -- internals ----------------------------------------------------------
 
     def _identity_payload(self) -> dict[str, object]:
@@ -1748,6 +2277,195 @@ def _whole_number(value: object, what: str) -> int:
     return value
 
 
+# -- external scopes --------------------------------------------------------
+
+
+def _validate_external_backend(backend: object) -> str:
+    if backend not in EXTERNAL_BACKENDS:
+        raise CatalogError(
+            f"an external backend must be one of {sorted(EXTERNAL_BACKENDS)},"
+            f" got {backend!r}; the IDA backend keeps its own rows in the"
+            " managed database's netnode and has no scope here"
+        )
+    return str(backend)
+
+
+def _validate_scope(scope: object) -> str:
+    """One ``default`` or ``custom:<scan_name>`` scope name."""
+    if not isinstance(scope, str) or not scope.strip():
+        raise CatalogError(f"scope must be a non-empty string, got {scope!r}")
+    if len(scope) > MAX_ID_LENGTH:
+        raise CatalogError(
+            f"scope is {len(scope)} characters; the limit is {MAX_ID_LENGTH}"
+        )
+    if scope != "default" and not scope.startswith("custom:"):
+        raise CatalogError(
+            "scope must be 'default' or 'custom:<scan_name>', got"
+            f" {scope!r}: a backend's scopes are the two the design names and"
+            " nothing else"
+        )
+    return scope
+
+
+def _validate_scope_state(state: object) -> str:
+    if state not in SCOPE_STATES:
+        raise CatalogError(
+            f"state must be one of {sorted(SCOPE_STATES)}, got {state!r}"
+        )
+    return str(state)
+
+
+def _validate_scan_coverage(coverage: object, state: str) -> str | None:
+    """How much of the image this scan covered, when it ran at all.
+
+    A scope that did not run has no coverage, and ``None`` is how that is
+    said. The pairing is checked rather than assumed: a scan that reports
+    itself ``failed`` and ``complete`` in one breath is a caller's mistake,
+    and the one thing this store must never hold is a complete-looking row
+    nothing completed.
+    """
+    if state != "evaluated":
+        if coverage is not None:
+            raise CatalogError(
+                f"a {state!r} scope covered nothing, so coverage must be None,"
+                f" got {coverage!r}: a scan that did not run cannot also claim"
+                " to have covered the image"
+            )
+        return None
+    if coverage not in SCAN_COVERAGES:
+        raise CatalogError(
+            f"coverage must be one of {sorted(SCAN_COVERAGES)} for an"
+            f" evaluated scope, got {coverage!r}"
+        )
+    return str(coverage)
+
+
+def _external_scope_id(target_key: str, backend: str, scope: str) -> str:
+    """The id of the one scope these three facts name.
+
+    Derived rather than minted, so the same backend's same scope of the same
+    target is the same row in every process and a rescan updates it in place
+    instead of creating a second one beside it.
+    """
+    digest = hashlib.sha256()
+    for part in (target_key, backend, scope):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x00")
+    return f"xscope-{digest.hexdigest()[:32]}"
+
+
+def _external_finding_row(
+    item: object, index: int, backend: str, scope: str
+) -> dict[str, Any]:
+    """One finding, validated whole before a single row of a scan is written.
+
+    Every refusal names the finding's position in the request, because a
+    caller handed a list and has to be able to find the one that was wrong.
+    """
+    where = f"findings[{index}]"
+    if not isinstance(item, dict):
+        raise CatalogError(f"{where} must be an object, got {type(item).__name__}")
+    identifier = _validate_id(item.get("id"), f"{where}.id")
+    if item.get("backend") != backend:
+        raise CatalogError(
+            f"{where} claims backend {item.get('backend')!r} and this scan is"
+            f" {backend!r}: a row is authored by the backend that found it"
+        )
+    if item.get("source") != scope:
+        raise CatalogError(
+            f"{where} claims scope {item.get('source')!r} and this scan is"
+            f" {scope!r}: a row belongs to the scope that recorded it"
+        )
+    rule_index = item.get("rule_index")
+    if isinstance(rule_index, bool) or not isinstance(rule_index, int):
+        raise CatalogError(f"{where}.rule_index must be an integer, got {rule_index!r}")
+    if rule_index < 0:
+        raise CatalogError(f"{where}.rule_index must be >= 0, got {rule_index}")
+    digest = _validate_id(item.get("rule_digest"), f"{where}.rule_digest")
+    space = _validate_id(item.get("address_space"), f"{where}.address_space")
+    address = _external_address(item.get("address"), where)
+    occurrence = item.get("occurrence", 0)
+    if isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 0:
+        raise CatalogError(
+            f"{where}.occurrence must be an integer >= 0, got {occurrence!r}"
+        )
+    priority = item.get("priority")
+    if priority not in PRIORITIES:
+        raise CatalogError(
+            f"{where}.priority must be one of {list(PRIORITIES)}, got"
+            f" {priority!r}"
+        )
+    evidence = item.get("evidence")
+    if not isinstance(evidence, dict):
+        raise CatalogError(
+            f"{where}.evidence must be an object, got {type(evidence).__name__}"
+        )
+    evidence_json = _dump_json(evidence)
+    if len(evidence_json) > MAX_EVIDENCE_BYTES:
+        raise CatalogError(
+            f"{where}.evidence is {len(evidence_json)} bytes of JSON; the"
+            f" limit is {MAX_EVIDENCE_BYTES}"
+        )
+    return {
+        "finding_id": identifier,
+        # The rule's identity, not its ordinal: two different rules can share
+        # an index across two scans of one scope, and the unique key below
+        # has to keep their rows apart rather than collapse them.
+        "rule_id": f"{rule_index}:{digest}",
+        "rule_index": rule_index,
+        "rule_digest": digest,
+        "rule_name": _row_text(item.get("rule_name"), f"{where}.rule_name"),
+        "function_name": _row_text(
+            item.get("function_name"), f"{where}.function_name"
+        ),
+        "found_in": _row_text(item.get("found_in"), f"{where}.found_in"),
+        "address_space": space,
+        "address": address,
+        "relative_address": _optional_text(
+            item.get("relative_address"), f"{where}.relative_address"
+        ),
+        "occurrence": occurrence,
+        "priority": str(priority),
+        "evidence_json": evidence_json,
+    }
+
+
+def _external_address(value: object, where: str) -> int:
+    """One finding's address, as the integer this store orders rows by.
+
+    A finding is a call site, and a call site this backend could not place in
+    an address space is not one it may record: there would be nothing for a
+    reviewer to go and look at, and nothing a link could ever verify.
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = int(value, 16 if value.lower().startswith("0x") else 10)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    raise CatalogError(
+        f"{where}.address must be an address this backend proved, as an"
+        f" integer >= 0 or its hexadecimal spelling, got {value!r}"
+    )
+
+
+def _row_text(value: object, what: str) -> str:
+    if not isinstance(value, str):
+        raise CatalogError(f"{what} must be a string, got {type(value).__name__}")
+    if len(value) > MAX_ID_LENGTH:
+        raise CatalogError(
+            f"{what} is {len(value)} characters; the limit is {MAX_ID_LENGTH}"
+        )
+    return value
+
+
+def _optional_text(value: object, what: str) -> str | None:
+    return None if value is None else _row_text(value, what)
+
+
 # -- pass results -----------------------------------------------------------
 
 
@@ -1986,7 +2704,15 @@ def _connect(store: Path, *, writable: bool) -> sqlite3.Connection:
 
 
 def _apply_schema(connection: sqlite3.Connection) -> None:
-    """Create the schema once, or refuse a version this build does not own."""
+    """Create the schema once, migrate it forward, or refuse to touch it.
+
+    One transaction does the whole of whichever of those happens, and the
+    version moves inside it: a catalog another process is also opening is
+    either the version it was or the version this build owns, never a half
+    migrated one. The version is re-read after the lock is taken, so the
+    process that loses the race reads the winner's result rather than
+    repeating its work.
+    """
     version = _version(connection)
     if version == SCHEMA_VERSION:
         return
@@ -1996,24 +2722,41 @@ def _apply_schema(connection: sqlite3.Connection) -> None:
             f" writes version {SCHEMA_VERSION} only, and will not migrate or"
             " overwrite a newer one"
         )
-    if version != 0:
+    if version != 0 and version not in _MIGRATIONS:
         raise CatalogSchemaError(
             f"this catalog is schema version {version}, which this build"
             f" (version {SCHEMA_VERSION}) has no migration for"
         )
     connection.execute("BEGIN IMMEDIATE")
     try:
-        if _version(connection) != 0:  # Another process won the race.
+        held = _version(connection)
+        if held == SCHEMA_VERSION:  # Another process won the race.
+            connection.rollback()
+            return
+        if held != version:
             connection.rollback()
             _require_known_version(connection)
             return
-        if _has_tables(connection):
-            raise CatalogSchemaError(
-                "this file holds tables but carries no schema version, so it"
-                " is not a VulFi catalog and this build will not write over it"
-            )
-        for statement in _SCHEMA:
-            connection.execute(statement)
+        if held == 0:
+            if _has_tables(connection):
+                raise CatalogSchemaError(
+                    "this file holds tables but carries no schema version, so"
+                    " it is not a VulFi catalog and this build will not write"
+                    " over it"
+                )
+            for statement in _SCHEMA:
+                connection.execute(statement)
+        else:
+            for step in range(held, SCHEMA_VERSION):
+                migration = _MIGRATIONS.get(step)
+                if migration is None:
+                    raise CatalogSchemaError(
+                        f"this build has no migration from schema version"
+                        f" {step} to {step + 1}, so the catalog was left"
+                        f" exactly as it was at version {held}"
+                    )
+                for statement in migration:
+                    connection.execute(statement)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     except BaseException:
         connection.rollback()

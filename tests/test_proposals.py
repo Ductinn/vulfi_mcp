@@ -285,16 +285,25 @@ def test_a_proposal_must_name_its_candidates_own_address_and_kind() -> None:
 
 
 def test_a_candidate_this_build_cannot_write_is_refused_not_faked() -> None:
-    # Plan 3 brings the external providers. Until one of them can write back
-    # safely, a proposal against its candidate is unavailable *by name* — the
-    # one outcome that must never happen is a reported apply that no backend
-    # performed.
-    foreign = dict(FUNCTION_CANDIDATE, backend="ghidra")
+    # Plan 3 Task 2 gave Ghidra a safe typed writer that validates and saves,
+    # so a Ghidra candidate is now proposable. radare2 still has none — no
+    # project, no save, so a mutation would not outlive the session — and a
+    # proposal against one of its candidates is unavailable *by name*. The one
+    # outcome that must never happen is a reported apply no backend performed.
+    foreign = dict(FUNCTION_CANDIDATE, backend="r2")
     body = validate_proposal(_proposal())
     with pytest.raises(PreparationError) as refused:
         check_proposal_against_candidate(body, foreign)
-    assert "ghidra" in str(refused.value)
+    assert "r2" in str(refused.value)
     assert "nothing was applied" in str(refused.value).lower()
+
+
+def test_a_ghidra_candidate_is_proposable_now_that_it_has_a_safe_writer() -> None:
+    # The other half of the rule above: a backend that *can* write back
+    # safely is not refused, because refusing it would make the operator's
+    # Ghidra approval path unreachable and therefore untestable.
+    recovered = dict(FUNCTION_CANDIDATE, backend="ghidra")
+    check_proposal_against_candidate(validate_proposal(_proposal()), recovered)
 
 
 # -- what the catalog does with a decision ----------------------------------
