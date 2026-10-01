@@ -313,7 +313,7 @@ _CODE_NOT_SWEPT: Final = (
 
 _FUNCTION_ROW: Final = re.compile(r"\A(?P<address>0x[0-9A-Fa-f]+)\s+(?P<name>\S.*)\Z")
 _SYMBOL_ROW: Final = re.compile(
-    r"\A(?P<address>0x[0-9A-Fa-f]+)\s+(?P<size>\d+)\s+(?P<name>\S.*)\Z"
+    r"\A(?P<address>0x[0-9A-Fa-f]+)\s+(?P<size>\d+)(?:\s+(?P<name>\S.*))?\Z"
 )
 _XREF_ROW: Final = re.compile(
     r"\A(?P<owner>\S+)\s+(?P<address>0x[0-9A-Fa-f]+)\s+"
@@ -324,6 +324,22 @@ _XREF_ROW: Final = re.compile(
 _EXTENT_ROW: Final = re.compile(r"\A(?P<size>\d+):\s+\S")
 _HEX_LINE: Final = re.compile(r"\A(?P<address>0x[0-9A-Fa-f]+)\s\s(?P<rest>.*)\Z")
 _SECTION_HEADER: Final = re.compile(r"\Anth\s+paddr\b")
+#: The rule radare2 draws under a table header, in either of the two glyphs
+#: its table printer uses.
+_SECTION_RULE: Final = re.compile(r"\A[-\u2014\u2015\u2500-\u257f]+\Z")
+#: One ``iS``/``iSS`` row. The name is optional because the ``NULL`` section
+#: at index zero has none, and a row with a missing *address* is a row this
+#: adapter refuses rather than one it drops.
+_SECTION_ROW: Final = re.compile(
+    r"\A(?P<nth>\d+)\s+(?P<paddr>0x[0-9A-Fa-f]+)\s+(?P<psize>0x[0-9A-Fa-f]+)\s+"
+    r"(?P<vaddr>0x[0-9A-Fa-f]+)\s+(?P<vsize>0x[0-9A-Fa-f]+)\s+"
+    r"(?P<perm>[-rwx]{4})\s+(?P<flags>0x[0-9A-Fa-f]+)\s+(?P<type>\S+)"
+    r"(?:\s+(?P<name>\S.*))?\Z"
+)
+#: What ``list_functions`` says when radare2's analysis recognised nothing.
+#: It is an answer, not a row — and an answer this adapter never reads as
+#: "this image has no code in it".
+_NO_FUNCTIONS: Final = re.compile(r"\ANo functions (found|matched)\b")
 #: radare2 name prefixes that are its own bookkeeping rather than a symbol's
 #: own name. Stripped before a rule's function names are compared.
 _PREFIXES: Final[tuple[str, ...]] = ("sym.imp.", "sym.", "imp.", "fcn.", "loc.")
@@ -344,7 +360,25 @@ class PreparedPass(PassResult):
 
 
 class R2UnavailableError(ProviderError):
-    """The radare2 provider is not configured, or cannot hold this target."""
+    """The radare2 provider is not configured, or cannot hold this target.
+
+    This is *the backend was not available*, not *the backend was asked and
+    could not answer*, and the two are different answers to Plan 3's routing:
+    one says try the next backend, the other says this one was selected and
+    failed. It therefore propagates out of both entry points instead of being
+    flattened into a per-rule ``failed``.
+    """
+
+
+class R2FormatError(ProviderError):
+    """A reply this adapter cannot read.
+
+    r2mcp declares no ``outputSchema`` for any tool, so the pinned fingerprint
+    attests the call and nothing about the reply: a drifted listing arrives as
+    an ordinary success full of rows no parser here recognises. Every parse
+    below raises this rather than skipping the row, because a row that was not
+    understood is not a thing that was not there.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -358,6 +392,11 @@ async def prepare_r2(target: str, passes: tuple[str, ...]) -> tuple[PassResult, 
     One session, opened and analysed from scratch, because this provider keeps
     nothing between sessions. The session is released on the way out, and the
     operator's file is never written: every allowlisted tool reads.
+
+    One pass that cannot be answered does not take the others down: a drifted
+    capability becomes ``coverage="unavailable"`` for the pass that needed it,
+    with the refusal on every range, and the passes that already ran are
+    returned. Per-pass fallback is the whole point of this plan.
     """
     wanted = _requested(passes)
     config = _config()
@@ -366,7 +405,12 @@ async def prepare_r2(target: str, passes: tuple[str, ...]) -> tuple[PassResult, 
         try:
             results: list[PassResult] = []
             for name in wanted:
-                results.append(await _run_pass(session, image, name))
+                try:
+                    results.append(await _run_pass(session, image, name))
+                except R2UnavailableError:
+                    raise
+                except ProviderError as refused:
+                    results.append(_unavailable_pass(image, name, str(refused)))
             return tuple(results)
         finally:
             await _release(session)
@@ -380,11 +424,12 @@ async def evidence_r2(target: str, rule: Rule, rule_index: int) -> RuleEvidence:
     says they are calls. Argument recovery is not among them, so a rule whose
     branch indexes ``param`` comes back ``unsupported`` naming what was
     missing — never ``False``, and never a priority read out of pseudocode.
+
+    :class:`R2UnavailableError` is deliberately **not** caught: a backend that
+    is not configured, or whose file could not be opened and analysed, is not
+    a rule that was tried and failed.
     """
-    try:
-        config = _config()
-    except R2UnavailableError as refused:
-        return _evidence(rule_index, [], [], "failed", str(refused))
+    config = _config()
     try:
         async with provider_session(config, target, allowlist=ALLOWLIST) as session:
             image = await _open(session)
@@ -392,6 +437,8 @@ async def evidence_r2(target: str, rule: Rule, rule_index: int) -> RuleEvidence:
                 return await _rule_evidence(session, image, rule, rule_index)
             finally:
                 await _release(session)
+    except R2UnavailableError:
+        raise
     except ProviderError as refused:
         return _evidence(rule_index, [], [], "failed", str(refused))
 
@@ -456,7 +503,7 @@ async def _open(session: ProviderSession) -> _Image:
             f" {headline[:200]!r}"
         )
     info = _info(await _call(session, "show_info"))
-    listing = await _call(session, "list_sections")
+    listing = await _paged(session, "list_sections")
     sections = _sections(listing)
     unmapped = _unmapped_sections(listing)
     if unmapped:
@@ -504,7 +551,7 @@ async def _call(session: ProviderSession, tool: str, **arguments: Any) -> str:
     reply = await checked_call(session, tool, dict(arguments), PINNED_SCHEMAS[tool])
     blocks = reply.get("text")
     if not isinstance(blocks, list):
-        raise R2UnavailableError(
+        raise R2FormatError(
             f"the radare2 provider's {tool!r} reply carries no text blocks"
         )
     return "\n".join(str(block) for block in blocks)
@@ -557,68 +604,140 @@ def _info(text: str) -> dict[str, str]:
         key, value = parts[0], parts[1].strip()
         if key not in fields:
             fields[key] = value
+    if "baddr" not in fields:
+        raise R2FormatError(
+            "the radare2 provider's 'show_info' reply states no 'baddr', so"
+            " the space every address below is in is unknown"
+        )
     return fields
 
 
-def _sections(text: str) -> list[dict[str, Any]]:
-    """Every mapped section, as half-open ranges in the provider's space.
+#: Pages of a line-paginated listing one call may read, and the lines one page
+#: asks for. r2mcp's list tools paginate *by line*, take a line number as the
+#: cursor, and drop the ``next_cursor`` they compute — so the end of a listing
+#: is found by counting, not by following a cursor the reply does not carry.
+MAX_LIST_PAGES: Final = 64
+LIST_PAGE_LINES: Final = 1000
+
+
+async def _paged(session: ProviderSession, tool: str, **arguments: Any) -> list[str]:
+    """Every line of one line-paginated listing, or a refusal.
+
+    ``list_sections`` and ``list_symbols`` go through ``list_cmd_response``,
+    which paginates the command's text at ``page_size`` lines (default 1000)
+    and answers a ``cursor`` that is a line number — but the reply carries no
+    cursor back, so a caller that asks once gets the first page and no way to
+    know there was a second. The same tool answers ``count`` with the number
+    of lines it has, and that is what bounds the walk here.
+    """
+    declared = _rows(await _call(session, tool, count=True, **arguments))
+    if len(declared) != 1 or not declared[0].strip().isdigit():
+        raise R2FormatError(
+            f"the radare2 provider's {tool!r} did not answer how many lines it"
+            f" has ({declared[:2]!r}), so a page of it cannot be told from all"
+            " of it"
+        )
+    total = int(declared[0].strip())
+    lines: list[str] = []
+    for _ in range(MAX_LIST_PAGES):
+        if len(lines) >= total:
+            return lines
+        page = (await _call(
+            session,
+            tool,
+            cursor=str(len(lines)),
+            page_size=LIST_PAGE_LINES,
+            **arguments,
+        )).splitlines()
+        if not page:
+            raise R2FormatError(
+                f"the radare2 provider's {tool!r} answered {total} lines and"
+                f" stopped producing them at line {len(lines)}"
+            )
+        lines.extend(page)
+    raise R2FormatError(
+        f"the radare2 provider's {tool!r} did not finish within"
+        f" {MAX_LIST_PAGES} pages of {LIST_PAGE_LINES} lines"
+    )
+
+
+def _section_rows(lines: Sequence[str], tool: str) -> list[dict[str, Any]]:
+    """Every row of the *first* table in a section listing, strictly.
 
     ``list_sections`` runs ``iS;iSS`` and prints two tables with the same
     header: sections, then segments. Only the first is read — the second
     describes the same bytes a second time, and a range reported twice would
-    be a range this pass claims to have covered twice.
+    be a range a pass claims to have covered twice.
 
-    A section with no virtual address is not in the address space at all
-    (``.symtab``, ``.strtab``, ``.comment``). It is dropped here and named in
-    the pass's warnings rather than reported as a range nothing read.
+    A line that is neither the header, the rule under it, nor a row this
+    parser recognises **fails the capability**. Skipping it would delete a
+    mapped range from an image that still looked complete.
     """
-    blocks: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     headers = 0
-    for line in _rows(text):
-        if _SECTION_HEADER.match(line.strip()):
+    for line in _rows("\n".join(lines)):
+        stripped = line.strip()
+        if _SECTION_HEADER.match(stripped):
             headers += 1
             if headers > 1:
                 break
             continue
-        fields = line.split()
-        if len(fields) < 9 or not fields[0].isdigit():
+        if _SECTION_RULE.match(stripped):
             continue
-        try:
-            start = int(fields[3], 0)
-            size = int(fields[4], 0)
-        except ValueError:
-            continue
-        if start <= 0 or size <= 0 or "r" not in fields[5]:
-            continue
-        blocks.append(
+        matched = _SECTION_ROW.match(stripped)
+        if matched is None:
+            raise R2FormatError(
+                f"the radare2 provider's {tool!r} answered a row this adapter"
+                f" does not recognise ({stripped[:120]!r}); a listing it cannot"
+                " read is not a listing with fewer things in it"
+            )
+        rows.append(
             {
-                "name": fields[8],
-                "start": start,
-                "end": start + size,
-                "perm": fields[5],
-                "type": fields[7],
-                "executable": "x" in fields[5],
+                "start": int(matched["vaddr"], 0),
+                "size": int(matched["vsize"], 0),
+                "perm": matched["perm"],
+                "type": matched["type"],
+                "name": (matched["name"] or "").strip(),
             }
         )
+    if not headers:
+        raise R2FormatError(
+            f"the radare2 provider's {tool!r} answered no table header, so"
+            " nothing in it could be read as a section"
+        )
+    return rows
+
+
+def _sections(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """Every mapped section, as half-open ranges in the provider's space.
+
+    A section with no virtual address is not in the address space at all
+    (``.symtab``, ``.strtab``, ``.comment``). It is dropped here and named by
+    :func:`_unmapped_sections` in the pass's warnings rather than reported as
+    a range nothing read.
+    """
+    blocks = [
+        {
+            "name": row["name"],
+            "start": row["start"],
+            "end": row["start"] + row["size"],
+            "perm": row["perm"],
+            "type": row["type"],
+            "executable": "x" in row["perm"],
+        }
+        for row in _section_rows(lines, "list_sections")
+        if row["start"] > 0 and row["size"] > 0 and "r" in row["perm"]
+    ]
     return sorted(blocks, key=lambda block: block["start"])
 
 
-def _unmapped_sections(text: str) -> list[str]:
+def _unmapped_sections(lines: Sequence[str]) -> list[str]:
     """Section names the provider reports with no address in this space."""
-    names: list[str] = []
-    headers = 0
-    for line in _rows(text):
-        if _SECTION_HEADER.match(line.strip()):
-            headers += 1
-            if headers > 1:
-                break
-            continue
-        fields = line.split()
-        if len(fields) < 9 or not fields[0].isdigit():
-            continue
-        if _whole(fields[3], 0) == 0 and _whole(fields[4], 0) > 0:
-            names.append(fields[8])
-    return names
+    return [
+        row["name"]
+        for row in _section_rows(lines, "list_sections")
+        if row["start"] == 0 and row["size"] > 0 and row["name"]
+    ]
 
 
 async def _functions(
@@ -632,14 +751,25 @@ async def _functions(
     does not match it is reported short rather than read as the whole image.
     """
     declared = _rows(await _call(session, "list_functions", count=True))
-    expected: int | None = None
-    if len(declared) == 1 and declared[0].strip().isdigit():
-        expected = int(declared[0].strip())
+    if len(declared) != 1 or not declared[0].strip().isdigit():
+        raise R2FormatError(
+            "the radare2 provider's 'list_functions' did not answer how many"
+            f" functions it has ({declared[:2]!r}), so a short listing cannot"
+            " be told from the whole image"
+        )
+    expected = int(declared[0].strip())
+    listed = _rows(await _call(session, "list_functions", max_length=-1))
+    if len(listed) == 1 and _NO_FUNCTIONS.match(listed[0].strip()):
+        return [], listed[0].strip()
     rows: list[dict[str, Any]] = []
-    for line in _rows(await _call(session, "list_functions", max_length=-1)):
+    for line in listed:
         matched = _FUNCTION_ROW.match(line.strip())
         if matched is None:
-            continue
+            raise R2FormatError(
+                "the radare2 provider's 'list_functions' answered a row this"
+                f" adapter does not recognise ({line.strip()[:120]!r}); a row"
+                " it cannot read is not a function that is not there"
+            )
         rows.append(
             {
                 "entry": int(matched["address"], 16),
@@ -647,11 +777,6 @@ async def _functions(
             }
         )
     rows.sort(key=lambda row: row["entry"])
-    if expected is None:
-        return rows, (
-            "the provider did not answer how many functions it has, so this"
-            " listing cannot be checked for truncation"
-        )
     if len(rows) != expected:
         return rows, (
             f"the provider reports {expected} functions and listed"
@@ -664,20 +789,26 @@ async def _functions(
 async def _symbols(session: ProviderSession) -> dict[int, dict[str, Any]]:
     """Every symbol with an address and a size, keyed by address.
 
-    An import with no local implementation is spelled ``0xffffffffffffffff``
-    here; it is not an address in this image and is dropped.
+    Read through :func:`_paged`, because ``list_symbols`` is one of the
+    line-paginated listings: a single call answers its first page and says
+    nothing about the rest. An import with no local implementation is spelled
+    ``0xffffffffffffffff`` here; it is not an address in this image and is
+    dropped. A row this parser does not recognise fails the capability.
     """
     symbols: dict[int, dict[str, Any]] = {}
-    for line in _rows(await _call(session, "list_symbols")):
+    for line in _rows("\n".join(await _paged(session, "list_symbols"))):
         matched = _SYMBOL_ROW.match(line.strip())
         if matched is None:
-            continue
+            raise R2FormatError(
+                "the radare2 provider's 'list_symbols' answered a row this"
+                f" adapter does not recognise ({line.strip()[:120]!r}); a row"
+                " it cannot read is not a symbol that is not there"
+            )
+        name = (matched["name"] or "").strip()
         address = int(matched["address"], 16)
-        if address == 0 or address == 0xFFFFFFFFFFFFFFFF:
+        if not name or address == 0 or address == 0xFFFFFFFFFFFFFFFF:
             continue
-        symbols.setdefault(
-            address, {"size": int(matched["size"]), "name": matched["name"].strip()}
-        )
+        symbols.setdefault(address, {"size": int(matched["size"]), "name": name})
     return symbols
 
 
@@ -711,7 +842,11 @@ async def _xrefs(session: ProviderSession, address: int) -> list[dict[str, Any]]
     for line in _rows(await _call(session, "xrefs_to", address=_hex(address))):
         matched = _XREF_ROW.match(line.strip())
         if matched is None:
-            continue
+            raise R2FormatError(
+                "the radare2 provider's 'xrefs_to' answered a row this adapter"
+                f" does not recognise ({line.strip()[:120]!r}); a row it cannot"
+                " read is not a reference that is not there"
+            )
         rows.append(
             {
                 "owner": matched["owner"],
@@ -740,17 +875,32 @@ async def _read(session: ProviderSession, start: int, length: int) -> bytes:
             continue
         matched = _HEX_LINE.match(line.rstrip())
         if matched is None:
-            break
+            raise R2FormatError(
+                "the radare2 provider's 'hexdump' answered a line this adapter"
+                f" does not recognise ({line.strip()[:120]!r}) while reading"
+                f" {length} bytes at {start:#x}"
+            )
         if int(matched["address"], 16) != start + len(read):
-            break
+            raise R2FormatError(
+                "the radare2 provider's 'hexdump' answered bytes at"
+                f" {int(matched['address'], 16):#x} while this read was at"
+                f" {start + len(read):#x}"
+            )
         wanted = min(16, length - len(read))
         field = matched["rest"][: wanted * 2 + (wanted + 1) // 2].replace(" ", "")
         if len(field) != wanted * 2:
-            break
+            raise R2FormatError(
+                "the radare2 provider's 'hexdump' answered"
+                f" {len(field)} hex digits where {wanted * 2} were asked for at"
+                f" {start + len(read):#x}"
+            )
         try:
             read.extend(bytes.fromhex(field))
-        except ValueError:
-            break
+        except ValueError as refused:
+            raise R2FormatError(
+                "the radare2 provider's 'hexdump' answered something that is"
+                f" not hexadecimal at {start + len(read):#x}: {refused}"
+            ) from None
         if len(read) >= length:
             break
     return bytes(read)
@@ -858,38 +1008,51 @@ async def _functions_pass(session: ProviderSession, image: _Image) -> PreparedPa
     rows, truncated = await _functions(session)
     symbols = await _symbols(session)
     warnings = list(image.warnings)
+    blocked: list[str] = []
     if truncated is not None:
         warnings.append(truncated)
+        blocked.append(truncated)
+
+    # The cap is applied to the *rows*, before anything is measured, so the
+    # extents this pass reports belong to the candidates it reports. Measuring
+    # past the cap would let the bytes of a function nobody was told about
+    # close a coverage gap.
+    reported = rows[:MAX_PASS_CANDIDATES]
+    omitted = rows[MAX_PASS_CANDIDATES:]
+    if omitted:
+        capped = (
+            f"this pass reported {MAX_PASS_CANDIDATES} functions and stopped;"
+            f" {len(omitted)} more entries were left out, the first at"
+            f" {int(omitted[0]['entry']):#x}, and nothing is claimed about the"
+            " bytes they cover"
+        )
+        warnings.append(capped)
+        blocked.append(capped)
+
     extents: dict[int, int] = {}
-    measured = 0
     unmeasured: list[int] = []
-    for row in rows:
+    for index, row in enumerate(reported):
         entry = int(row["entry"])
-        if measured >= MAX_FUNCTION_EXTENTS:
+        if index >= MAX_FUNCTION_EXTENTS:
             unmeasured.append(entry)
             continue
-        measured += 1
         end = await _extent(session, entry)
         if end is None:
             unmeasured.append(entry)
             continue
         extents[entry] = end
     if unmeasured:
-        warnings.append(
-            f"{len(unmeasured)} of {len(rows)} function entries have no"
-            " measured extent here (the provider's listing carried no size"
-            f" line for them, first at {unmeasured[0]:#x}), so the bytes they"
-            " cover are reported unvisited rather than assumed"
+        unknown = (
+            f"{len(unmeasured)} of {len(reported)} reported function entries"
+            " have no measured extent here (the provider's listing carried no"
+            f" size line for them, first at {unmeasured[0]:#x}), so the bytes"
+            " they cover are reported unvisited rather than assumed"
         )
+        warnings.append(unknown)
+        blocked.append(unknown)
 
     candidates: list[Candidate] = []
-    for row in rows:
-        if len(candidates) >= MAX_PASS_CANDIDATES:
-            warnings.append(
-                f"this pass reported {MAX_PASS_CANDIDATES} functions and"
-                " stopped; the entries past that one were not described"
-            )
-            break
+    for row in reported:
         entry = int(row["entry"])
         block = _block_of(image, entry)
         if block is None:
@@ -898,8 +1061,15 @@ async def _functions_pass(session: ProviderSession, image: _Image) -> PreparedPa
         candidates.append(
             _function_candidate(block, row, extents.get(entry), symbols, references)
         )
-    ranges = _code_ranges(image, extents, truncated is not None or bool(unmeasured))
-    return _pass_result(image, "functions", ranges, candidates, warnings)
+    ranges = _code_ranges(image, extents, bool(blocked))
+    return _pass_result(
+        image,
+        "functions",
+        ranges,
+        candidates,
+        warnings,
+        blocked="; ".join(blocked) if blocked else None,
+    )
 
 
 async def _sweep(
@@ -1200,7 +1370,26 @@ def _pass_result(
     ranges: list[AddressRange],
     candidates: list[Candidate],
     warnings: list[str],
+    blocked: str | None = None,
 ) -> PreparedPass:
+    """One pass result, with ``blocked`` as a veto rather than a note.
+
+    ``blocked`` is set when the pass proved it left something behind — a
+    listing shorter than the provider's own count, a candidate cap, an extent
+    it could not measure. It **removes** ``complete`` from the answers this
+    pass may give, for the summary and for every range in it, because whether
+    the geometry happens to close is not the question: the pass knows it did
+    not see everything it was told about, and a range that says ``complete``
+    says it did.
+    """
+    if blocked is not None:
+        for item in ranges:
+            if item["coverage"] != "complete":
+                continue
+            item["coverage"] = "partial"
+            item["reason"] = (
+                f"{item['reason']}; {blocked}" if item["reason"] else blocked
+            )
     states = {item["coverage"] for item in ranges}
     if not states or states == {"unavailable"}:
         coverage = "unavailable"
@@ -1220,6 +1409,29 @@ def _pass_result(
         "candidates": candidates,
         "image_base": image.base,
     }
+
+
+def _unavailable_pass(image: _Image, name: str, reason: str) -> PreparedPass:
+    """One pass this session could not answer, named range by range.
+
+    A capability that drifted, a reply that could not be read: the pass that
+    needed it reports ``unavailable`` over every range it would have covered,
+    and the passes beside it keep their results.
+    """
+    return _pass_result(
+        image,
+        name,
+        [
+            _unavailable(
+                block,
+                "code_scan" if name == "functions" else "raw_bytes",
+                f"the {name!r} pass could not be answered: {reason}",
+            )
+            for block in image.sections
+        ],
+        [],
+        [*image.warnings, f"the {name!r} pass was not answered: {reason}"],
+    )
 
 
 def _requested(passes: object) -> tuple[str, ...]:
@@ -1245,11 +1457,54 @@ def _requested(passes: object) -> tuple[str, ...]:
 async def _rule_evidence(
     session: ProviderSession, image: _Image, rule: Rule, rule_index: int
 ) -> RuleEvidence:
+    if rule.get("wrappers"):
+        # Upstream VulFi follows a rule's callee one level out through its
+        # wrappers. Finding a wrapper needs argument flow across a call, and
+        # this provider states none — so following only the direct references
+        # below would answer a different rule than the one that was asked.
+        return _evidence(
+            rule_index,
+            [],
+            [],
+            "unsupported",
+            f"rule {rule['name']!r} is a wrapper-following rule, and"
+            " radare2-mcp 1.8.8 states no argument flow across a call: this"
+            " adapter can only follow direct references to the functions the"
+            " rule names, so a wrapper of one of them would be missed rather"
+            " than searched",
+        )
     rows, truncated = await _functions(session)
+    if truncated is not None:
+        # Before the targets are looked for, not after: a listing that is not
+        # the whole image may be missing exactly the functions this rule
+        # names, and "not in the part I read" is not "not there".
+        return _evidence(
+            rule_index,
+            [],
+            [],
+            "failed",
+            f"{truncated}: a rule answered over a function listing that is not"
+            " the whole image would be answered over part of it",
+        )
     wanted = _wanted_names(rule)
     targets = [row for row in rows if _normalize(str(row["name"])) in wanted]
     if not targets:
-        return _evidence(rule_index, [], [], "evaluated", None)
+        # Not a clean zero. ``list_functions`` covers what radare2's analysis
+        # recognised, not every executable byte — the functions pass reports
+        # the rest of the code ranges unvisited for exactly this reason — so
+        # "this listing has no strcpy in it" is not "this image calls none".
+        return _evidence(
+            rule_index,
+            [],
+            [],
+            "unsupported",
+            f"rule {rule['name']!r} names"
+            f" {', '.join(sorted(rule['function_names'])[:8])} and none of"
+            f" them is in the {len(rows)} functions radare2's analysis"
+            " recognised; that listing is not a sweep of the executable"
+            " ranges, so this is a rule this backend could not look for, not"
+            " a rule that matched nothing",
+        )
     names = {int(row["entry"]): str(row["name"]) for row in rows}
     by_name: dict[str, int] = {}
     for entry, name in names.items():
@@ -1326,24 +1581,18 @@ async def _rule_evidence(
                 {"start": int(site["address"]), "end": int(site["address"]) + 1}
             ]
             entry_range["reason"] = (
-                "the caller graph above this call site is larger than the"
-                f" {MAX_CALLERS} functions this pass walks, so which functions"
-                " it is reached from was not established"
+                "which functions this call site is reached from was not"
+                " established: the walk above it either exceeded the"
+                f" {MAX_CALLERS} functions this pass follows or met a caller"
+                " the provider could not name"
             )
         else:
             facts["call"]["reachable_from_names"] = reached
         ranges.append(entry_range)
         contexts.append(facts)
 
-    if truncated is not None:
-        return _evidence(
-            rule_index,
-            [],
-            ranges,
-            "failed",
-            f"{truncated}: a rule evaluated over a function listing that is"
-            " not the whole image would be answered over part of it",
-        )
+    # ``truncated`` is handled before any of this, where it belongs: a short
+    # listing is a failure to look, not a result to annotate.
     missing = _probe(rule, rule_index, contexts, ranges)
     if missing is not None:
         return missing
@@ -1379,7 +1628,14 @@ async def _reachable_from(
             if reference["kind"] not in CALL_REFERENCES:
                 continue
             caller = by_name.get(str(reference["owner"]))
-            if caller is None or caller in seen:
+            if caller is None:
+                # A real call into this function from something the provider
+                # does not list as a function — radare2 spells it ``(nofunc)``.
+                # The caller set is therefore *not* the set that was observed,
+                # and a short list here is what makes ``reachable_from(...)``
+                # answer ``False`` about a path that was seen and not resolved.
+                return None
+            if caller in seen:
                 continue
             seen.add(caller)
             pending.append(caller)

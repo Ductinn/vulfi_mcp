@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -564,6 +565,181 @@ def test_a_drifted_tool_schema_takes_only_that_capability_down(
     assert evidence["state"] == "failed", evidence
     assert "xrefs_to" in (evidence["reason"] or ""), evidence["reason"]
     assert evidence["contexts"] == []
+
+
+# --------------------------------------------------------------------------
+# the four invariants fix round 1 is about. r2mcp declares no ``outputSchema``
+# for any tool, so the pin attests the call and nothing about the reply: this
+# adapter is the only thing between a format drift and a clean result.
+# --------------------------------------------------------------------------
+
+
+def test_an_unrecognised_row_fails_the_capability(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant A: a row the parser does not recognise is not an absence.
+
+    A drifted listing must take the capability down. The failure mode this
+    closes is the quiet one: ``xrefs_to`` rows that no longer parse become an
+    empty reference list, the rule gets ``evaluated`` with no call sites, and
+    a real target reads as clean.
+    """
+    import vulfi_mcp.providers.r2 as adapter
+
+    never = re.compile(r"\A(?!)")
+    index, _ = stock_rule("strcpy")
+
+    # The section table first, because a drift there is what makes every later
+    # pass summarise the rows that happened to survive as if they were the
+    # image. ``_open`` must refuse instead.
+    real_section_row = adapter._SECTION_ROW
+    monkeypatch.setattr(adapter, "_SECTION_ROW", never)
+    with pytest.raises(adapter.R2FormatError) as refused:
+        live(prepare_r2(str(compiled_calls_binary), ("strings",)))
+    assert "list_sections" in str(refused.value), refused.value
+    monkeypatch.setattr(adapter, "_SECTION_ROW", real_section_row)
+
+    # And the cross-reference rows: an unreadable row is not "no references".
+    monkeypatch.setattr(adapter, "_XREF_ROW", never)
+    evidence = live(evidence_r2(str(compiled_calls_binary), REACHABILITY_RULE, index))
+    assert evidence["state"] == "failed", evidence
+    assert "xrefs_to" in (evidence["reason"] or ""), evidence["reason"]
+    assert evidence["contexts"] == []
+
+
+def test_a_truncated_listing_blocks_complete_coverage(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant B: a bounded read forces partial coverage, whatever the shape.
+
+    Geometry is not the test. A section whose measured extents happen to cover
+    it may not stay ``complete`` once the pass has proved it left rows behind,
+    and the extents of rows past the cap may not close gaps whose candidates
+    were never reported.
+    """
+    import vulfi_mcp.providers.r2 as adapter
+
+    whole = live(prepare_r2(str(compiled_calls_binary), ("functions",)))
+    entries = sorted(
+        row["address"] for row in candidates(whole, "functions")
+    )
+    assert len(entries) > 2, entries
+    covered = ranges_by_name(one_pass(whole, "functions"))
+    assert any(item["coverage"] == "complete" for item in covered.values()), covered
+
+    monkeypatch.setattr(adapter, "MAX_PASS_CANDIDATES", 2)
+    short = live(prepare_r2(str(compiled_calls_binary), ("functions",)))
+    entry = one_pass(short, "functions")
+    reported = sorted(row["address"] for row in candidates(short, "functions"))
+    assert 0 < len(reported) <= 2, reported
+    assert entry["coverage"] == "partial", entry["coverage"]
+    assert all(item["coverage"] != "complete" for item in entry["ranges"]), (
+        entry["ranges"]
+    )
+    assert all(item["reason"] for item in entry["ranges"]), entry["ranges"]
+    left_out = [item for item in entry["warnings"] if "left out" in item]
+    assert left_out, entry["warnings"]
+    named = re.search(r"first at (0x[0-9a-f]+)", left_out[0])
+    assert named is not None, left_out[0]
+    first_omitted = int(named.group(1), 16)
+    assert all(address < first_omitted for address in reported), (
+        first_omitted,
+        reported,
+    )
+    assert first_omitted <= max(entries), (first_omitted, entries)
+
+
+def test_evidence_without_a_fact_is_never_a_clean_negative(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant C: "I could not tell" is ``unsupported``, not ``False``."""
+    import vulfi_mcp.providers.r2 as adapter
+
+    index, _ = stock_rule("strcpy")
+    symbols = elf_symbols(compiled_calls_binary)
+
+    # A rule that follows wrappers asks for something no structural evidence
+    # here can establish: this adapter only ever follows direct references.
+    wrapped: Rule = {**REACHABILITY_RULE, "wrappers": True}
+    evidence = live(evidence_r2(str(compiled_calls_binary), wrapped, index))
+    assert evidence["state"] == "unsupported", evidence
+    assert "wrapper" in (evidence["reason"] or "").lower(), evidence["reason"]
+
+    # A rule whose functions are not in the listing is not a clean zero: the
+    # listing covers what radare2 recognised, not every executable byte.
+    absent: Rule = {**REACHABILITY_RULE, "function_names": ["gets"]}
+    evidence = live(evidence_r2(str(compiled_calls_binary), absent, index))
+    assert evidence["state"] == "unsupported", evidence
+    assert "gets" in (evidence["reason"] or ""), evidence["reason"]
+
+    # An unresolved caller inside the reachability walk — radare2 spells one
+    # ``(nofunc)`` — leaves the fact unestablished rather than short.
+    owner = symbols["copy_from_argument"][0]
+    real_xrefs = adapter._xrefs
+
+    async def with_unresolved_caller(session: Any, address: int) -> list[Any]:
+        rows = await real_xrefs(session, address)
+        if address == owner:
+            rows.append(
+                {
+                    "owner": "(nofunc)",
+                    "address": owner - 0x50,
+                    "kind": "CALL",
+                    "text": "call sym.copy_from_argument",
+                }
+            )
+        return rows
+
+    monkeypatch.setattr(adapter, "_xrefs", with_unresolved_caller)
+    evidence = live(
+        evidence_r2(str(compiled_calls_binary), REACHABILITY_RULE, index)
+    )
+    assert evidence["state"] == "unsupported", evidence
+    assert "reachable_from_names" in (evidence["reason"] or ""), evidence["reason"]
+    assert evidence["contexts"] == []
+
+
+def test_one_capability_failure_keeps_the_other_passes(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant D: unavailable and failed are different, and per pass."""
+    import vulfi_mcp.providers.r2 as adapter
+
+    drifted = dict(PINNED_SCHEMAS)
+    drifted["list_symbols"] = "0" * 64
+    monkeypatch.setattr(adapter, "PINNED_SCHEMAS", drifted)
+
+    results = live(prepare_r2(str(compiled_calls_binary), ("strings", "functions")))
+    assert {entry["pass"] for entry in results} == {"strings", "functions"}
+    assert candidates(results, "strings"), "a working pass must survive"
+    broken = one_pass(results, "functions")
+    assert broken["coverage"] == "unavailable", broken
+    assert broken["candidate_ids"] == []
+    assert any(
+        "list_symbols" in str(item["reason"]) for item in broken["ranges"]
+    ), broken["ranges"]
+
+    # A backend that is not configured at all is unavailable, not a rule that
+    # was tried and failed: Task 4 routes on that difference.
+    empty = tmp_path / "no-providers.toml"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(empty))
+    index, rule = stock_rule("strcpy")
+    with pytest.raises(adapter.R2UnavailableError):
+        live(evidence_r2(str(compiled_calls_binary), rule, index))
 
 
 def test_the_adapter_allowlist_is_a_constant_no_caller_can_widen() -> None:
