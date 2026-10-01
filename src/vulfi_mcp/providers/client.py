@@ -234,19 +234,37 @@ def tool_fingerprint(tool: types.Tool) -> str:
 #:
 #: What the budget admits is the actual security property, and it is measured
 #: rather than inferred. The most expensive shape these two limits allow is 245
-#: ``allOf`` branches in 8,166 bytes: **67.5 ms to vet**, and **~290 µs per byte
-#: of answer** at call time (115 ms for the same 398-byte answer that cost
-#: 20.1 s before). That is an amplification of ~290× over an honest schema's
-#: ~1 µs/byte, down from ~5×10⁴ — bounded, not eliminated. The answer dimension
-#: still has no ceiling, because bounding it would mean not calling
-#: ``ClientSession.call_tool``; a very large answer against a legal-but-hostile
-#: schema is the residue, and it is in the report rather than hidden here.
+#: ``allOf`` branches in 8,166 bytes, and it costs **67.5 ms to vet**.
+#:
+#: What it costs at *call* time is now **nothing**, and that is a separate
+#: defence worth stating together with this one. The per-call cost came from
+#: the SDK running a provider's output schema against a provider's answer on
+#: our behalf; :class:`_UnvalidatedResultSession` declines it, measured at
+#: 1.82 s → 0.000 s for an 11 KB answer against this very schema. Were that
+#: subclass ever removed, this budget alone would leave ~290 µs of blocked loop
+#: per byte of answer — about 290 s for a 1 MB answer — down from ~50 ms/byte
+#: (~5×10⁴ s) before the budget existed. Both numbers are here so that neither
+#: layer can be removed in the belief that the other one covers it.
 MAX_SCHEMA_BYTES: Final = 8 * 1024
 
 #: Nodes the schema walk may visit before it stops. Counted during the walk it
 #: already performs, so it costs nothing, and checked *before* each node rather
 #: than after the walk completes.
 MAX_SCHEMA_NODES: Final = 512
+
+#: How deep a provider's schema may nest. Derived like the two above — the
+#: deepest schema either backend ships is **5** (GhidraMCP's ``import_file``;
+#: radare2-mcp's deepest is 3), so this is roughly **9.6×** the observed
+#: maximum.
+#:
+#: It has its own constant because the previous version measured a schema with
+#: ``max_response_depth``, which is the same category confusion that produced
+#: the size finding: a bound on one answer standing in for a bound on a schema.
+#: It is **not** subsumed by :data:`MAX_SCHEMA_NODES`, and the arithmetic says
+#: why — a schema 200 levels deep has about 200 nodes, far inside the node cap,
+#: so deleting this would open a hole rather than tidy one. Depth matters on
+#: its own because ``jsonschema`` descends recursively.
+MAX_SCHEMA_DEPTH: Final = 48
 
 #: Keywords refused for what they **cost**, which is a different question from
 #: the one :data:`_SHARED_KINDS` answers and must stay one.
@@ -669,6 +687,43 @@ def _digest(source: Path) -> str:
 # -- transport --------------------------------------------------------------
 
 
+class _UnvalidatedResultSession(ClientSession):
+    """A client session that does not validate results against output schemas.
+
+    ``ClientSession.call_tool`` calls ``self.validate_tool_result`` (``mcp``
+    2.2.0, ``client/session.py:1102``), which compiles the provider's own
+    ``outputSchema`` and runs it against the provider's own structured content
+    — on this event loop, after ``send_request`` has returned, where no bound
+    of this module's reaches it. That is the whole of the cost measured in
+    round 9: ~290 µs of blocked loop per byte of answer even for a schema
+    inside the budget, and ~50 ms/byte for one that was not.
+    
+    It is a check this module never asked for and does not use: the output
+    schema is vetted at pin time and then **dropped** — :class:`_Capability`
+    has no slot for it and :func:`_envelope` never consults it — and the check
+    compares a provider's content against the *same provider's* schema, so it
+    establishes nothing about trustworthiness that this gate relies on.
+    
+    Declining it is ordinary subclassing: ``validate_tool_result`` is a public,
+    documented method of a public, exported class, reached through ``self``.
+    Nothing here reimplements ``call_tool`` and nothing here touches an
+    underscore-prefixed name. The SDK offers no constructor flag — the
+    constructor's parameters are read streams, callbacks and capabilities only
+    — so this is the extension point that exists.
+    
+    What is given up, stated rather than buried: the SDK would otherwise raise
+    ``RuntimeError`` when structured content is missing or does not conform to
+    a declared output schema. Adapters get the content as data either way, via
+    :func:`_envelope`, bounded and sanitized; they already cannot assume a
+    hostile provider's shape.
+    """
+
+    async def validate_tool_result(
+        self, name: str, result: types.CallToolResult
+    ) -> None:
+        return None
+
+
 async def _connect(stack: AsyncExitStack, config: ProviderConfig) -> ClientSession:
     if config.backend not in PROVIDER_BACKENDS:  # pragma: no cover - loader checks
         raise ProviderUnavailableError(f"{config.backend!r} is not a provider backend")
@@ -705,7 +760,7 @@ async def _connect(stack: AsyncExitStack, config: ProviderConfig) -> ClientSessi
         )
         read, write = streams[0], streams[1]
     return await stack.enter_async_context(
-        ClientSession(
+        _UnvalidatedResultSession(
             read, write, read_timeout_seconds=config.limits.startup_timeout_seconds
         )
     )
@@ -821,10 +876,10 @@ def _unusable_schema(
             f"its {what} schema is {len(encoded)} bytes, over the"
             f" {MAX_SCHEMA_BYTES} byte schema budget"
         )
-    if _too_deep(schema, limits.max_response_depth):
+    if _too_deep(schema, MAX_SCHEMA_DEPTH):
         return (
             f"its {what} schema nests deeper than the"
-            f" {limits.max_response_depth} level depth budget"
+            f" {MAX_SCHEMA_DEPTH} level schema depth budget"
         )
     finding = _inspect_schema(schema, what)
     if finding.reason is not None:

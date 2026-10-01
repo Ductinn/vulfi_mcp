@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
-from mcp import types
+from mcp import ClientSession, types
 import pytest
 
 from vulfi_mcp.catalog import get_catalog, open_catalog
@@ -1462,6 +1462,61 @@ def test_a_schema_gets_its_own_size_budget_in_two_dimensions(
     assert called < 1.0, f"the call ran the schema ({called:.1f}s)"
 
 
+def test_the_sdk_is_not_asked_to_run_a_schema_this_module_does_not_use(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """The cost the budget bounded, removed rather than bounded.
+
+    `ClientSession.call_tool` calls `validate_tool_result`, which compiles the
+    provider's `outputSchema` and runs it against the provider's own structured
+    content, on this event loop, after `send_request` returns. This module vets
+    that schema at pin time and then **drops** it — `_Capability` has no slot
+    for it and `_envelope` never consults it — so the work was being done on our
+    behalf, against a schema we do not use, for a check comparing a provider's
+    content to the same provider's schema.
+
+    The schema here is *inside* the budget and pins clean, so the budget cannot
+    be what saves this call: 1.82 s for this 11 KB answer with the SDK's
+    validation in place, 0.000 s with it declined.
+    """
+    config = configure(
+        _config_text(
+            variant="admitted_output",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[float, dict[str, object]]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            # A capability the budget *admits*, so what follows is the subclass
+            # and not the pin.
+            assert session._capabilities["beta_text"].unusable is None
+            started = time.monotonic()
+            answered = await checked_call(
+                session,
+                "beta_text",
+                {"address": "0x1000"},
+                session.fingerprint("beta_text"),
+            )
+            return time.monotonic() - started, answered
+
+    elapsed, answered = _run(exercise())
+    assert len(answered["structured"]["xs"]) == 2000
+    # The cost is the assertion; the type is the explanation for it.
+    assert elapsed < 0.5, (
+        f"the output schema was run against the answer ({elapsed:.2f}s)"
+    )
+    assert issubclass(client._UnvalidatedResultSession, ClientSession)
+
+
 def test_the_schema_budget_is_derived_from_the_real_providers() -> None:
     """Both limits, and the worst case they admit, kept where a change is visible.
 
@@ -1472,8 +1527,35 @@ def test_the_schema_budget_is_derived_from_the_real_providers() -> None:
     """
     assert client.MAX_SCHEMA_BYTES == 8 * 1024
     assert client.MAX_SCHEMA_NODES == 512
+    assert client.MAX_SCHEMA_DEPTH == 48
     assert client.MAX_SCHEMA_BYTES / 953 > 8.0
     assert client.MAX_SCHEMA_NODES / 52 > 9.0
+    assert client.MAX_SCHEMA_DEPTH / 5 > 9.0  # deepest observed: import_file
+
+    # Depth is *not* subsumed by the node cap, proved rather than asserted: a
+    # schema 120 levels deep has about 360 nodes, well inside the 512 the walk
+    # allows, so deleting the depth bound would open a hole rather than tidy
+    # one. It is refused, and refused by depth.
+    deep: dict[str, Any] = {"type": "object", "properties": {}}
+    node = deep
+    for _ in range(120):
+        child: dict[str, Any] = {"type": "object", "properties": {}}
+        node["properties"] = {"x": child}
+        node = child
+    assert client._too_deep(deep, client.MAX_SCHEMA_DEPTH)
+
+    def count(value: object) -> int:
+        if isinstance(value, dict):
+            return 1 + sum(count(item) for item in value.values())
+        if isinstance(value, list):
+            return 1 + sum(count(item) for item in value)
+        return 1
+
+    assert count(deep) < client.MAX_SCHEMA_NODES, "must be inside the node cap"
+    refusal = client._unusable_schema(
+        deep, ProviderLimits(), require_properties=True
+    )
+    assert refusal is not None and "depth budget" in refusal
 
     def branches(count: int) -> dict[str, Any]:
         return {
@@ -2162,6 +2244,24 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
                 "type": "object",
                 "properties": {"xs": {"type": "array", "uniqueItems": True}},
             }
+        if variant == "admitted_output":
+            # Inside the schema budget — this one pins *clean*. What it proves
+            # is the layer behind the budget: the SDK is no longer made to run
+            # it against the answer.
+            beta["outputSchema"] = {
+                "type": "object",
+                "properties": {
+                    "xs": {
+                        "type": "array",
+                        "items": {
+                            "allOf": [
+                                {"type": ["integer", "string"]}
+                                for _ in range(245)
+                            ]
+                        },
+                    }
+                },
+            }
         if variant == "vast_output":
             # 1.06 MB, depth 4, no reference, no refused keyword, no costly
             # keyword, and inside the 4 MiB *response* budget that was doing
@@ -2257,6 +2357,12 @@ def _server_call(
             return {
                 "content": [{"type": "text", "text": "ok"}],
                 "structuredContent": {"xs": list(range(100))},
+                "isError": False,
+            }
+        if variant == "admitted_output":
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"xs": list(range(2000))},
                 "isError": False,
             }
         text = (
