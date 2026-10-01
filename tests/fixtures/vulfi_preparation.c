@@ -15,12 +15,16 @@
  *                       three strings that follow: ASCII, UTF-16LE and
  *                       UTF-16BE, each NUL-terminated, each left undefined.
  *
- *   .vulfi_hidden       Two valid functions in an executable section that
- *                       nothing calls, so IDA decodes the bytes and creates
- *                       no function over them. The first carries a local ELF
- *                       symbol and is the one preparation may define; the
- *                       second carries nothing at all and must stay a
- *                       candidate.
+ *   .vulfi_hidden       Three valid stretches of code in an executable
+ *                       section that nothing calls, so IDA decodes the bytes
+ *                       and creates no function over any of them. The first
+ *                       carries a local ELF symbol and is the one
+ *                       preparation may define; the second carries nothing
+ *                       at all; the third branches out of itself to an
+ *                       address that is not a function entry, and the block
+ *                       its own conditional branch targets must stay a
+ *                       candidate because the only thing reaching it is a
+ *                       jump from inside unrecognized code.
  *
  *   vulfi_overlap_tail  A label *inside* `vulfi_tail_owner` that a relocated
  *                       pointer names: a call target overlapping an existing
@@ -60,7 +64,7 @@ __asm__(
     ".previous\n");
 
 /* ----------------------------------------------------------------------
- * Two unreferenced functions in their own executable section.
+ * Three unreferenced stretches in their own executable section.
  * ------------------------------------------------------------------- */
 __asm__(
     ".section .vulfi_hidden,\"ax\",@progbits\n"
@@ -78,6 +82,21 @@ __asm__(
     "  endbr64\n"
     "  mov %esi,%eax\n"
     "  sub $0x11,%eax\n"
+    "  ret\n"
+    ".balign 16\n"
+    /* A third stretch whose own linear decode refuses — it branches out of
+     * the stretch to an address that is not a function entry — while the
+     * block its conditional branch targets decodes cleanly to a return.
+     * The only thing pointing at that block is a jump from inside this same
+     * undefined stretch, which is ordinary control flow inside something
+     * unrecognized and not an entry point: preparation must describe that
+     * block and must never define a function over it. */
+    "  endbr64\n"
+    "  test %edi,%edi\n"
+    "  je 1f\n"
+    "  jmp vulfi_overlap_tail\n"
+    "1:\n"
+    "  mov %edi,%eax\n"
     "  ret\n"
     ".previous\n");
 

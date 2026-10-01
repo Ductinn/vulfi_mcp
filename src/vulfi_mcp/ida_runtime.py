@@ -3978,10 +3978,22 @@ class _Preparation:
     def _reference_evidence(
         self, address: int, owner: Any = None
     ) -> dict[str, object] | None:
-        """What refers to ``address``, or ``None`` when only its own flow does."""
+        """What refers to ``address``, or ``None`` when only its own flow does.
+
+        A jump whose source belongs to no function is the weakest of these on
+        purpose. Inside an executable gap it is a branch from unrecognized
+        code, which is ordinary control flow in something this pass has not
+        identified yet — the same thing ``_defined_targets`` discounts inside
+        a function. Treating it as an entry point would let a basic block in
+        the middle of an unrecognized function be defined as a function of
+        its own, splitting the real one and foreclosing recovering it later,
+        which is precisely the false recovery this pass exists to avoid. It
+        is kept, under its own kind, so the block is still described.
+        """
         calls: list[int] = []
         jumps: list[int] = []
         pointers: list[int] = []
+        unowned: list[int] = []
         for index, xref in enumerate(self._utils.XrefsTo(address)):
             if index >= MAX_QUOTED_REFERENCES:
                 break
@@ -3989,7 +4001,9 @@ class _Preparation:
                 calls.append(xref.frm)
             elif xref.type in (self._xref.fl_JN, self._xref.fl_JF):
                 source = self._funcs.get_func(xref.frm)
-                if owner is None or source is None or source.start_ea != owner.start_ea:
+                if source is None:
+                    unowned.append(xref.frm)
+                elif owner is None or source.start_ea != owner.start_ea:
                     jumps.append(xref.frm)
             elif not xref.iscode and xref.type == self._xref.dr_O:
                 pointers.append(xref.frm)
@@ -3997,6 +4011,7 @@ class _Preparation:
             ("call_xref", calls),
             ("jump_xref", jumps),
             ("data_pointer", pointers),
+            ("unowned_jump", unowned),
         ):
             if sources:
                 return {"kind": kind, "from": sorted(sources)}
@@ -4070,7 +4085,15 @@ class _Preparation:
         state = "candidate"
         reason = decoded["refusal"]
         defined_end: int | None = None
-        if reason is None and not proven:
+        if reason is None and evidence["kind"] == "unowned_jump":
+            sources = ", ".join(f"{source:#x}" for source in evidence["from"])
+            reason = (
+                f"only a jump from unrecognized code ({sources}) reaches"
+                f" {entry:#x}, which is control flow inside something this"
+                " pass has not identified, not an entry point; defining a"
+                " function here would split whatever contains it"
+            )
+        elif reason is None and not proven:
             reason = (
                 "no call, jump, relocated pointer or symbol establishes"
                 f" {entry:#x} as an entry point, so its instructions are"
@@ -4383,12 +4406,27 @@ class _Preparation:
             length, text, encoding = found
             start = base + offset
             self._claimed = start + length
-            if self._is_undefined(start, start + length):
+            held, defined = self._definition(start, start + length)
+            if held is None:
                 self._raw_string_candidate(
                     segment, start, text, encoding, raw[offset : offset + length]
                 )
-            else:
+            elif defined == length:
+                # IDA already holds every byte of this run; there is nothing
+                # here to recover and nothing lost by not restating it.
                 self._already_defined += 1
+            else:
+                # Part of the run is undefined and part of it is not. Dropping
+                # it would lose the undefined part with no address and no
+                # reason, so it is reported with both.
+                self._raw_string_candidate(
+                    segment,
+                    start,
+                    text,
+                    encoding,
+                    raw[offset : offset + length],
+                    held=held,
+                )
             offset += length
 
     def _longest_run(
@@ -4408,13 +4446,23 @@ class _Preparation:
                 found.append((big[0], big[1], "utf-16be"))
         return max(found, key=operator.itemgetter(0)) if found else None
 
-    def _is_undefined(self, start: int, end: int) -> bool:
+    def _definition(self, start: int, end: int) -> tuple[int | None, int]:
+        """Where this range stops being undefined, and how many bytes are not.
+
+        ``(None, 0)`` means every byte is free. Anything else names the first
+        byte an item already holds, so a run that straddles a defined item
+        and undefined bytes can say exactly where the two meet.
+        """
+        first: int | None = None
+        defined = 0
         address = start
         while address < end:
             if not self._bytes.is_unknown(self._bytes.get_flags(address)):
-                return False
+                defined += 1
+                if first is None:
+                    first = address
             address += 1
-        return True
+        return first, defined
 
     def _raw_string_candidate(
         self,
@@ -4423,12 +4471,19 @@ class _Preparation:
         text: str,
         encoding: str,
         raw: bytes,
+        held: int | None = None,
     ) -> None:
         self._budget.charge("candidates")
         string_type = self._string_types[encoding]
         state = "candidate"
         reason: str | None = None
-        if segment["executable"]:
+        if held is not None:
+            reason = (
+                f"an item already defined at {held:#x} holds part of this run,"
+                " so the bytes are reported with their addresses and nothing"
+                " already in the database is replaced"
+            )
+        elif segment["executable"]:
             # Undefined bytes in an executable segment are as likely to be
             # code IDA has not reached as they are to be text, and a string
             # defined over an instruction hides it. The bytes and their
@@ -4480,6 +4535,7 @@ class _Preparation:
                     "terminator": "nul",
                     "text": text,
                     "segment": segment["name"],
+                    "already_defined_at": held,
                     **_quoted(raw),
                 },
             }
@@ -4602,7 +4658,14 @@ class _Preparation:
                 address += 1
                 continue
             if previous is not None and self._reached_from_elsewhere(address, previous):
+                # This walk is linear and the two sides of a branch are not:
+                # bytes written only on the path that was not taken are not
+                # bytes this block can be said to hold. Keeping them would
+                # let one candidate be assembled out of two alternative
+                # paths and spell a string that never exists at run time.
                 registers.clear()
+                self._harvest_frame(segment, function, frame)
+                frame = {}
             if not self._apply_instruction(instruction, address, registers, frame):
                 self._harvest_frame(segment, function, frame)
                 frame = {}

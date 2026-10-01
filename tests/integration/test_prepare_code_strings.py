@@ -349,9 +349,17 @@ def _assert_an_overlapping_target_is_not_defined(
 
 @pytest.mark.requires_ida
 def test_budget_and_cancel_are_partial(
-    compiled_preparation: Path, managed_data_dir: Path
+    compiled_preparation: Path, managed_data_dir: Path, durable_or_reported: Tolerance
 ) -> None:
-    managed = ensure_managed_idb(str(compiled_preparation))
+    with durable_or_reported() as produced:
+        _assert_a_bounded_pass_names_what_it_missed(compiled_preparation, produced)
+
+
+def _assert_a_bounded_pass_names_what_it_missed(
+    binary: Path, produced: list[str]
+) -> None:
+    managed = ensure_managed_idb(str(binary))
+    produced.append(managed)
     # A byte budget far below the mapped image.
     bounded = run_ida_passes(managed, ("strings",), {"bytes": 64})
     strings = _pass(bounded, "strings")
@@ -379,9 +387,17 @@ def test_budget_and_cancel_are_partial(
 
 @pytest.mark.requires_ida
 def test_a_requested_subset_says_which_prerequisite_it_skipped(
-    compiled_preparation: Path, managed_data_dir: Path
+    compiled_preparation: Path, managed_data_dir: Path, durable_or_reported: Tolerance
 ) -> None:
-    managed = ensure_managed_idb(str(compiled_preparation))
+    with durable_or_reported() as produced:
+        _assert_a_subset_names_its_skipped_stage(compiled_preparation, produced)
+
+
+def _assert_a_subset_names_its_skipped_stage(
+    binary: Path, produced: list[str]
+) -> None:
+    managed = ensure_managed_idb(str(binary))
+    produced.append(managed)
     result = run_ida_passes(managed, ("strings",))
 
     # Raw mapped-byte discovery does not need the function pass, so it ran.
@@ -399,3 +415,56 @@ def test_a_requested_subset_says_which_prerequisite_it_skipped(
     assert any(
         "functions" in warning for warning in _pass(result, "strings")["warnings"]
     )
+
+
+@pytest.mark.requires_ida
+def test_a_branch_target_inside_unrecognized_code_is_not_defined(
+    compiled_preparation: Path, managed_data_dir: Path, durable_or_reported: Tolerance
+) -> None:
+    with durable_or_reported() as produced:
+        _assert_an_intra_gap_branch_target_stays_a_candidate(
+            compiled_preparation, produced
+        )
+
+
+def _assert_an_intra_gap_branch_target_stays_a_candidate(
+    binary: Path, produced: list[str]
+) -> None:
+    # The fixture's third hidden stretch branches out of itself to an address
+    # that is not a function entry, so its own decode refuses; the block its
+    # conditional branch targets then decodes cleanly to a return. The only
+    # thing reaching that block is a jump from inside the same unrecognized
+    # stretch. Defining a function there would split whatever contains it,
+    # which is the ordinary-control-flow case the in-function sweep already
+    # discounts, so the gap sweep must discount it too.
+    sections = elf_sections(binary)
+    managed = ensure_managed_idb(str(binary))
+    produced.append(managed)
+    before = invoke_ida(managed, SUMMARY, {"name_limit": 400})
+
+    result = run_ida_passes(managed, ("functions",))
+    after = invoke_ida(managed, SUMMARY, {"name_limit": 400})
+
+    hidden_start = result["image_base"] + sections[".vulfi_hidden"][0]
+    hidden_end = hidden_start + sections[".vulfi_hidden"][1]
+    reached = [
+        row
+        for row in _by_kind(result, "function")
+        if row["evidence"]["entry_evidence"]["kind"] == "unowned_jump"
+    ]
+    assert len(reached) == 1, reached
+    block = reached[0]
+    assert hidden_start < block["address"] < hidden_end
+    # The decode succeeded, so the only thing keeping this a candidate is the
+    # evidence rule — which is what makes this test fail without it.
+    assert block["evidence"]["terminator"] == "return"
+    assert block["evidence"]["end"] is not None
+    assert block["state"] == "candidate"
+    assert block["evidence"]["defined_end"] is None
+    assert block["candidate_id"] not in _pass(result, "functions")["applied_ids"]
+    sources = block["evidence"]["entry_evidence"]["from"]
+    assert sources and all(hidden_start <= source < hidden_end for source in sources)
+    assert f"{sources[0]:#x}" in block["reason"]
+
+    # Only `vulfi_hidden_add` was defined.
+    assert after["function_count"] == before["function_count"] + 1
