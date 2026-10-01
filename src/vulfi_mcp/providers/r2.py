@@ -629,15 +629,20 @@ def _scalar(info: Mapping[str, str], key: str) -> int:
 
 
 def _info(text: str) -> dict[str, str]:
-    """``show_info``'s leading ``key value`` table, and nothing after it."""
+    """``show_info``'s leading ``key value`` table, and nothing after it.
+
+    A key stated with nothing after it is kept with an empty value rather than
+    dropped, so :func:`_scalar` can say *the value was not a number* instead of
+    *the key was never stated*. Both are refusals; only one of them is true.
+    """
     fields: dict[str, str] = {}
     for line in _rows(text):
-        parts = line.split(None, 1)
-        if len(parts) != 2 or line.startswith("0x"):
+        if line.startswith("0x"):
             continue
-        key, value = parts[0], parts[1].strip()
+        parts = line.split(None, 1)
+        key = parts[0]
         if key not in fields:
-            fields[key] = value
+            fields[key] = parts[1].strip() if len(parts) == 2 else ""
     return fields
 
 
@@ -697,9 +702,19 @@ async def _paged(session: ProviderSession, tool: str, **arguments: Any) -> list[
             # A provider that ignores ``cursor`` repeats its first page, and a
             # repetition whose length happens to land on the declared count
             # would otherwise be accepted as a whole listing of duplicates.
-            # 1.8.8 honours ``cursor`` and this cannot fire against it; the
-            # check is here because "the count was satisfied" is not evidence
-            # that the lines were different ones.
+            #
+            # What keeps this from firing on an honest reply is **not** that
+            # 1.8.8 honours ``cursor`` — it does, but that is not the guard.
+            # It is that a false positive needs a run of ``LIST_PAGE_LINES``
+            # byte-identical consecutive rows, so that one page equals the one
+            # before it. Such runs are real: an ELF linked from object files
+            # that share a name makes ``list_symbols`` print
+            # ``0x00000000 0 dup.c`` once per file, and at a small page size a
+            # dozen of them is already enough. At 1000 it takes about two
+            # thousand consecutive identical rows — exotic, not impossible, and
+            # the refusal is still the right direction when it happens: "the
+            # count was satisfied" is not evidence that the lines were
+            # different ones.
             raise R2FormatError(
                 f"the radare2 provider's {tool!r} answered the same"
                 f" {len(page)} lines again at cursor {len(lines)}, so its"
