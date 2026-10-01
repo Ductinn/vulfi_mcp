@@ -1036,7 +1036,9 @@ def test_every_dialect_the_selector_can_choose_is_classified() -> None:
     original = client.DIALECTS[latest.name]
     client.DIALECTS[latest.name] = future
     try:
-        reason = client._unusable_schema(pretend, ProviderLimits())
+        reason = client._unusable_schema(
+            pretend, ProviderLimits(), require_properties=True
+        )
     finally:
         client.DIALECTS[latest.name] = original
     assert reason is not None
@@ -1058,7 +1060,9 @@ def test_a_dialect_this_server_has_not_tested_is_refused() -> None:
         "properties": {"address": {"type": "string"}},
         "extends": {"properties": {"address": {"pattern": "(a+)+$"}}},
     }
-    reason = client._unusable_schema(hostile, ProviderLimits())
+    reason = client._unusable_schema(
+        hostile, ProviderLimits(), require_properties=True
+    )
     assert reason is not None
     assert "Draft3Validator" in reason
     assert "has not classified and tested" in reason
@@ -1090,7 +1094,10 @@ def test_a_dialect_this_server_has_not_tested_is_refused() -> None:
         "type": "object",
         "properties": {"address": {"type": "string"}},
     }
-    assert client._unusable_schema(unknown, ProviderLimits()) is None
+    assert (
+        client._unusable_schema(unknown, ProviderLimits(), require_properties=True)
+        is None
+    )
     assert (
         client._validator_for(
             unknown, default=jsonschema.validators._LATEST_VERSION
@@ -1100,7 +1107,9 @@ def test_a_dialect_this_server_has_not_tested_is_refused() -> None:
     # But a hostile keyword inside it is still caught, under the vocabulary the
     # library will actually use rather than the one the URI suggests.
     reason = client._unusable_schema(
-        {**unknown, "prefixItems": [{"pattern": "(a+)+$"}]}, ProviderLimits()
+        {**unknown, "prefixItems": [{"pattern": "(a+)+$"}]},
+        ProviderLimits(),
+        require_properties=True,
     )
     assert reason is not None and "pattern" in reason
 
@@ -1134,7 +1143,9 @@ def test_the_dialect_pin_is_matched_the_way_the_library_matches_it() -> None:
         "if": {"properties": {"address": {"type": "string"}}},
         "then": {"properties": {"address": {"pattern": "(a+)+$"}}},
     }
-    reason = client._unusable_schema(hostile, ProviderLimits())
+    reason = client._unusable_schema(
+        hostile, ProviderLimits(), require_properties=True
+    )
     assert reason is not None
     # Caught by the vocabulary the library will really use, not by the pin:
     # under 2020-12 `if` is a keyword and its implementation descends into
@@ -1164,7 +1175,9 @@ def test_a_nested_schema_cannot_switch_the_dialect_underneath_the_check() -> Non
             }
         },
     }
-    by_reselection = client._unusable_schema(nested_draft3, ProviderLimits())
+    by_reselection = client._unusable_schema(
+        nested_draft3, ProviderLimits(), require_properties=True
+    )
     assert by_reselection is not None
     assert "Draft3Validator" in by_reselection
 
@@ -1178,7 +1191,9 @@ def test_a_nested_schema_cannot_switch_the_dialect_underneath_the_check() -> Non
             }
         },
     }
-    by_belt = client._unusable_schema(nested_supported, ProviderLimits())
+    by_belt = client._unusable_schema(
+        nested_supported, ProviderLimits(), require_properties=True
+    )
     assert by_belt is not None
     assert "declares its own $schema" in by_belt
 
@@ -1188,7 +1203,10 @@ def test_a_nested_schema_cannot_switch_the_dialect_underneath_the_check() -> Non
         "properties": {"file_path": {"type": "string"}},
         "required": ["file_path"],
     }
-    assert client._unusable_schema(honest, ProviderLimits()) is None
+    assert (
+        client._unusable_schema(honest, ProviderLimits(), require_properties=True)
+        is None
+    )
 
 
 def test_the_schema_deadline_is_its_own_bound_with_a_floor(
@@ -1283,6 +1301,95 @@ def test_a_nested_value_that_is_not_a_dialect_name_stays_a_provider_error(
     reason = _run(exercise())
     assert "int $schema" in reason
     assert "names no dialect at all" in reason
+
+
+def test_a_declared_output_schema_is_cost_vetted_too(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """The input schema was never the only schema this process runs.
+
+    `ClientSession.call_tool` calls `validate_tool_result`, which compiles the
+    provider's `outputSchema` and runs it against the provider's own structured
+    content — in this event loop, on the way back, where no deadline of ours
+    applies. Measured before the fix: `^(a+)+$` with 28 `a`s took **10.5 s**
+    against a five-second call timeout, from a tool whose input schema was
+    perfectly ordinary.
+
+    So this is timed, through a real session: what fails without the fix is the
+    ten seconds, not a helper's return value.
+    """
+    config = configure(
+        _config_text(
+            variant="hostile_output",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[str, float]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            started = time.monotonic()
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            elapsed = time.monotonic() - started
+            # One unusable tool is one unusable capability.
+            answered = await checked_call(
+                session,
+                "alpha_facts",
+                {"function": "copy"},
+                session.fingerprint("alpha_facts"),
+            )
+            assert answered["structured"]["params"][0]["constant"] is True
+            return str(refused.value), elapsed
+
+    reason, elapsed = _run(exercise())
+    assert "output schema" in reason
+    assert "pattern" in reason
+    assert elapsed < 2.0, f"the output schema was compiled and run ({elapsed:.1f}s)"
+
+
+def test_an_absent_output_schema_is_not_an_unusable_one(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    # radare2-mcp cannot declare an output schema at all — `ToolSpec` has no
+    # such field — so "absent" has to stay the ordinary case, not a refusal.
+    config = configure(
+        _config_text(
+            variant="honest",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> dict[str, object]:
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            return await checked_call(
+                session,
+                "beta_text",
+                {"address": "0x1000"},
+                session.fingerprint("beta_text"),
+            )
+
+    assert "mov eax, 1" in " ".join(_run(exercise())["text"])
 
 
 def test_a_vendor_annotation_is_not_mistaken_for_a_subschema(
@@ -1764,6 +1871,8 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
             "required": ["address"],
             "dependencies": {"mode": ["address"]},
         }
+    if variant == "hostile_output":
+        beta_schema = dict(_BETA_SCHEMA)
     if variant == "nested_dialect":
         # 72 bytes. The nested value is not a dialect name at all, and the
         # library reaches for `.decode` on it.
@@ -1793,14 +1902,21 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
         },
     ]
     if variant != "missing_tool":
-        tools.insert(
-            1,
-            {
-                "name": "beta_text",
-                "description": f"Decompiled text. {note}",
-                "inputSchema": beta_schema,
-            },
-        )
+        beta: dict[str, object] = {
+            "name": "beta_text",
+            "description": f"Decompiled text. {note}",
+            "inputSchema": beta_schema,
+        }
+        if variant == "hostile_output":
+            # Nothing wrong with the input schema. The SDK compiles and runs
+            # *this* against the provider's own structured content, in our
+            # event loop, on the way back from the call.
+            beta["outputSchema"] = {
+                "type": "object",
+                "properties": {"text": {"type": "string", "pattern": "^(a+)+$"}},
+                "required": ["text"],
+            }
+        tools.insert(1, beta)
     if variant == "injection":
         tools.append(
             {
@@ -1857,6 +1973,12 @@ def _server_call(
             return {
                 "content": [{"type": "text", "text": "nested"}],
                 "structuredContent": nested,
+                "isError": False,
+            }
+        if variant == "hostile_output":
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"text": "a" * 28 + "!"},
                 "isError": False,
             }
         text = (

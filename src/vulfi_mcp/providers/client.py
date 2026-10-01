@@ -657,33 +657,85 @@ async def _list_tools(
 
 
 def _pin(tool: types.Tool, limits: ProviderLimits) -> _Capability:
-    """One advertised tool, with its schema vetted before anything uses it.
+    """One advertised tool, with **both** its schemas vetted before anything runs.
 
-    The input schema is the one provider-controlled value this module *runs*
-    rather than merely reads, so it is checked here, once, while the session is
-    being built — not at call time, where a refusal would already have cost
-    whatever the schema asked it to cost.
+    A tool schema is the provider-controlled value this module *runs* rather
+    than merely reads, so it is checked here, once, while the session is being
+    built — not at call time, where a refusal would already have cost whatever
+    the schema asked it to cost.
+
+    Both, because both are run. The input schema is evaluated by
+    :func:`_check_arguments` before a call goes out; the **output** schema is
+    evaluated by the SDK itself — ``ClientSession.call_tool`` calls
+    ``validate_tool_result``, which compiles the provider's ``outputSchema``
+    and runs it against the provider's own structured content, in this
+    process's event loop, on the way back. A ``^(a+)+$`` there cost 10.5
+    seconds against a five-second call timeout, needing no input schema at all.
+    Vetting one and not the other was the same hole through a field nobody had
+    looked at.
+
+    ``outputSchema`` is optional, and absent is not unusable: radare2-mcp
+    cannot declare one at all, so a missing field means nothing is compiled and
+    nothing is refused. The two cases get different branches on purpose.
     """
     schema = dict(tool.input_schema) if isinstance(tool.input_schema, dict) else {}
-    return _Capability(
-        tool.name, schema, tool_fingerprint(tool), _unusable_schema(schema, limits)
+    unusable = _unusable_schema(schema, limits, require_properties=True)
+    if unusable is None:
+        unusable = _unusable_output_schema(tool.output_schema, limits)
+    return _Capability(tool.name, schema, tool_fingerprint(tool), unusable)
+
+
+def _unusable_output_schema(
+    schema: object, limits: ProviderLimits
+) -> str | None:
+    """Why this tool's declared output schema may not be run, or ``None``.
+
+    ``None`` means *no output schema was declared*, which is the common case
+    and costs nothing: the SDK compiles nothing and validates nothing. A
+    declared one that is not a JSON object is a defect rather than an absence,
+    and is refused rather than ignored — the SDK's own parse makes that
+    unreachable over the wire today, which is a reason to keep the branch, not
+    to drop it.
+    """
+    if schema is None:
+        return None
+    if not isinstance(schema, dict):
+        return (
+            f"it declares a {type(schema).__name__} output schema, which is not"
+            " a schema at all"
+        )
+    return _unusable_schema(
+        schema, limits, require_properties=False, what="output"
     )
 
 
-def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | None:
-    """Why this tool's input schema may not be evaluated, or ``None``."""
+def _unusable_schema(
+    schema: dict[str, Any],
+    limits: ProviderLimits,
+    *,
+    require_properties: bool,
+    what: str = "input",
+) -> str | None:
+    """Why one of this tool's schemas may not be evaluated, or ``None``.
+
+    ``require_properties`` is the one asymmetry: an input schema with no
+    ``properties`` table says nothing about which arguments exist, and this
+    module fails closed on that. An output schema makes no such promise — the
+    SDK runs it against whatever the provider returned either way — so the same
+    requirement there would refuse honest tools for nothing.
+    """
     try:
         encoded = json.dumps(schema, ensure_ascii=False).encode("utf-8")
     except (TypeError, ValueError) as error:
-        return _quote(f"its input schema is not JSON ({error})")
+        return _quote(f"its {what} schema is not JSON ({error})")
     if len(encoded) > limits.max_response_bytes:
         return (
-            f"its input schema is {len(encoded)} bytes, over the"
+            f"its {what} schema is {len(encoded)} bytes, over the"
             f" {limits.max_response_bytes} byte response budget"
         )
     if _too_deep(schema, limits.max_response_depth):
         return (
-            "its input schema nests deeper than the"
+            f"its {what} schema nests deeper than the"
             f" {limits.max_response_depth} level depth budget"
         )
     finding = _inspect_schema(schema)
@@ -691,19 +743,20 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
         return finding.reason
     if finding.unclassified:
         return (
-            f"its input schema uses {finding.unclassified}, which the installed"
+            f"its {what} schema uses {finding.unclassified}, which the"
+            " installed"
             " JSON Schema library evaluates but this server has not classified"
             " as a schema position; a keyword whose shape is unknown is refused"
             " rather than walked past, because what it can reach is unknown too"
         )
     if finding.refused:
         return (
-            f"its input schema uses {finding.refused}, which this server will"
+            f"its {what} schema uses {finding.refused}, which this server will"
             " not evaluate: a provider's regular expression, and anything a"
             " provider's reference can reach, runs here, in this process,"
             " before any call is sent"
         )
-    if not isinstance(schema.get("properties"), dict):
+    if require_properties and not isinstance(schema.get("properties"), dict):
         # An empty ``properties`` table is a real answer — "this tool takes no
         # arguments" — and stays callable. No table at all means nothing says
         # which arguments exist, so the undeclared-key filter would pass
@@ -718,7 +771,7 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
         )
         validator.check_schema(schema)
     except Exception as error:  # noqa: BLE001 - any refusal is a refusal
-        return _quote(f"its input schema is not a valid JSON Schema ({error})")
+        return _quote(f"its {what} schema is not a valid JSON Schema ({error})")
     return None
 
 
@@ -760,7 +813,7 @@ def _validator_for(schema: object, default: type[Any]) -> type[Any]:
     writes, because :func:`_pin` runs outside the guarded block. It fails
     closed, but "fails closed" is not the contract; the contract is that every
     provider defect arrives as a :class:`ProviderError` naming what was wrong.
-    The guard lives here, not at the three call sites, because they all share
+    The guard lives here, not at the four call sites, because they all share
     this helper.
     """
     if isinstance(schema, Mapping):
@@ -797,7 +850,7 @@ def _inspect_schema(schema: Mapping[str, Any]) -> _Finding:
     try:
         return _walk_schema(schema)
     except _UnusableDialect as error:
-        return _Finding([], [], f"its input schema: {error.reason}")
+        return _Finding([], [], f"its schema: {error.reason}")
 
 
 def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
@@ -825,7 +878,7 @@ def _walk_schema(schema: Mapping[str, Any]) -> _Finding:
             return _Finding(
                 [],
                 [],
-                "a subschema of its input schema declares its own $schema,"
+                "a subschema declares its own $schema,"
                 " which switches the dialect the library evaluates that subtree"
                 " with; no tool schema this server talks to has one, and one"
                 " here would mean the vocabulary changes underneath the check",
@@ -852,7 +905,7 @@ def _unsupported(validator: type[Any], declared: object) -> str:
     """Why one dialect is refused, naming what the library resolved it to."""
     named = f" declared as {declared!r}" if declared is not None else ""
     return _quote(
-        f"its input schema would be evaluated as {validator.__name__}{named},"
+        f"a schema of its would be evaluated as {validator.__name__}{named},"
         " a dialect this server has not classified and tested; only"
         f" {sorted(item.__name__ for item in SUPPORTED_DIALECTS)} are accepted"
     )
