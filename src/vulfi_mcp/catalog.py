@@ -105,6 +105,13 @@ MAX_EVIDENCE_BYTES: Final = 1 << 16
 #: Longest identifier this store accepts, for ids it did not mint itself.
 MAX_ID_LENGTH: Final = 200
 
+#: Longest filesystem path this store records. A managed artifact's path is
+#: not an identifier and is not bounded like one: it inherits whatever depth
+#: the operator's configured data directory has, and refusing a perfectly
+#: good workspace for being nested would be this module's mistake, not the
+#: caller's. This is the platform's own ceiling, not a design limit.
+MAX_PATH_LENGTH: Final = 4096
+
 #: The passes this design defines. A name outside this set is a mistake in the
 #: caller, not a new kind of evidence, so it is refused rather than stored.
 PASS_NAMES: Final = frozenset({"strings", "functions", "structures", "pointer_tables"})
@@ -738,6 +745,52 @@ class Catalog:
                     ),
                 )
 
+    def record_analysis(
+        self,
+        analysis_id: str,
+        *,
+        requested_backend: str,
+        artifact_path: str,
+        capability_fingerprint: str,
+        revision: int,
+    ) -> dict[str, object]:
+        """Describe the analysis revision later passes will be recorded under.
+
+        These four columns are the whole of what makes a revision reusable
+        besides the target identity this catalog is already bound to: which
+        backend was asked for, which managed artifact answered, what that
+        backend could do at the time, and which revision of the artifact the
+        passes describe. A reader that cannot match all four re-runs
+        preparation rather than reusing a result that was produced by
+        something else.
+
+        Returns the stored row, so a caller reports what the catalog holds
+        rather than what it sent.
+        """
+        self._require_writable()
+        identifier = _validate_id(analysis_id, "analysis_id")
+        backend = _validate_backend(requested_backend)
+        artifact = _validate_path(artifact_path, "artifact_path")
+        fingerprint = _validate_id(capability_fingerprint, "capability_fingerprint")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise CatalogError(f"revision must be an integer >= 0, got {revision!r}")
+        now = utc_now()
+        with self._transaction() as connection:
+            self._ensure_target(connection)
+            self._ensure_analysis(connection, identifier, now)
+            connection.execute(
+                "UPDATE analyses SET requested_backend = ?, artifact_path = ?,"
+                " capability_fingerprint = ?, revision = ?, updated_at = ?"
+                " WHERE analysis_id = ?",
+                (backend, artifact, fingerprint, revision, now, identifier),
+            )
+        stored = self.analysis(identifier)
+        if stored is None:  # pragma: no cover - the transaction just wrote it
+            raise CatalogError(
+                f"analysis {identifier!r} was written and cannot be read back"
+            )
+        return stored
+
     # -- reads --------------------------------------------------------------
 
     def page_candidates(
@@ -791,6 +844,90 @@ class Catalog:
             "loaded": len(candidates),
             "candidates": candidates,
         }
+
+    def analysis(self, analysis_id: str) -> dict[str, object] | None:
+        """One analysis revision of *this* target, or ``None``.
+
+        An id another target owns answers ``None`` rather than that target's
+        row: an analysis belongs to the image it was made from, and a caller
+        asking about one target may not be handed another's revision.
+        """
+        identifier = _validate_id(analysis_id, "analysis_id")
+        row = self._connection.execute(
+            "SELECT analysis_id, target_key, requested_backend, artifact_path,"
+            " capability_fingerprint, revision, created_at, updated_at"
+            " FROM analyses WHERE analysis_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None or row[1] != self._target.key:
+            return None
+        return {
+            "analysis_id": row[0],
+            "target_key": row[1],
+            "requested_backend": row[2],
+            "artifact_path": row[3],
+            "capability_fingerprint": row[4],
+            "revision": row[5],
+            "created_at": row[6],
+            "updated_at": row[7],
+        }
+
+    def latest_analysis(self) -> str | None:
+        """The most recently written analysis of this target, or ``None``."""
+        row = self._connection.execute(
+            "SELECT analysis_id FROM analyses WHERE target_key = ?"
+            " ORDER BY updated_at DESC, analysis_id ASC LIMIT 1",
+            (self._target.key,),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def pass_results(self, analysis_id: str) -> list[dict[str, object]]:
+        """Every pass recorded under ``analysis_id``, as it was stored.
+
+        The rows come back in :data:`vulfi_mcp.contracts.PassResult` shape,
+        so a reader of a reused revision sees exactly what the run that
+        produced it reported — including a ``partial`` range and the warning
+        that explains it, which is the ordinary outcome on a real image.
+        """
+        identifier = _validate_id(analysis_id, "analysis_id")
+        self._require_analysis(identifier)
+        rows = self._connection.execute(
+            "SELECT name, backend, coverage, ranges, applied_ids,"
+            " candidate_ids, warnings, artifact_revision FROM passes"
+            " WHERE analysis_id = ? ORDER BY name ASC, backend ASC",
+            (identifier,),
+        ).fetchall()
+        return [
+            {
+                "pass": row[0],
+                "backend": row[1],
+                "coverage": row[2],
+                "ranges": json.loads(row[3]),
+                "applied_ids": json.loads(row[4]),
+                "candidate_ids": json.loads(row[5]),
+                "warnings": json.loads(row[6]),
+                "artifact_revision": row[7],
+            }
+            for row in rows
+        ]
+
+    def applied_candidates(self, analysis_id: str) -> list[str]:
+        """Every candidate of this analysis the managed artifact carries.
+
+        Read from the candidate rows rather than from a pass's declared
+        ``applied_ids``, so this counts what the store actually holds in the
+        ``applied`` state and not what a result claimed about it.
+        """
+        identifier = _validate_id(analysis_id, "analysis_id")
+        self._require_analysis(identifier)
+        return [
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT candidate_id FROM candidates WHERE analysis_id = ?"
+                " AND state = 'applied' ORDER BY candidate_id ASC",
+                (identifier,),
+            )
+        ]
 
     # -- internals ----------------------------------------------------------
 
@@ -1271,6 +1408,14 @@ def _whole_number(value: object, what: str) -> int:
 # -- pass results -----------------------------------------------------------
 
 
+def _validate_backend(backend: object) -> str:
+    if backend not in BACKENDS:
+        raise CatalogError(
+            f"backend must be one of {sorted(BACKENDS)}, got {backend!r}"
+        )
+    return str(backend)
+
+
 def _parse_pass_result(pass_result: object) -> dict[str, Any]:
     """Validate a whole pass result before a single row of it is written."""
     if not isinstance(pass_result, dict):
@@ -1282,11 +1427,7 @@ def _parse_pass_result(pass_result: object) -> dict[str, Any]:
         raise CatalogError(
             f"pass must be one of {sorted(PASS_NAMES)}, got {name!r}"
         )
-    backend = pass_result.get("backend")
-    if backend not in BACKENDS:
-        raise CatalogError(
-            f"backend must be one of {sorted(BACKENDS)}, got {backend!r}"
-        )
+    backend = _validate_backend(pass_result.get("backend"))
     coverage = pass_result.get("coverage")
     if coverage not in COVERAGES:
         raise CatalogError(
@@ -1420,6 +1561,15 @@ def _validate_id(value: object, what: str) -> str:
         raise CatalogError(f"{what} must be a non-empty string, got {value!r}")
     if len(value) > MAX_ID_LENGTH:
         raise CatalogError(f"{what} is longer than {MAX_ID_LENGTH} characters")
+    return value
+
+
+def _validate_path(value: object, what: str) -> str:
+    """One filesystem path, bounded as a path rather than as an identifier."""
+    if not isinstance(value, str) or not value.strip():
+        raise CatalogError(f"{what} must be a non-empty string, got {value!r}")
+    if len(value) > MAX_PATH_LENGTH:
+        raise CatalogError(f"{what} is longer than {MAX_PATH_LENGTH} characters")
     return value
 
 

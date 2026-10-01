@@ -70,11 +70,13 @@ STOCK_TOOLS = frozenset(
     }
 )
 
-#: The four tools this milestone adds.
+#: The six tools this milestone adds.
 VULFI_TOOLS = frozenset(
     {
         "vulfi_rule_template",
         "vulfi_scan",
+        "vulfi_prepare",
+        "vulfi_preparation",
         "vulfi_findings",
         "vulfi_triage",
     }
@@ -469,10 +471,10 @@ def _scan_triage_and_restart(
     server = mcp_server()
 
     # Throwaway discovery check: this entry point extends the official server,
-    # so its six tools answer beside the four added here.
+    # so its six tools answer beside the six added here.
     listed = server.tools()
     assert STOCK_TOOLS | VULFI_TOOLS <= set(listed)
-    assert len(listed) == 10, sorted(listed)
+    assert len(listed) == 12, sorted(listed)
 
     template = server.call("vulfi_rule_template", {}, timeout=HANDSHAKE_TIMEOUT)
     assert "rule_schema" in template
@@ -596,21 +598,33 @@ def test_unimplemented_capabilities_are_refused_not_answered_empty(
 ) -> None:
     server = mcp_server()
 
-    backend = server.failure(
-        "vulfi_scan",
-        {"path": str(compiled_calls), "backend": "ghidra"},
-        timeout=HANDSHAKE_TIMEOUT,
-    )
-    assert "ghidra" in backend
-    assert "'ida'" in backend and "'auto'" in backend
+    for tool_name in ("vulfi_scan", "vulfi_prepare"):
+        for name in ("ghidra", "r2"):
+            refused = server.failure(
+                tool_name,
+                {"path": str(compiled_calls), "backend": name},
+                timeout=HANDSHAKE_TIMEOUT,
+            )
+            assert name in refused
+            assert "'ida'" in refused and "'auto'" in refused
+            # The claim that matters: nothing quietly answered for it.
+            assert "fell back" in refused
 
-    prepared = server.failure(
+    unprepared = server.failure(
         "vulfi_scan",
         {"path": str(compiled_calls), "analysis_id": "prep-1"},
         timeout=HANDSHAKE_TIMEOUT,
     )
-    assert "analysis_id" in prepared
-    assert "preparation" in prepared
+    assert "analysis_id" in unprepared
+    assert "'prep-1'" in unprepared
+    assert "nothing was scanned" in unprepared
+
+    unknown_pass = server.failure(
+        "vulfi_prepare",
+        {"path": str(compiled_calls), "passes": ["decompile_everything"]},
+        timeout=HANDSHAKE_TIMEOUT,
+    )
+    assert "decompile_everything" in unknown_pass
 
     aggregated = server.failure(
         "vulfi_findings",
@@ -629,7 +643,7 @@ def test_every_successful_result_validates_against_its_advertised_schema(
     mcp_server: Callable[[], _Server],
     durable_or_reported: Callable[[], AbstractContextManager[list[str]]],
 ) -> None:
-    """A client that validates structured output accepts all four tools.
+    """A client that validates structured output accepts all six tools.
 
     MCP 2025-06-18 says a client SHOULD validate a tool result's
     ``structuredContent`` against the ``outputSchema`` that tool advertises, so
@@ -659,6 +673,13 @@ def _validate_every_vulfi_payload(
     payloads["vulfi_rule_template"] = server.call(
         "vulfi_rule_template", {}, timeout=HANDSHAKE_TIMEOUT
     )
+    prepared = server.call("vulfi_prepare", target)
+    # A payload with no candidates and no passes would not exercise the
+    # nested `Candidate` and `PassResult` schemas, which is where this
+    # result's flattened value types live.
+    assert prepared["candidates"], prepared
+    assert prepared["passes"], prepared
+    payloads["vulfi_prepare"] = prepared
     scan = server.call(
         "vulfi_scan", {**target, "rules": [NESTED_RULE], "scan_name": SCAN_NAME}
     )
@@ -678,6 +699,9 @@ def _validate_every_vulfi_payload(
     page = server.call("vulfi_findings", target, timeout=HANDSHAKE_TIMEOUT)
     assert page["findings"], page
     payloads["vulfi_findings"] = page
+    recovered = server.call("vulfi_preparation", target, timeout=HANDSHAKE_TIMEOUT)
+    assert recovered["candidates"], recovered
+    payloads["vulfi_preparation"] = recovered
 
     for name in sorted(VULFI_TOOLS):
         schema = advertised[name]

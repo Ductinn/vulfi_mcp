@@ -23,12 +23,15 @@ __all__ = [
     "PassName",
     "PassResult",
     "PassStage",
+    "PreparationPage",
+    "PreparationResult",
     "Priority",
     "RangeCoverage",
     "RuleCoverage",
     "RuleState",
     "ScanCoverage",
     "ScanResult",
+    "SkippedPrerequisite",
     "SyncState",
     "TriageResult",
     "TriageStatus",
@@ -304,3 +307,100 @@ PassResult = TypedDict(
         "artifact_revision": int | None,
     },
 )
+
+
+#: One stage a requested subset of passes could not run.
+#:
+#: Spelled with the functional syntax for the same reason :data:`PassResult`
+#: is: the field the worker produces is named ``pass``, which the class
+#: syntax cannot declare.
+#:
+#: A subset never reports a coverage it did not produce: the stage is named
+#: here, with the pass it needed, rather than being left out of the result as
+#: if it had run and found nothing.
+SkippedPrerequisite = TypedDict(
+    "SkippedPrerequisite",
+    {
+        "pass": PassName,
+        "stage": PassStage,
+        "requires": PassName,
+        "reason": str,
+    },
+)
+
+
+class PreparationResult(TypedDict):
+    """One preparation revision of one target, as ``vulfi_prepare`` reports it.
+
+    ``reused`` is the whole claim about whether anything ran. ``True`` means
+    an already-recorded revision matched this request on all four counts the
+    design requires — source identity, managed artifact, backend capability
+    fingerprint and the requested pass coverage — so no pass ran, nothing was
+    applied and ``preparation_revision`` is exactly where it was. ``False``
+    means the passes in ``passes`` ran against the managed artifact just now.
+
+    ``candidates`` is the *first page* of what the catalog holds, ordered the
+    way :func:`vulfi_mcp.prepare.preparation_page` orders it; ``candidate_total``
+    counts them all and ``vulfi_preparation`` pages the rest. ``applied_ids``
+    is bounded the same way and ``applied_total`` is exact. ``coverage`` is
+    the weakest coverage of any recorded pass, so one ``partial`` range makes
+    the whole revision ``partial`` — which is the ordinary outcome on a real
+    image, not a failure.
+
+    ``skipped_prerequisites`` describes *this call's* run and is empty when a
+    revision was reused; what each pass found is in ``passes`` either way.
+    """
+
+    path: str
+    idb_path: str
+    backend: Backend
+    requested_backend: str
+    analysis_id: str
+    target_key: str
+    source_sha256: str | None
+    managed_idb_id: str | None
+    source_association: str | None
+    capability_fingerprint: str
+    preparation_revision: int
+    reused: bool
+    requested_passes: list[PassName]
+    passes: list[PassResult]
+    coverage: RangeCoverage
+    candidates: list[Candidate]
+    candidate_total: int
+    applied_ids: list[str]
+    applied_total: int
+    skipped_prerequisites: list[SkippedPrerequisite]
+    artifact_paths: dict[str, JsonValue]
+    catalog_available: bool
+    warnings: list[str]
+
+
+class PreparationPage(TypedDict):
+    """One window of a recorded preparation, read without re-running anything.
+
+    ``available`` is the distinction this page exists to keep: ``False`` with
+    a ``reason`` means the candidate store could not answer — no managed
+    database, no catalog, or nothing prepared — and a reader must not render
+    that as a target whose preparation found nothing. ``True`` with an empty
+    ``candidates`` list is the other answer, and means exactly what it says.
+    """
+
+    path: str
+    idb_path: str | None
+    backend: Backend
+    available: bool
+    reason: str | None
+    analysis_id: str | None
+    target_key: str | None
+    source_sha256: str | None
+    managed_idb_id: str | None
+    source_association: str | None
+    preparation_revision: int | None
+    offset: int
+    limit: int
+    total: int
+    loaded: int
+    candidates: list[Candidate]
+    passes: list[PassResult]
+    warnings: list[str]

@@ -56,6 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - the worker never imports the package.
     from vulfi_mcp.rules import Rule
 
 __all__ = [
+    "MAX_ANALYSIS_ID_LENGTH",
     "MAX_COMPREHENSION_ITERATIONS",
     "MAX_EXPRESSION_DEPTH",
     "MAX_EXPRESSION_LENGTH",
@@ -69,6 +70,8 @@ __all__ = [
     "NETNODE_BLOB_INDEX",
     "NETNODE_BLOB_TAG",
     "NETNODE_NAME",
+    "PREPARE_CONTRACT",
+    "PREPARE_COVERAGES",
     "PREPARE_LIMITS",
     "PREPARE_PASSES",
     "PRIORITIES",
@@ -89,10 +92,12 @@ __all__ = [
     "UnavailableEvidenceError",
     "UnknownFindingError",
     "UnknownOperationError",
+    "capability_fingerprint",
     "evaluate_rule",
     "finding_order",
     "run",
     "utc_now",
+    "validate_analysis_id",
     "validate_expression",
     "validate_page",
     "validate_prepare_limits",
@@ -3481,6 +3486,20 @@ ADDRESS_SPACE_IMAGE: Final = "image"
 #: Most warnings one preparation result carries back.
 MAX_PREPARE_WARNINGS: Final = 64
 
+#: What one pass may claim about one address range, as the managed record
+#: stores it. There is no fourth answer.
+PREPARE_COVERAGES: Final[tuple[str, ...]] = ("complete", "partial", "unavailable")
+
+#: Version of what the four passes above recover and how they justify it.
+#: It rides in the backend capability fingerprint, so a build that changed
+#: what a pass does re-runs preparation instead of reusing a revision an
+#: older build recorded under the same name.
+PREPARE_CONTRACT: Final = 1
+
+#: Longest preparation identifier the managed record accepts. The ids this
+#: server mints are far shorter; this bounds the ones a caller supplies.
+MAX_ANALYSIS_ID_LENGTH: Final = 200
+
 #: Bytes one recovered string may span, terminator included.
 MAX_STRING_BYTES: Final = 4096
 #: Shortest run of characters reported as a string. Shorter runs are mostly
@@ -3673,6 +3692,149 @@ def validate_prepare_limits(value: object) -> dict[str, int]:
     return limits
 
 
+def validate_analysis_id(value: object) -> str:
+    """Accept one preparation revision identifier, or say what is wrong."""
+    if not isinstance(value, str) or not value.strip():
+        raise OperationError(
+            f"analysis_id must be a non-empty string, got {value!r}"
+        )
+    if len(value) > MAX_ANALYSIS_ID_LENGTH:
+        raise OperationError(
+            f"analysis_id is {len(value)} characters; the limit is"
+            f" {MAX_ANALYSIS_ID_LENGTH}"
+        )
+    return value
+
+
+def validate_preparation_coverage(value: object) -> dict[str, str]:
+    """Accept the bounded per-pass coverage the managed record may carry.
+
+    This is the whole of what the IDB stores about what preparation found:
+    one of three words per pass, and nothing else. The candidates themselves
+    live in the catalog, which is the only place large enough to hold them
+    and the only place a reader may page them from.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise OperationError("record_preparation: 'coverage' must be an object")
+    coverage: dict[str, str] = {}
+    for name, state in value.items():
+        if name not in PREPARE_PASSES:
+            raise OperationError(
+                f"record_preparation: this build does not run a {name!r} pass;"
+                f" it runs {', '.join(PREPARE_PASSES)}"
+            )
+        if state not in PREPARE_COVERAGES:
+            raise OperationError(
+                f"record_preparation: coverage[{name!r}] is {state!r}; one of"
+                f" {', '.join(PREPARE_COVERAGES)} is the only answer"
+            )
+        coverage[name] = state
+    return coverage
+
+
+def capability_fingerprint(capabilities: object) -> str:
+    """One stable digest of what a backend could do for one exact database.
+
+    A recorded preparation revision is reusable only while this answers the
+    same thing it answered when the revision was made: a different IDA, a
+    different processor module, a decompiler that has appeared or gone, a
+    changed pass set or a changed budget all produce a different digest and
+    therefore a re-run, rather than a result reused from a backend that no
+    longer exists here.
+    """
+    try:
+        canonical = json.dumps(
+            capabilities, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError) as error:
+        raise OperationError(f"capabilities are not JSON: {error}") from error
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _capabilities() -> dict[str, Any]:
+    """What this build, this IDA and this database can do between them."""
+    import ida_hexrays
+    import ida_ida
+    import idaapi
+
+    return {
+        "backend": BACKEND_NAME,
+        "contract": PREPARE_CONTRACT,
+        "ida_version": idaapi.get_kernel_version(),
+        "processor": ida_ida.inf_get_procname(),
+        "bits": 64 if ida_ida.inf_is_64bit() else 32,
+        "endianness": "big" if ida_ida.inf_is_be() else "little",
+        "decompiler": bool(ida_hexrays.init_hexrays_plugin()),
+        "passes": list(PREPARE_PASSES),
+        "limits": dict(PREPARE_LIMITS),
+    }
+
+
+def _preparation_report(record: dict[str, Any]) -> dict[str, object]:
+    """The bounded summary this database carries, and who could have made it.
+
+    Every preparation operation answers with exactly this, so the reuse check
+    and the run that satisfies it compare the same fields computed by the
+    same code rather than two spellings of one idea.
+    """
+    import ida_loader
+    import ida_nalt
+
+    digest = ida_nalt.retrieve_input_file_sha256()
+    capabilities = _capabilities()
+    return {
+        "backend": BACKEND_NAME,
+        "idb_path": ida_loader.get_path(ida_loader.PATH_TYPE_IDB),
+        "input_file": ida_nalt.get_root_filename(),
+        "input_sha256": digest.hex() if digest else None,
+        "managed_idb_id": record.get("managed_idb_id"),
+        "preparation": dict(record["preparation"]),
+        "capabilities": capabilities,
+        "capability_fingerprint": capability_fingerprint(capabilities),
+    }
+
+
+def _preparation_summary(payload: dict[str, object]) -> dict[str, object]:
+    """Read the preparation summary, without changing or creating anything.
+
+    ``mutated`` is ``False``, so the lease that ran this does not save: a
+    reuse check must never be the reason a managed database was rewritten.
+    """
+    record, _ = _read_record()
+    return {"mutated": False, **_preparation_report(record)}
+
+
+def _record_preparation(payload: dict[str, object]) -> dict[str, object]:
+    """Write the bounded preparation summary into the managed record.
+
+    Only the summary. The revision is not set here: it moves in the same
+    write as the change that earned it, inside the ``prepare`` operation, so
+    there is no state in which the artifact moved and its revision did not,
+    and none in which this call could move a revision nothing applied.
+    """
+    analysis_id = validate_analysis_id(payload.get("analysis_id"))
+    coverage = validate_preparation_coverage(payload.get("coverage"))
+    catalog_key = payload.get("catalog_key")
+    if catalog_key is not None and (
+        not isinstance(catalog_key, str)
+        or not catalog_key.strip()
+        or len(catalog_key) > MAX_ANALYSIS_ID_LENGTH
+    ):
+        raise OperationError(
+            f"record_preparation: 'catalog_key' must be a non-empty string of"
+            f" at most {MAX_ANALYSIS_ID_LENGTH} characters, got {catalog_key!r}"
+        )
+    record, _ = _read_record()
+    preparation = record["preparation"]
+    preparation["analysis_id"] = analysis_id
+    preparation["coverage"] = coverage
+    preparation["catalog_key"] = catalog_key
+    _write_record(record)
+    return {"mutated": True, **_preparation_report(record)}
+
+
 def _ascii_run(raw: bytes, start: int) -> tuple[int, str] | None:
     """The NUL-terminated printable run at ``start``, with its byte length.
 
@@ -3835,6 +3997,7 @@ class _Preparation:
         }
         results = [runners[name]() for name in self._passes]
         revision = preparation.get("revision") or 0
+        written = False
         if self._applied:
             # The managed artifact changed, so the revision these results
             # describe is a new one. The bump rides in the same netnode write
@@ -3843,19 +4006,27 @@ class _Preparation:
             revision = int(revision) + 1
             preparation["revision"] = revision
             _write_record(record)
+            written = True
+        elif not record.get("managed_idb_id"):
+            # Nothing was applied, so the revision stands — but this database
+            # has never been written to and so has no identity yet, and the
+            # catalog keys a database-only target on exactly that identity.
+            # Minting it here is what lets this run be recorded at all; the
+            # alternative is a preparation of a supplied IDB that cannot be
+            # stored because the thing it describes has no name.
+            _write_record(record)
+            written = True
         for result in results:
             result["artifact_revision"] = revision
-        digest = self._nalt.retrieve_input_file_sha256()
         return {
-            "mutated": bool(self._applied),
-            "backend": BACKEND_NAME,
+            "mutated": written,
+            # The same summary every preparation operation answers with, so
+            # the reuse check that decided this run was needed compares like
+            # with like when it next asks.
+            **_preparation_report(record),
             "address_space": ADDRESS_SPACE_IMAGE,
-            "idb_path": self._loader.get_path(self._loader.PATH_TYPE_IDB),
-            "input_file": self._nalt.get_root_filename(),
-            "input_sha256": digest.hex() if digest else None,
             "image_base": self._image_base,
             "processor": self._processor,
-            "managed_idb_id": record.get("managed_idb_id"),
             "artifact_revision": revision,
             "requested_passes": list(self._passes),
             "passes": results,
@@ -5901,6 +6072,8 @@ _OPERATIONS: Final[dict[str, Callable[[dict[str, object]], dict[str, object]]]] 
     "database_summary": _database_summary,
     "findings_page": _findings_page,
     "prepare": _run_preparation,
+    "preparation_summary": _preparation_summary,
+    "record_preparation": _record_preparation,
     "scan": _scan,
     "store_scan": _store_scan,
     "triage": _triage,
