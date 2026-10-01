@@ -172,8 +172,11 @@ ALLOWLIST: Final[frozenset[str]] = frozenset(
 #: shape — that capability becomes unavailable and says so. Re-pinning is a
 #: deliberate act, done after reading what changed.
 #:
-#: Measured against GhidraMCP 6.0.0 (bridge ``ghidra-mcp`` 6.0.0, MCP SDK
-#: 1.30.0, protocol 2025-11-25) on Ghidra 12.1.2.
+#: Measured against GhidraMCP 6.0.0 on Ghidra 12.1.2, over the bridge's stdio
+#: MCP server (``ghidra-mcp-bridge`` 6.0.0, whose own virtualenv carries the
+#: 1.x MCP SDK it pins and which therefore reports ``serverInfo.version``
+#: 1.30.0), reached from *this* project's pinned ``mcp==2.2.0`` client at
+#: protocol 2025-11-25.
 PINNED_SCHEMAS: Final[dict[str, str]] = {
     "add_struct_field": (
         "58b8a9639af451982eb1d8aab8f4ce93e9bdf94c7d4adaf1831e14525f0ad5a2"
