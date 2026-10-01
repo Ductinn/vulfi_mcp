@@ -653,16 +653,29 @@ async def _call(session: ProviderSession, tool: str, **arguments: Any) -> str:
 
 
 def _refuse_failures(tool: str, text: str) -> None:
-    """Raise when ``text`` is this provider's way of spelling a failure."""
+    """Raise when ``text`` is this provider's way of spelling a failure.
+
+    A body that opens with ``{`` is this provider claiming to answer in JSON.
+    If it then does not parse as an object, the reply was cut short or is not
+    what it says it is — and handing that to a line parser is the empty
+    collection this boundary exists to refuse, so it is refused here rather
+    than read as nothing.
+    """
     stripped = text.lstrip()
     if not stripped.startswith("{"):
         return
     try:
         document = json.loads(stripped)
     except ValueError:
-        return
+        raise ProviderUnavailableError(
+            f"the ghidra provider's {tool!r} reply begins as a JSON object and"
+            f" does not parse as one: {stripped[:200]!r}"
+        ) from None
     if not isinstance(document, dict):
-        return
+        raise ProviderUnavailableError(
+            f"the ghidra provider's {tool!r} reply begins as a JSON object and"
+            f" is a {type(document).__name__}"
+        )
     failure = document.get("error")
     if failure is None and document.get("success") is not False:
         return
@@ -699,12 +712,12 @@ async def _call_json(
 #: set that is one wording out of date. It is only ever a hint about *how* to
 #: report a failure this adapter has already refused to treat as a result —
 #: whether the provider is busy (skip) or broken (fail). Whether a foreign
-#: program is loaded is asked of :func:`_foreign_programs`, not of prose.
+#: program is loaded is asked of :func:`_open_state`, not of prose.
 _CONTENTION: Final = re.compile(
     # "no program(s)" — but not "the project has no program files", which is
     # this provider's way of saying a program is not in a project yet, and is
     # an ordinary branch rather than contention.
-    r"no programs?\b(?! files)"
+    r"no programs?\b(?! files| specified)"
     r"|program (?:is )?not (?:loaded|open)"
     r"|not currently open"
     r"|timed out|timeout"
@@ -769,7 +782,9 @@ async def _open_program(
     and the order is the point.
 
     First, **a foreign program is refused before the project is touched at
-    all**. A failed ``open_project`` closes whatever program the JVM was
+    all** — which narrows that race rather than preventing it: this surface
+    offers no lease, so a client that loads between the check and the next
+    call still wins. A failed ``open_project`` closes whatever program the JVM was
     holding, so a check that runs after it has nothing left to see: this
     adapter would have evicted another client's program and then reported a
     clean run. The question is asked of the provider's state —
@@ -781,7 +796,7 @@ async def _open_program(
     "it does not exist yet" would turn a stale lock or a transient refusal
     into the loss of every earlier revision.
     """
-    foreign = await _foreign_programs(session)
+    foreign, _ = await _open_state(session)
     if foreign:
         raise ProviderBusyError(
             f"the ghidra provider is holding {foreign} open, which this session"
@@ -860,13 +875,21 @@ def _existing_project(sha256: str, name: str, record: Mapping[str, Any]) -> str 
     return None
 
 
-async def _foreign_programs(session: ProviderSession) -> list[str]:
-    """Every program this provider holds that is not the operator's target.
+async def _open_state(
+    session: ProviderSession,
+) -> tuple[list[str], str | None]:
+    """Whose programs this provider is holding: the foreign ones, and ours.
 
     Asked of the provider's state rather than of its prose, and asked before
     anything that could evict one. ``list_open_programs`` is the only typed
     answer to "whose JVM is this right now", and it is the primary signal for
     every busy refusal below.
+
+    One read answers both questions, so the window between looking and acting
+    is as narrow as this surface allows — and it is a window, not a gate:
+    there is no lease in the 19 tools, so another client that loads between
+    this read and the next call still wins. The check **narrows** the race; it
+    does not prevent it.
     """
     open_now = await _call_json(session, "list_open_programs")
     programs = open_now.get("programs")
@@ -876,6 +899,8 @@ async def _foreign_programs(session: ProviderSession) -> list[str]:
             " there is no way to tell whose program it is holding"
         )
     held: list[str] = []
+    mine: str | None = None
+    stem = Path(session.remote_path).name
     for entry in programs:
         if not isinstance(entry, dict):
             raise ProviderUnavailableError(
@@ -884,7 +909,9 @@ async def _foreign_programs(session: ProviderSession) -> list[str]:
             )
         if entry.get("executable_path") != session.remote_path:
             held.append(str(entry.get("executable_path") or entry.get("name")))
-    return held
+        elif mine is None:
+            mine = str(entry.get("path") or f"/{stem}")
+    return held, mine
 
 
 async def _load(session: ProviderSession) -> str:
@@ -899,20 +926,13 @@ async def _load(session: ProviderSession) -> str:
     """
     remote = session.remote_path
     stem = Path(remote).name
-    foreign = await _foreign_programs(session)
+    foreign, mine = await _open_state(session)
     if foreign:
         raise ProviderBusyError(
             f"the ghidra provider is holding {foreign} open, which this"
             f" session did not open and may not close; it works against"
             f" exactly one program and this target is {remote}"
         )
-    open_now = await _call_json(session, "list_open_programs")
-    programs = open_now.get("programs")
-    mine: str | None = None
-    for entry in programs if isinstance(programs, list) else []:
-        if isinstance(entry, dict) and entry.get("executable_path") == remote:
-            mine = str(entry.get("path") or f"/{stem}")
-            break
     if mine is not None:
         return mine
     try:
@@ -1012,7 +1032,9 @@ def _hex(address: int) -> str:
     return f"0x{address:x}"
 
 
-async def _segments(session: ProviderSession) -> tuple[list[dict[str, Any]], str | None]:
+async def _segments(
+    session: ProviderSession,
+) -> tuple[list[dict[str, Any]], str | None]:
     """Every memory block with a numeric address, as half-open ranges.
 
     Ghidra's listing is inclusive at both ends and spells an overlay block

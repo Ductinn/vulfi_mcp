@@ -989,12 +989,15 @@ def test_a_successful_text_reply_is_still_text(refusing: Any) -> None:
     ]
     # A JSON body with no error is a success too, and is not mistaken for one.
     session = refusing('{"programs":[],"count":0,"current_program":""}')
-    assert asyncio.run(ghidra._foreign_programs(session)) == []
+    assert asyncio.run(ghidra._open_state(session)) == ([], None)
 
 
 @pytest.mark.requires_ghidra
 def test_a_foreign_program_is_refused_before_anything_can_evict_it(
-    compiled_fallback: Path, ghidra_config: Path, managed_data_dir: Path
+    compiled_fallback: Path,
+    ghidra_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The suite does not survive other work on the JVM by taking the JVM.
 
@@ -1004,6 +1007,11 @@ def test_a_foreign_program_is_refused_before_anything_can_evict_it(
     refusal now happens first, and is asked of ``list_open_programs`` rather
     than of any error prose.
     """
+    # The flag is set *inside* the test, not left to the invocation. Without
+    # it `live()` raises `Skipped`, which walks straight out of the body and
+    # takes the half of this proof that matters — that the foreign program is
+    # still there afterwards — with it, while the run still reports green.
+    monkeypatch.setenv("VULFI_REQUIRE_LIVE", "1")
     foreign = Path(shutil.which("ls") or "/bin/ls").resolve()
     _load_foreign(foreign)
     try:
@@ -1044,3 +1052,107 @@ def _load_foreign(binary: Path) -> None:
 def _close_foreign() -> None:
     for row in _request("list_open_programs").get("programs", []):
         _request("close_program", {"name": row.get("name")})
+
+
+def _program(segment_cap: str | None):
+    from vulfi_mcp.providers import ghidra
+
+    return ghidra._Program(
+        name="vulfi_fallback",
+        project="vulfi-0",
+        remote="/srv/samples/vulfi_fallback",
+        base=0x100000,
+        segments=[{"name": ".rodata", "start": 0x102000, "end": 0x102042}],
+        segment_cap=segment_cap,
+        mutated=False,
+    )
+
+
+def test_a_cut_short_block_listing_can_never_summarise_complete() -> None:
+    """Coverage is measured over the blocks; a short listing shrinks them.
+
+    ``list_segments`` was capped at 512 with no paging and no cap in the
+    result, so an image with more blocks than that silently shrank every
+    pass's denominator and a pass could report ``complete`` over blocks it
+    never saw. The cap now rides on the program and the summary refuses to be
+    complete while it is set.
+    """
+    from vulfi_mcp.providers import ghidra
+
+    block = {"name": ".rodata", "start": 0x102000, "end": 0x102042}
+    whole = [ghidra._range(block, "raw_bytes")]
+
+    uncapped = ghidra._pass_result(_program(None), "strings", whole, [], [])
+    assert uncapped["coverage"] == "complete"
+    assert uncapped["warnings"] == []
+
+    cap = "the provider's memory-block listing did not end within 8192 blocks"
+    capped = ghidra._pass_result(_program(cap), "strings", whole, [], ["a warning"])
+    assert capped["coverage"] == "partial"
+    assert capped["warnings"][0] == cap, capped["warnings"]
+
+    # The cap is prepended, so it survives the warning budget rather than
+    # being the one thing the truncation drops.
+    noisy = ghidra._pass_result(
+        _program(cap), "strings", whole, [], [f"w{i}" for i in range(500)]
+    )
+    assert noisy["warnings"][0] == cap
+    assert len(noisy["warnings"]) <= 500
+
+    # An unavailable pass stays unavailable: the cap cannot upgrade it.
+    nothing = ghidra._pass_result(_program(cap), "structures", [], [], ["why"])
+    assert nothing["coverage"] == "unavailable"
+
+
+def test_the_block_listing_is_paged_and_says_when_it_ran_out(
+    refusing: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Paging ends on a short page, and an exhausted budget is reported."""
+    from vulfi_mcp.providers import ghidra
+
+    monkeypatch.setattr(ghidra, "SEGMENT_PAGE", 2)
+    monkeypatch.setattr(ghidra, "MAX_SEGMENT_PAGES", 3)
+    pages: list[str] = [
+        ".a: 00100000 - 001000ff\n.b: 00100100 - 001001ff",
+        ".c: 00100200 - 001002ff\n.d: 00100300 - 001003ff",
+        ".e: 00100400 - 001004ff\n.f: 00100500 - 001005ff",
+    ]
+    session = refusing("")
+    served: list[str] = []
+
+    async def answer(held, tool, arguments, fingerprint):
+        body = pages[len(served)] if len(served) < len(pages) else ""
+        served.append(body)
+        return {"tool": tool, "structured": {"result": body}, "text": [body]}
+
+    monkeypatch.setattr(ghidra, "checked_call", answer)
+    blocks, cap = asyncio.run(ghidra._segments(session))
+    assert [item["name"] for item in blocks] == [".a", ".b", ".c", ".d", ".e", ".f"]
+    assert cap is not None and "did not end within 6 blocks" in cap
+
+    # A listing that ends exactly on a page boundary is not falsely capped:
+    # the page after it comes back short and ends the walk.
+    monkeypatch.setattr(ghidra, "MAX_SEGMENT_PAGES", 8)
+    served.clear()
+    blocks, cap = asyncio.run(ghidra._segments(session))
+    assert len(blocks) == 6 and cap is None
+
+
+@pytest.mark.parametrize(
+    "body", ['{"programs":[{"name":"ls"}', '{"not": "an object"']
+)
+def test_a_reply_that_claims_json_and_is_not_is_refused(
+    refusing: Any, body: str
+) -> None:
+    """A short read is the one gap with an obvious trigger, and it refuses.
+
+    The boundary's promise is that a read which did not succeed never becomes
+    an empty collection. A body that opens with ``{`` and then does not parse
+    is this provider's JSON cut short; returning it to a line parser would
+    have made it one.
+    """
+    from vulfi_mcp.providers import ghidra
+
+    session = refusing(body)
+    with pytest.raises(ghidra.ProviderUnavailableError):
+        asyncio.run(ghidra._functions(session))
