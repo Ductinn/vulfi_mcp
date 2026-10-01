@@ -19,7 +19,6 @@ from ida_nexus import (
     DatabaseHandle,
     NexusConnectionError,
     RemoteError,
-    WorkerStartError,
     find_database_owner,
     probe_database_state,
 )
@@ -339,18 +338,37 @@ def test_a_save_that_cannot_be_reopened_is_rolled_back_and_reported(
     assert invoke_ida(str(managed), SUMMARY, {"name_limit": 5})["function_count"] > 0
 
 
-def test_a_damaged_database_with_no_spare_copy_still_fails(
-    compiled_calls: Path, managed_data_dir: Path
+def test_a_damaged_database_with_no_spare_copy_is_discarded_and_rebuilt(
+    compiled_calls: Path, managed_data_dir: Path, durable_or_reported: Tolerance
 ) -> None:
-    # Nothing to recover from: the open failure reaches the caller unchanged,
-    # and no database is invented to answer from.
-    managed = Path(ensure_managed_idb(str(compiled_calls)))
-    _damage(managed)
-    damaged = managed.read_bytes()
+    # The staging save behind `ensure_managed_idb` is the one write with no
+    # rescue copy — it writes a private file with no earlier generation to
+    # keep — and `_publish` cannot tell a database the vendor defect damaged
+    # there from a good one, because `probe_database_state` calls both
+    # `packed`. Nothing can recover those bytes, so left in place they made the
+    # workspace permanently dead and every later open an opaque
+    # `WorkerStartError`. The database is discarded instead, and the next
+    # `ensure_managed_idb` builds it again from the source.
+    with durable_or_reported() as produced:
+        _assert_an_unrecoverable_database_is_discarded(compiled_calls, produced)
 
-    with pytest.raises(WorkerStartError):
+
+def _assert_an_unrecoverable_database_is_discarded(
+    compiled_calls: Path, produced: list[str]
+) -> None:
+    managed = Path(ensure_managed_idb(str(compiled_calls)))
+    produced.append(str(managed))
+    _damage(managed)
+    assert probe_database_state(managed)["state"] == "packed"
+
+    with pytest.raises(ManagedDatabaseError) as discarded:
         invoke_ida(str(managed), SUMMARY, {"name_limit": 5})
-    assert managed.read_bytes() == damaged
+    assert "discarded" in str(discarded.value)
+    assert not managed.exists(), "the unreadable database was left in place"
+
+    rebuilt = Path(ensure_managed_idb(str(compiled_calls)))
+    assert rebuilt == managed
+    assert invoke_ida(str(rebuilt), SUMMARY, {"name_limit": 5})["function_count"] > 0
 
 
 def test_a_spare_copy_that_is_damaged_too_is_reported_as_unusable(

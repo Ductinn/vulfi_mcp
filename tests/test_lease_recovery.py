@@ -363,3 +363,79 @@ def test_a_spare_that_cannot_be_opened_either_is_reported_as_unusable(
 
     assert "built again from its source" in str(unusable.value)
     assert len(seam.attempts) == 2
+
+
+# --------------------------------------------------------------------------
+# A damaged database with no spare is discarded, not met again forever
+# --------------------------------------------------------------------------
+
+
+def test_a_refused_open_with_no_spare_discards_the_managed_database(
+    seam: _Seam,
+) -> None:
+    # The staging save behind `ensure_managed_idb` is the one write with no
+    # rescue copy, and `_publish` cannot tell a database the vendor defect
+    # damaged there from a good one: `probe_database_state` calls both
+    # `packed`. Nothing can recover those bytes, so leaving them in place made
+    # the workspace permanently dead and every later open an opaque
+    # `WorkerStartError`.
+    component = seam.target.with_suffix(".id0")
+    component.write_bytes(b"left by the interrupted open")
+    seam.opens = [WorkerStartError(_bad_pack(seam.target))]
+
+    with pytest.raises(ManagedDatabaseError) as discarded:
+        with _lease(seam.target, seam.options(), rescue=True):
+            pytest.fail("the lease body must never run")
+
+    assert "discarded" in str(discarded.value)
+    assert "built again from its source" in str(discarded.value)
+    assert not seam.target.exists()
+    assert not component.exists()
+    # One discard and no retry: rebuilding is the next ensure_managed_idb's.
+    assert seam.attempts == [str(seam.target)]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [READINESS_TIMEOUT, WRONG_IDB, LAUNCHER_DIED],
+    ids=["readiness-timeout", "wrong-idb", "launcher-died"],
+)
+def test_a_start_failure_that_is_not_about_the_file_discards_nothing(
+    seam: _Seam, message: str
+) -> None:
+    # The same distinction the rollback is gated on: none of these says the
+    # bytes are bad, and a lease-invariant regression looks exactly like one of
+    # them. Discarding here would delete a readable database and hide it.
+    seam.opens = [WorkerStartError(message)]
+
+    with pytest.raises(WorkerStartError):
+        with _lease(seam.target, seam.options(), rescue=True):
+            pytest.fail("the lease body must never run")
+
+    assert seam.target.read_bytes() == SAVED
+
+
+@pytest.mark.parametrize(
+    ("owner", "state", "error"),
+    [
+        ("gui-session", "packed", None),
+        (None, "in_use", None),
+        (None, "unknown", "the .id0 header is truncated"),
+    ],
+    ids=["owned", "in-use", "undetermined"],
+)
+def test_a_database_another_session_may_hold_is_never_discarded(
+    seam: _Seam, owner: str | None, state: str, error: str | None
+) -> None:
+    # Deleting a file another session has open destroys that session's work,
+    # so the discard is gated exactly like the restore it replaces.
+    seam.owner = owner
+    seam.state = state
+    seam.error = error
+    seam.opens = [WorkerStartError(_bad_pack(seam.target))]
+
+    with pytest.raises(WorkerStartError):
+        with _lease(seam.target, seam.options(), rescue=True):
+            pytest.fail("the lease body must never run")
+
+    assert seam.target.read_bytes() == SAVED

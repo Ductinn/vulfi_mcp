@@ -835,6 +835,12 @@ def _lease(
     nothing had happened would contradict the durability the operation before
     this one was given.
 
+    When there is no spare at all — the staging save that first produced the
+    database is the one write with no earlier generation to keep — the bytes
+    are unrecoverable and the managed database is discarded instead, so the
+    next ``ensure_managed_idb`` builds it again from the source rather than
+    meeting the same dead file forever. The caller is told that too.
+
     Every other ``WorkerStartError`` travels untouched. A readiness timeout, a
     worker that opened the wrong IDB, a launcher that died of a licence or a
     missing library — none of them says the file is bad, and rolling back on
@@ -855,7 +861,7 @@ def _lease(
     except WorkerStartError as damaged:
         if not rescue or not _refused_these_bytes(damaged, target):
             raise
-        handle = _restore_pre_save(target, options, damaged)
+        handle = _recover_unreadable(target, options, damaged)
         recovered = True
     instance = handle.instance
     # Not "nobody owned it before": the instance this lease actually got. A
@@ -946,7 +952,7 @@ def _refused_these_bytes(damaged: WorkerStartError, target: Path) -> bool:
     return False
 
 
-def _restore_pre_save(
+def _recover_unreadable(
     target: Path,
     options: DatabaseOpenOptions,
     damaged: WorkerStartError,
@@ -954,9 +960,8 @@ def _restore_pre_save(
     """Put the copy taken before the last save back, and open that instead.
 
     Only for a database no live instance owns and no unregistered session
-    holds: overwriting a file another session has open would destroy that
-    session's work. With no spare copy there is nothing to recover and the
-    original failure stands.
+    holds: overwriting or deleting a file another session has open would
+    destroy that session's work.
 
     ``probe_database_state`` reports ``in_use`` only when it took and read the
     advisory ``.id0`` lock. It reports ``unknown`` with ``error`` set when the
@@ -965,13 +970,32 @@ def _restore_pre_save(
     unsigned — exactly the cases where another live session cannot be excluded.
     Those are refusals too, for the same reason ``_require_released`` refuses
     every unsafe state rather than the one it can name.
+
+    With no spare there is nothing to put back, and that case is real: the
+    staging save behind ``ensure_managed_idb`` is the one write this module
+    makes with no rescue copy, because it writes a private file that has no
+    earlier generation to keep. A database the vendor defect damaged *there*
+    passes ``_publish``'s gate — ``probe_database_state`` calls a corrupt file
+    ``packed`` — and then refuses every later open, permanently. Nothing can
+    recover those bytes, so the managed database is discarded instead: the
+    caller is told, and the next ``ensure_managed_idb`` analyzes the source
+    again rather than meeting the same dead file forever. One discard, no
+    retry here; the rebuild belongs to the next call.
     """
-    spare = _pre_save(target)
-    if not spare.is_file() or _prior_owner(target, None) is not None:
+    if _prior_owner(target, None) is not None:
         raise damaged
     state = ida_nexus.probe_database_state(target)
     if state["state"] == "in_use" or state["error"] is not None:
         raise damaged
+    spare = _pre_save(target)
+    if not spare.is_file():
+        _discard(target)
+        raise ManagedDatabaseError(
+            f"IDA could not read back {target}, and the save that produced it"
+            " kept no copy to restore: the managed database has been discarded"
+            " and has to be built again from its source binary, which the next"
+            " scan of that target does"
+        ) from damaged
     _discard_unpacked(target)
     os.replace(spare, target)
     try:
