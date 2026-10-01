@@ -643,6 +643,9 @@ def test_a_truncated_listing_blocks_complete_coverage(
         entry["ranges"]
     )
     assert all(item["reason"] for item in entry["ranges"]), entry["ranges"]
+    # contracts.py says a partial range names the rest in ``unvisited``; a
+    # range the pass vetoed is no exception.
+    assert all(item["unvisited"] for item in entry["ranges"]), entry["ranges"]
     left_out = [item for item in entry["warnings"] if "left out" in item]
     assert left_out, entry["warnings"]
     named = re.search(r"first at (0x[0-9a-f]+)", left_out[0])
@@ -740,6 +743,98 @@ def test_one_capability_failure_keeps_the_other_passes(
     index, rule = stock_rule("strcpy")
     with pytest.raises(adapter.R2UnavailableError):
         live(evidence_r2(str(compiled_calls_binary), rule, index))
+
+
+def test_a_drifted_scalar_is_refused_like_a_drifted_row(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant A, for scalars: a reply that is one value is still a reply.
+
+    ``image_base`` is in every ``PassResult`` as the space its addresses are
+    in. A ``baddr`` this adapter cannot read used to fall back to ``0`` — on a
+    non-PIE image that publishes an address space nothing is in, with no
+    warning anywhere. It must refuse exactly as an unreadable row does.
+    """
+    import vulfi_mcp.providers.r2 as adapter
+
+    real_call = adapter._call
+
+    async def drifted(session: Any, tool: str, **arguments: Any) -> str:
+        text = await real_call(session, tool, **arguments)
+        if tool == "show_info":
+            return re.sub(r"(?m)^baddr\s+\S+$", "baddr    notanumber", text)
+        return text
+
+    monkeypatch.setattr(adapter, "_call", drifted)
+    with pytest.raises(adapter.R2FormatError) as refused:
+        live(prepare_r2(str(compiled_calls_binary), ("strings",)))
+    assert "baddr" in str(refused.value), refused.value
+
+
+def test_a_session_that_never_opened_is_unavailable_not_failed(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant D: *unavailable* is about the session, not about the rule.
+
+    A server that exits the moment it is launched never answered a call, so
+    there is no extraction that failed — and Plan 3 routes on that difference.
+    Both entry points must say the same thing about it.
+    """
+    import vulfi_mcp.providers.r2 as adapter
+
+    dead = tmp_path / "dead-providers.toml"
+    dead.write_text(
+        "\n".join(
+            (
+                "[r2]",
+                'transport = "stdio"',
+                'command = "/bin/true"',
+                "args = []",
+                "",
+                "[[r2.binaries]]",
+                f'local = "{tmp_path}"',
+                f'remote = "{tmp_path}"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(dead))
+    index, rule = stock_rule("strcpy")
+    with pytest.raises(adapter.R2UnavailableError):
+        live(evidence_r2(str(compiled_calls_binary), rule, index))
+    with pytest.raises(adapter.R2UnavailableError):
+        live(prepare_r2(str(compiled_calls_binary), ("strings",)))
+
+
+def test_a_target_with_no_call_reference_says_where_it_looked(
+    compiled_calls_binary: Path, r2_config: Path, managed_data_dir: Path
+) -> None:
+    """A real empty answer is still an answer about a place, and names it.
+
+    ``main`` is in the listing and nothing *calls* it — the entry point
+    reaches it through a data reference. That is a true negative, and it stays
+    ``evaluated``; what it may not do is arrive with no statement of where the
+    backend looked.
+    """
+    index, _ = stock_rule("strcpy")
+    rule: Rule = {**REACHABILITY_RULE, "function_names": ["main"]}
+    evidence = live(evidence_r2(str(compiled_calls_binary), rule, index))
+    assert evidence["state"] == "evaluated", evidence
+    assert evidence["contexts"] == []
+    assert evidence["ranges"], "the target this rule searched must be named"
+    entry = elf_symbols(compiled_calls_binary)["main"][0]
+    assert any(item["start"] == entry for item in evidence["ranges"]), (
+        evidence["ranges"]
+    )
+    assert all(item["reason"] for item in evidence["ranges"]), evidence["ranges"]
 
 
 def test_the_adapter_allowlist_is_a_constant_no_caller_can_widen() -> None:

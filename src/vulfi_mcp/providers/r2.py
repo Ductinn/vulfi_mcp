@@ -114,6 +114,7 @@ from vulfi_mcp.ida_runtime import (
 from vulfi_mcp.providers.client import (
     ProviderError,
     ProviderSession,
+    ProviderUnavailableError,
     checked_call,
     provider_session,
     rule_contexts,
@@ -397,23 +398,33 @@ async def prepare_r2(target: str, passes: tuple[str, ...]) -> tuple[PassResult, 
     capability becomes ``coverage="unavailable"`` for the pass that needed it,
     with the refusal on every range, and the passes that already ran are
     returned. Per-pass fallback is the whole point of this plan.
+
+    A provider that could not be launched or spoken to is reported the same
+    way here as in :func:`evidence_r2`: as :class:`R2UnavailableError`, before
+    any pass exists to attach a failure to.
     """
     wanted = _requested(passes)
     config = _config()
-    async with provider_session(config, target, allowlist=ALLOWLIST) as session:
-        image = await _open(session)
-        try:
-            results: list[PassResult] = []
-            for name in wanted:
-                try:
-                    results.append(await _run_pass(session, image, name))
-                except R2UnavailableError:
-                    raise
-                except ProviderError as refused:
-                    results.append(_unavailable_pass(image, name, str(refused)))
-            return tuple(results)
-        finally:
-            await _release(session)
+    try:
+        async with provider_session(config, target, allowlist=ALLOWLIST) as session:
+            image = await _open(session)
+            try:
+                results: list[PassResult] = []
+                for name in wanted:
+                    try:
+                        results.append(await _run_pass(session, image, name))
+                    except (R2UnavailableError, ProviderUnavailableError):
+                        raise
+                    except ProviderError as refused:
+                        results.append(_unavailable_pass(image, name, str(refused)))
+                return tuple(results)
+            finally:
+                await _release(session)
+    except ProviderUnavailableError as refused:
+        raise R2UnavailableError(
+            f"the radare2 provider never opened a session for {target}:"
+            f" {refused}"
+        ) from refused
 
 
 async def evidence_r2(target: str, rule: Rule, rule_index: int) -> RuleEvidence:
@@ -425,9 +436,13 @@ async def evidence_r2(target: str, rule: Rule, rule_index: int) -> RuleEvidence:
     branch indexes ``param`` comes back ``unsupported`` naming what was
     missing — never ``False``, and never a priority read out of pseudocode.
 
-    :class:`R2UnavailableError` is deliberately **not** caught: a backend that
-    is not configured, or whose file could not be opened and analysed, is not
-    a rule that was tried and failed.
+    A session that never opened is not a rule that was tried: both
+    :class:`R2UnavailableError` and the client's
+    :class:`~vulfi_mcp.providers.client.ProviderUnavailableError` — which is
+    what a provider that cannot be launched or spoken to raises, before a
+    single tool is called — propagate as *unavailable*. ``failed`` is reserved
+    for a call that was attempted. The same split is what the Ghidra adapter
+    reports, so Plan 4 routes on one taxonomy rather than two.
     """
     config = _config()
     try:
@@ -439,6 +454,11 @@ async def evidence_r2(target: str, rule: Rule, rule_index: int) -> RuleEvidence:
                 await _release(session)
     except R2UnavailableError:
         raise
+    except ProviderUnavailableError as refused:
+        raise R2UnavailableError(
+            f"the radare2 provider never opened a session for {target}:"
+            f" {refused}"
+        ) from refused
     except ProviderError as refused:
         return _evidence(rule_index, [], [], "failed", str(refused))
 
@@ -520,8 +540,8 @@ async def _open(session: ProviderSession) -> _Image:
             f" {session.remote_path}, so there is no address range to read"
         )
     return _Image(
-        _whole(info.get("baddr"), 0),
-        _whole(info.get("bits"), 0),
+        _scalar(info, "baddr"),
+        _scalar(info, "bits"),
         str(info.get("format") or "unknown"),
         sections,
         warnings,
@@ -585,13 +605,29 @@ def _rows(text: str) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def _whole(value: object, fallback: int) -> int:
-    if isinstance(value, str):
-        try:
-            return int(value, 0)
-        except ValueError:
-            return fallback
-    return fallback
+def _scalar(info: Mapping[str, str], key: str) -> int:
+    """One number ``show_info`` stated, or a refusal.
+
+    Invariant A is about replies, not about rows: a reply that is a single
+    value is as unattested as a listing. ``baddr`` in particular reaches every
+    ``PassResult`` as the space its addresses are in, so a value this adapter
+    cannot read must not become ``0`` — on a non-PIE image that publishes an
+    address space nothing is in, and nothing downstream could tell.
+    """
+    value = info.get(key)
+    if not isinstance(value, str):
+        raise R2FormatError(
+            f"the radare2 provider's 'show_info' states no {key!r}, so the"
+            " image this session opened cannot be described"
+        )
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise R2FormatError(
+            f"the radare2 provider's 'show_info' answered {key}={value!r},"
+            " which is not a number; a value this adapter cannot read is not a"
+            " value of zero"
+        ) from None
 
 
 def _info(text: str) -> dict[str, str]:
@@ -604,11 +640,6 @@ def _info(text: str) -> dict[str, str]:
         key, value = parts[0], parts[1].strip()
         if key not in fields:
             fields[key] = value
-    if "baddr" not in fields:
-        raise R2FormatError(
-            "the radare2 provider's 'show_info' reply states no 'baddr', so"
-            " the space every address below is in is unknown"
-        )
     return fields
 
 
@@ -641,6 +672,16 @@ async def _paged(session: ProviderSession, tool: str, **arguments: Any) -> list[
     lines: list[str] = []
     for _ in range(MAX_LIST_PAGES):
         if len(lines) >= total:
+            if len(lines) != total:
+                # More lines than the tool said it had. Nothing here can tell
+                # which of the two the provider meant, and a listing read
+                # against a count that does not describe it is a listing whose
+                # end this adapter cannot locate.
+                raise R2FormatError(
+                    f"the radare2 provider's {tool!r} answered {total} lines"
+                    f" and produced {len(lines)}; a listing and its own count"
+                    " that disagree cannot bound each other"
+                )
             return lines
         page = (await _call(
             session,
@@ -796,7 +837,18 @@ async def _symbols(session: ProviderSession) -> dict[int, dict[str, Any]]:
     dropped. A row this parser does not recognise fails the capability.
     """
     symbols: dict[int, dict[str, Any]] = {}
-    for line in _rows("\n".join(await _paged(session, "list_symbols"))):
+    raw = await _paged(session, "list_symbols")
+    rows = _rows("\n".join(raw))
+    if raw and not rows:
+        # Everything the listing contained was radare2's own log. The count
+        # matched, so the paging above is satisfied, and the parse below would
+        # report an image with no symbols in it.
+        raise R2FormatError(
+            "the radare2 provider's 'list_symbols' answered"
+            f" {len(raw)} lines of which none is a symbol row; an image with"
+            " no readable symbol listing is not an image without symbols"
+        )
+    for line in rows:
         matched = _SYMBOL_ROW.match(line.strip())
         if matched is None:
             raise R2FormatError(
@@ -1390,6 +1442,13 @@ def _pass_result(
             item["reason"] = (
                 f"{item['reason']}; {blocked}" if item["reason"] else blocked
             )
+            # ``contracts.AddressRange`` says a partial range names the rest in
+            # ``unvisited``, and the rest here is the whole range: the pass left
+            # rows behind without knowing where they were, so it cannot say
+            # which bytes of this one it really described.
+            item["unvisited"] = [
+                {"start": int(item["start"]), "end": int(item["end"])}
+            ]
     states = {item["coverage"] for item in ranges}
     if not states or states == {"unavailable"}:
         coverage = "unavailable"
@@ -1556,6 +1615,21 @@ async def _rule_evidence(
             )
     if not sites:
         failed = [item for item in ranges if item["coverage"] == "unavailable"]
+        if not failed:
+            # A real empty answer is still an answer about a place. The
+            # addresses asked about were the provider's own, so "nothing calls
+            # this" is evidence — but it is evidence about these functions, and
+            # they are named rather than inferred from an empty list.
+            ranges.extend(
+                _site_range(
+                    int(row["entry"]),
+                    str(row["name"]),
+                    "complete",
+                    "the provider reports no call reference to this function,"
+                    " so this rule has no call site here",
+                )
+                for row in targets
+            )
         return _evidence(
             rule_index,
             [],
