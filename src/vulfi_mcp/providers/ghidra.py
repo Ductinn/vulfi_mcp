@@ -70,7 +70,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
@@ -363,6 +364,52 @@ class ProviderBusyError(GhidraUnavailableError):
 # --------------------------------------------------------------------------
 
 
+@asynccontextmanager
+async def _open_session(
+    config: ProviderConfig, target: str
+) -> AsyncIterator[tuple[ProviderSession, _Program]]:
+    """Open a session and the managed program, or say the backend was never reached.
+
+    The distinction this draws is the one the routing layer runs on, and it is
+    the plan's own wording: **a session that never opened is not an attempted
+    call.** Everything that happens here — launching the provider, verifying
+    the binary's identity, opening the managed project, loading and analysing
+    the program — happens *before* this adapter has asked the backend anything
+    about the caller's question, so every failure in it is
+    :class:`GhidraUnavailableError`: the backend was not reachable, and the
+    router may try another one.
+
+    A failure *after* this context is open is the opposite case — this backend
+    was reached and the call failed — and stays a ``failed`` result recorded
+    against this backend, so the router does not silently substitute a second
+    one for a question the first really answered.
+    """
+    try:
+        async with provider_session(
+            config, target, allowlist=_allowlist(config)
+        ) as session:
+            try:
+                program = await _open_program(session, config, target)
+            except GhidraUnavailableError:
+                raise
+            except ProviderError as refused:
+                raise GhidraUnavailableError(
+                    f"the {BACKEND} provider was reached and no usable session"
+                    f" over {target!r} came out of it: {refused}"
+                ) from refused
+            try:
+                yield session, program
+            finally:
+                await _release(session, program)
+    except GhidraUnavailableError:
+        raise
+    except ProviderError as refused:
+        raise GhidraUnavailableError(
+            f"no session with the {BACKEND} provider could be opened for"
+            f" {target!r}: {refused}"
+        ) from refused
+
+
 async def prepare_ghidra(
     target: str, passes: tuple[str, ...]
 ) -> tuple[PassResult, ...]:
@@ -377,34 +424,28 @@ async def prepare_ghidra(
     """
     wanted = _requested(passes)
     config = _config()
-    async with provider_session(
-        config, target, allowlist=_allowlist(config)
-    ) as session:
-        program = await _open_program(session, config, target)
-        try:
-            record = _load_record(session.binary_sha256)
-            results: list[PassResult] = []
-            for name in PASS_NAMES:
-                if name not in wanted:
-                    continue
-                results.append(await _run_pass(session, program, record, name))
-            saved, save_reason = await _save(session)
-            # Only a run that really changed the program moves the revision. A
-            # pass that reports a definition an earlier run already made has
-            # applied nothing *now*, and a revision that moved without a
-            # change would stale every proposal written against the last one.
-            if program.mutated and saved:
-                record["revision"] = int(record["revision"]) + 1
-            if saved:
-                _store_record(session.binary_sha256, record)
-            revision = int(record["revision"])
-            for entry in results:
-                entry["artifact_revision"] = revision if saved else None
-                if not saved:
-                    _degrade(entry, save_reason)
-            return tuple(results)
-        finally:
-            await _release(session, program)
+    async with _open_session(config, target) as (session, program):
+        record = _load_record(session.binary_sha256)
+        results: list[PassResult] = []
+        for name in PASS_NAMES:
+            if name not in wanted:
+                continue
+            results.append(await _run_pass(session, program, record, name))
+        saved, save_reason = await _save(session)
+        # Only a run that really changed the program moves the revision. A
+        # pass that reports a definition an earlier run already made has
+        # applied nothing *now*, and a revision that moved without a
+        # change would stale every proposal written against the last one.
+        if program.mutated and saved:
+            record["revision"] = int(record["revision"]) + 1
+        if saved:
+            _store_record(session.binary_sha256, record)
+        revision = int(record["revision"])
+        for entry in results:
+            entry["artifact_revision"] = revision if saved else None
+            if not saved:
+                _degrade(entry, save_reason)
+        return tuple(results)
 
 
 async def evidence_ghidra(
@@ -421,22 +462,15 @@ async def evidence_ghidra(
     answered ``False``.
     """
     config = _config()
-    try:
-        async with provider_session(
-            config, target, allowlist=_allowlist(config)
-        ) as session:
-            program = await _open_program(session, config, target)
-            try:
-                return await _rule_evidence(session, program, rule, rule_index)
-            finally:
-                await _release(session, program)
-    except GhidraUnavailableError:
-        # "There is no provider to ask" is unavailability, not a rule this
-        # backend tried and could not finish, and the routing layer has to be
-        # able to tell the two apart.
-        raise
-    except ProviderError as refused:
-        return _evidence(rule_index, [], [], "failed", str(refused))
+    async with _open_session(config, target) as (session, program):
+        try:
+            return await _rule_evidence(session, program, rule, rule_index)
+        except GhidraUnavailableError:
+            # The provider went away mid-question. That is still "not
+            # reachable", not "reached and could not answer".
+            raise
+        except ProviderError as refused:
+            return _evidence(rule_index, [], [], "failed", str(refused))
 
 
 async def apply_ghidra_review(
@@ -453,63 +487,57 @@ async def apply_ghidra_review(
     body = validate_proposal(proposal)
     expected = _whole(expected_revision, "expected_revision")
     config = _config()
-    async with provider_session(
-        config, target, allowlist=_allowlist(config)
-    ) as session:
-        program = await _open_program(session, config, target)
-        try:
-            record = _load_record(session.binary_sha256)
-            revision = int(record["revision"])
-            if program.mutated:
-                # The project held no analysed program, so opening it changed
-                # the artifact before this approval was ever considered. That
-                # is a new revision, and this approval was not made against
-                # it — the comparison below is what says so.
-                opened, _ = await _save(session)
-                if opened:
-                    revision += 1
-                    record["revision"] = revision
-                    _store_record(session.binary_sha256, record)
-            report: dict[str, object] = {
-                "backend": BACKEND,
-                "mutated": False,
-                "applied": False,
-                "stale": False,
-                "revision": revision,
-                "previous_revision": revision,
-                "expected_revision": expected,
-                "effect": _effect(body),
-                "site": None,
-                "reason": None,
-            }
-            if revision != expected:
-                report["stale"] = True
-                report["reason"] = (
-                    f"this approval was made against revision {expected} and"
-                    f" the managed Ghidra project now carries revision"
-                    f" {revision}, so the evidence it rests on is not the"
-                    " evidence it would be applied to; nothing was applied"
-                )
-                return report
-            await _apply(session, program, body, report)
-            if not report["mutated"]:
-                return report
-            saved, save_reason = await _save(session)
-            if not saved:
-                report["applied"] = False
-                report["reason"] = (
-                    f"the change was applied to the open program and the"
-                    f" provider could not save it ({save_reason}), so no"
-                    " revision was approved and the next session reopens the"
-                    " project as it was before"
-                )
-                return report
-            record["revision"] = revision + 1
-            _store_record(session.binary_sha256, record)
-            report.update(applied=True, revision=revision + 1)
+    async with _open_session(config, target) as (session, program):
+        record = _load_record(session.binary_sha256)
+        revision = int(record["revision"])
+        if program.mutated:
+            # The project held no analysed program, so opening it changed
+            # the artifact before this approval was ever considered. That
+            # is a new revision, and this approval was not made against
+            # it — the comparison below is what says so.
+            opened, _ = await _save(session)
+            if opened:
+                revision += 1
+                record["revision"] = revision
+                _store_record(session.binary_sha256, record)
+        report: dict[str, object] = {
+            "backend": BACKEND,
+            "mutated": False,
+            "applied": False,
+            "stale": False,
+            "revision": revision,
+            "previous_revision": revision,
+            "expected_revision": expected,
+            "effect": _effect(body),
+            "site": None,
+            "reason": None,
+        }
+        if revision != expected:
+            report["stale"] = True
+            report["reason"] = (
+                f"this approval was made against revision {expected} and"
+                f" the managed Ghidra project now carries revision"
+                f" {revision}, so the evidence it rests on is not the"
+                " evidence it would be applied to; nothing was applied"
+            )
             return report
-        finally:
-            await _release(session, program)
+        await _apply(session, program, body, report)
+        if not report["mutated"]:
+            return report
+        saved, save_reason = await _save(session)
+        if not saved:
+            report["applied"] = False
+            report["reason"] = (
+                f"the change was applied to the open program and the"
+                f" provider could not save it ({save_reason}), so no"
+                " revision was approved and the next session reopens the"
+                " project as it was before"
+            )
+            return report
+        record["revision"] = revision + 1
+        _store_record(session.binary_sha256, record)
+        report.update(applied=True, revision=revision + 1)
+        return report
 
 
 # --------------------------------------------------------------------------

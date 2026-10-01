@@ -1160,3 +1160,58 @@ def test_a_reply_that_claims_json_and_is_not_is_refused(
     session = refusing(body)
     with pytest.raises(ghidra.ProviderUnavailableError):
         asyncio.run(ghidra._functions(session))
+
+
+@pytest.mark.requires_ghidra
+def test_a_session_that_never_opened_is_not_an_attempted_call(
+    compiled_fallback: Path,
+    ghidra_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreachable propagates; reached-and-failed stays a ``failed`` record.
+
+    This is the taxonomy the routing layer runs on, and the two halves mean
+    opposite things to it. "The backend was never reachable" means *try the
+    next one*; "we reached it and the call failed" means *record that against
+    this backend and do not silently substitute another*. Flattening an
+    unopened session into ``state='failed'`` left the router unable to tell
+    them apart, and the first thing it would do is guess.
+    """
+    from vulfi_mcp.providers import ghidra
+
+    index, printf_rule = _stock("Format String", "printf")
+
+    # Nothing is listening: no session, so no call was ever attempted.
+    dead = tmp_provider_config(ghidra_config, "http://127.0.0.1:1")
+    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(dead))
+    with pytest.raises(ghidra.GhidraUnavailableError) as unreachable:
+        asyncio.run(evidence_ghidra(str(compiled_fallback), printf_rule, index))
+    assert "no session" in str(unreachable.value) or "usable session" in str(
+        unreachable.value
+    ), unreachable.value
+    # prepare_* already propagated; both entry points now raise the same type.
+    with pytest.raises(ghidra.GhidraUnavailableError):
+        asyncio.run(prepare_ghidra(str(compiled_fallback), ("functions",)))
+
+    # And a failure *during* a call is still a failure recorded against this
+    # backend, not a backend the router may replace.
+    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(ghidra_config))
+    async def refuse(session: Any, program: Any, rule: Any, rule_index: int) -> Any:
+        raise ghidra.ProviderUnavailableError("read_memory answered nonsense")
+
+    monkeypatch.setattr(ghidra, "_rule_evidence", refuse)
+    evidence = live(evidence_ghidra(str(compiled_fallback), printf_rule, index))
+    assert evidence["state"] == "failed", evidence
+    assert evidence["backend"] == BACKEND, evidence
+    assert "nonsense" in (evidence["reason"] or ""), evidence["reason"]
+
+
+def tmp_provider_config(original: Path, url: str) -> Path:
+    """The same operator configuration, pointed at an endpoint nothing serves."""
+    copy = original.with_name("providers-dead.toml")
+    copy.write_text(
+        original.read_text(encoding="utf-8").replace(ghidra_url(), url),
+        encoding="utf-8",
+    )
+    return copy
