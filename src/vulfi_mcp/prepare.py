@@ -2523,12 +2523,15 @@ def _route_passes(
     The loop below is the whole of per-pass routing, and every branch in it
     is one of the five outcomes :data:`vulfi_mcp.contracts.AttemptOutcome`
     names. A pass a backend produced a result for is answered and is never
-    asked of another backend. A pass a backend produced an ``unavailable``
-    result for is that backend stating it cannot establish this pass at all,
-    and the chain advances. A backend that could not be reached advances the
-    chain too. A backend that opened a session and failed advances it as
-    well — and its failure stays in ``attempts``, is carried into the stored
-    revision's warnings, and keeps the pass from being read as clean.
+    asked of another backend. A pass whose coverage is ``unavailable`` is
+    one of two facts, and they are not collapsed: no typed tool is
+    ``unsupported`` and the chain advances; a session that opened and could
+    not finish that one pass is ``failed``, recorded, and the chain advances
+    past that pass alone. A backend that could not be reached advances the
+    chain too. A backend that opened a session and failed the call outright
+    advances it as well — and its failure stays in ``attempts``, is carried
+    into the stored revision's warnings, and keeps the pass from being read
+    as clean.
 
     The one outcome that stops a pass is an identity this server could not
     prove, because no other backend can stand in for that: "we cannot show
@@ -2584,6 +2587,19 @@ def _route_passes(
                 extra.append((_failed_pass(name, backend, missing), {}))
                 continue
             if str(entry.get("coverage")) == "unavailable":
+                # Two shapes share this coverage, and they are not the same
+                # fact. A pass with no typed tool says so before any call and
+                # stays unsupported. A session that opened and then could not
+                # finish — schema drift, a refused call, a killed child — is
+                # failed, for this pass alone, and the refusal is what is
+                # stored so a later answer cannot erase it.
+                unfinished = _unfinished_reason(entry)
+                if unfinished is not None:
+                    attempts[name].append(
+                        _attempt(backend, "failed", unfinished)
+                    )
+                    extra.append((_failed_pass(name, backend, unfinished), {}))
+                    continue
                 attempts[name].append(
                     _attempt(backend, "unsupported", _range_reason(entry))
                 )
@@ -2693,6 +2709,41 @@ def _unavailable_error(backend: str) -> type[BaseException]:
     )
 
 
+def _unfinished_reason(entry: Mapping[str, Any]) -> str | None:
+    """The refusal of a pass a session opened and could not finish.
+
+    Two adapter shapes, kept distinct from "no typed tool". Ghidra's
+    ``_run_pass`` catches ``ProviderError`` and returns empty ranges with the
+    refusal only in a warning, ``the {pass!r} pass could not finish: ...``.
+    radare2's ``_unavailable_pass`` puts ``the {pass!r} pass could not be
+    answered: ...`` on every range, and the same refusal in a warning. A
+    ``_NO_SOURCE`` pass uses neither spelling and is not this: it is a
+    capability the backend states it does not have, which stays
+    ``unsupported``.
+
+    The text returned is the provider's own refusal, without the adapter's
+    prefix, so a stored attempt quotes what was refused rather than "named
+    no reason".
+    """
+    name = entry.get("pass")
+    if not isinstance(name, str) or not name:
+        return None
+    finish = f"the {name!r} pass could not finish: "
+    for warning in _strings(entry.get("warnings")):
+        if warning.startswith(finish):
+            return warning[len(finish) :]
+    unanswered = f"the {name!r} pass could not be answered: "
+    for item in _entries(entry.get("ranges")):
+        reason = item.get("reason")
+        if isinstance(reason, str) and reason.startswith(unanswered):
+            return reason[len(unanswered) :]
+    noted = f"the {name!r} pass was not answered: "
+    for warning in _strings(entry.get("warnings")):
+        if warning.startswith(noted):
+            return warning[len(noted) :]
+    return None
+
+
 def _range_reason(entry: dict[str, Any]) -> str:
     """Why a pass reported ``unavailable``, in the backend's own words."""
     for item in _entries(entry.get("ranges")):
@@ -2705,6 +2756,21 @@ def _range_reason(entry: dict[str, Any]) -> str:
     )
 
 
+def _summary_coverage(coverage: str, attempts: list[BackendAttempt]) -> str:
+    """The coverage a routing row may report once a failure is known.
+
+    The answering pass's own coverage is carried through. The one exception
+    is ``complete`` on a pass a ``failed`` attempt touched: that would be the
+    later answer *instead of* the failure, and the aggregate inherits the
+    weaker claim. ``unavailable`` is never upgraded.
+    """
+    if coverage == "complete" and any(
+        item["outcome"] == "failed" for item in attempts
+    ):
+        return "partial"
+    return coverage
+
+
 def _pass_routing(
     name: str,
     answered: dict[str, Any] | None,
@@ -2714,16 +2780,17 @@ def _pass_routing(
     """One requested pass, and what the whole chain made of it.
 
     ``coverage`` is the answering pass's own coverage, carried through
-    untouched. Routing never upgrades a pass summary: a blanket veto and a
-    per-range one are both that backend's claim about what it really read,
-    and ``unavailable`` is not upgraded by anything.
+    untouched, except that a ``failed`` attempt on the way keeps a
+    ``complete`` summary from standing in for the failure: the row reports
+    ``partial`` instead. Routing never upgrades a pass summary, and
+    ``unavailable`` is not upgraded by anything.
     """
     if answered is not None:
         return {
             "pass": name,
             "backend": str(answered.get("backend")),
             "state": "answered",
-            "coverage": str(answered.get("coverage")),
+            "coverage": _summary_coverage(str(answered.get("coverage")), attempts),
             "attempts": attempts,
             "reason": None,
         }
@@ -2765,9 +2832,12 @@ def _reused_routing(
 ) -> list[PassRouting]:
     """Routing rows for a revision nothing was asked for.
 
-    ``attempts`` is empty on every row, and that is the honest thing to say:
-    this call consulted no backend at all. What each row carries is which
-    backend's result the store already holds for that pass.
+    This call consulted no backend. An empty ``attempts`` list is honest
+    only when the store holds no failure for that pass: a stored failure is
+    read back into ``attempts``, with the refusal it was recorded under, and
+    the row does not report ``complete`` or a clean ``answered`` over it.
+    What each row carries otherwise is which backend's result the store
+    already holds.
     """
     held: dict[str, dict[str, object]] = {}
     failures: dict[str, list[BackendAttempt]] = {}
@@ -2799,7 +2869,7 @@ def _reused_routing(
                 "pass": name,
                 "backend": str(entry["backend"]),
                 "state": "answered",
-                "coverage": str(entry["coverage"]),
+                "coverage": _summary_coverage(str(entry["coverage"]), attempts),
                 "attempts": attempts,
                 "reason": None,
             }

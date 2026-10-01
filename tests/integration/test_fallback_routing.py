@@ -45,10 +45,14 @@ from conftest import (
     missing_prerequisite,
 )
 
-from vulfi_mcp.catalog import get_catalog
+from vulfi_mcp.catalog import get_catalog, open_catalog
 from vulfi_mcp.ida_adapter import existing_managed_idb
 from vulfi_mcp.prepare import (
     UnverifiedBinaryError,
+    _coverage,
+    _record,
+    _reused_routing,
+    _route_passes,
     findings_across_backends,
     prepare_target,
     preparation_page,
@@ -732,3 +736,162 @@ def test_an_unverified_binary_refuses_triage_before_it_writes(
     assert held[0]["status"] == "Not Checked"
     assert held[0]["rationale"] == ""
     assert held[0]["triage_revision"] == 0
+
+
+# --------------------------------------------------------------------------
+# fix round 2: a real mid-call refusal is failed, and stays failed
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.requires_ghidra
+def test_a_drifted_list_strings_failure_survives_a_later_complete_answer(
+    compiled_calls: Path,
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that opened and then had a pass refused is failed, and stays so.
+
+    Drifting the pinned ``list_strings`` schema is not "this backend has no
+    typed tool". The refusal has to be stored as a failed attempt in the
+    provider's own words, and a later backend that completes the same pass
+    must not erase it into a clean complete answer. ``structures`` has no
+    typed tool and stays unsupported.
+    """
+    require_r2()
+    import vulfi_mcp.prepare as prepare
+    import vulfi_mcp.providers.ghidra as ghidra
+
+    pins = dict(ghidra.PINNED_SCHEMAS)
+    pins["list_strings"] = "0" * 64
+    monkeypatch.setattr(ghidra, "PINNED_SCHEMAS", pins)
+    real = prepare._PREPARE["r2"]
+
+    async def complete_strings(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        produced = await real(target, passes)
+        forced = []
+        for entry in produced:
+            row = dict(entry)
+            # A real strings pass on this fixture is partial — code is not
+            # swept — and that would hide the defect. The defect is a later
+            # *complete* answer rebuilding the row as if nothing failed.
+            if row.get("pass") == "strings":
+                row["coverage"] = "complete"
+            forced.append(row)
+        return tuple(forced)
+
+    monkeypatch.setitem(prepare._PREPARE, "r2", complete_strings)
+    requested = ("strings", "structures")
+    routed = _route_passes(str(compiled_calls), ("ghidra", "r2"), requested)
+    strings = routing_for({"routing": routed.routing}, "strings")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    ghidra_strings = next(
+        item for item in strings["attempts"] if item["backend"] == "ghidra"
+    )
+    ghidra_structures = next(
+        item for item in structures["attempts"] if item["backend"] == "ghidra"
+    )
+    report = _record(
+        str(compiled_calls), "ghidra", ("ghidra", "r2"), requested, routed
+    )
+    reopened = get_catalog(str(compiled_calls))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("strings",), stored)
+    detail = (
+        f"ghidra attempt={ghidra_strings!r}\n"
+        f"structures attempt={ghidra_structures!r}\n"
+        f"fresh={strings!r}\n"
+        f"reused={reused!r}\n"
+        f"revision_coverage={_coverage(stored)!r}"
+    )
+    assert ghidra_strings["outcome"] == "failed", detail
+    assert ghidra_strings["reason"], detail
+    assert "list_strings" in ghidra_strings["reason"], detail
+    assert "named no reason" not in ghidra_strings["reason"], detail
+    assert ghidra_structures["outcome"] == "unsupported", detail
+    assert reused["coverage"] != "complete", detail
+    assert not (reused["state"] == "answered" and reused["attempts"] == []), detail
+    failed = [item for item in reused["attempts"] if item["outcome"] == "failed"]
+    assert failed and failed[0]["backend"] == "ghidra", detail
+    assert failed[0]["reason"] and "list_strings" in failed[0]["reason"], detail
+    assert "named no reason" not in failed[0]["reason"], detail
+    assert _coverage(stored) != "complete", detail
+    # The later answer may sit beside the failure. It must not replace it.
+    assert reused["backend"] == "r2", detail
+
+
+def test_an_r2_unavailable_pass_is_failed_and_not_dropped(
+    compiled_calls: Path,
+    both_providers: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r2's per-pass refusal is failed; a missing tool stays unsupported.
+
+    ``_unavailable_pass`` keeps the refusal on the ranges. That is still a
+    session that opened and could not finish, and a later complete answer
+    must not drop it. ``structures`` has no typed tool and stays unsupported.
+    The strings pass beside the drifted tool is not taken down with it.
+    """
+    require_r2()
+    import vulfi_mcp.providers.r2 as r2
+
+    pins = dict(r2.PINNED_SCHEMAS)
+    pins["list_symbols"] = "0" * 64
+    monkeypatch.setattr(r2, "PINNED_SCHEMAS", pins)
+    requested = ("strings", "functions", "structures")
+    routed = _route_passes(str(compiled_calls), ("r2",), requested)
+    functions = routing_for({"routing": routed.routing}, "functions")
+    strings = routing_for({"routing": routed.routing}, "strings")
+    structures = routing_for({"routing": routed.routing}, "structures")
+    (functions_attempt,) = functions["attempts"]
+    (strings_attempt,) = strings["attempts"]
+    (structures_attempt,) = structures["attempts"]
+    report = _record(str(compiled_calls), "r2", ("r2",), requested, routed)
+    # r2 is last in every public chain, so the later complete answer is
+    # written beside the failure the way a chain that advanced would write it.
+    with open_catalog(str(compiled_calls)) as catalog:
+        catalog.record_pass(
+            report["analysis_id"],
+            {
+                "pass": "functions",
+                "backend": "ghidra",
+                "ranges": [{"start": 0x1000, "end": 0x2000}],
+                "coverage": "complete",
+                "applied_ids": [],
+                "candidate_ids": [],
+                "candidates": [],
+                "warnings": [],
+                "artifact_revision": None,
+            },
+        )
+    reopened = get_catalog(str(compiled_calls))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("functions",), stored)
+    detail = (
+        f"functions={functions_attempt!r}\n"
+        f"strings={strings_attempt!r}\n"
+        f"structures={structures_attempt!r}\n"
+        f"reused={reused!r}"
+    )
+    assert functions_attempt["outcome"] == "failed", detail
+    assert (
+        functions_attempt["reason"]
+        and "list_symbols" in functions_attempt["reason"]
+    ), detail
+    assert "named no reason" not in functions_attempt["reason"], detail
+    assert strings_attempt["outcome"] == "answered", detail
+    assert structures_attempt["outcome"] == "unsupported", detail
+    assert any(
+        item["backend"] == "r2"
+        and item["outcome"] == "failed"
+        and item["reason"]
+        and "list_symbols" in item["reason"]
+        for item in reused["attempts"]
+    ), detail
+    assert reused["coverage"] != "complete", detail
+    assert not (reused["state"] == "answered" and reused["attempts"] == []), detail

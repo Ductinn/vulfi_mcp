@@ -1129,3 +1129,148 @@ def test_an_external_only_scan_names_the_id_its_rows_really_carry(
     # The id the result named is the id the stored row carries.
     assert held["last_seen_scan_id"] == identifiers[-1]
     assert scope["scan_id"] == identifiers[-1]
+
+
+def test_unfinished_pass_shapes_stay_failed_and_missing_tools_do_not(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two unavailable shapes, not one. A missing typed tool stays unsupported.
+    # A pass a session opened and could not finish is failed, stored with the
+    # refusal, and a later complete answer does not rebuild a clean row.
+    import vulfi_mcp.prepare as prepare
+    from vulfi_mcp.providers.ghidra import _NO_SOURCE as GHIDRA_NO_SOURCE
+    from vulfi_mcp.providers.ghidra import _Program
+    from vulfi_mcp.providers.ghidra import _pass_result as ghidra_pass
+    from vulfi_mcp.providers.r2 import _Image
+    from vulfi_mcp.providers.r2 import _NO_SOURCE as R2_NO_SOURCE
+    from vulfi_mcp.providers.r2 import _pass_result as r2_pass
+    from vulfi_mcp.providers.r2 import _unavailable
+    from vulfi_mcp.providers.r2 import _unavailable_pass
+
+    program = _Program(
+        name="subject",
+        project="subject",
+        remote="subject",
+        base=0x1000,
+        segments=[],
+        segment_cap=None,
+        mutated=False,
+    )
+    refusal = (
+        "the ghidra provider's 'list_strings' tool no longer matches the"
+        " schema it was pinned at"
+    )
+    ghidra_failed = ghidra_pass(
+        program,
+        "strings",
+        [],
+        [],
+        [f"the {'strings'!r} pass could not finish: {refusal}"],
+    )
+    ghidra_missing = ghidra_pass(
+        program, "structures", [], [], [GHIDRA_NO_SOURCE["structures"]]
+    )
+    image = _Image(
+        0x400000,
+        [{"name": ".text", "start": 0x401000, "end": 0x402000}],
+        [],
+    )
+    r2_failed = _unavailable_pass(
+        image,
+        "functions",
+        "the r2 provider's 'list_symbols' tool no longer matches",
+    )
+    block = image.sections[0]
+    r2_missing = r2_pass(
+        image,
+        "pointer_tables",
+        [_unavailable(block, "raw_bytes", R2_NO_SOURCE["pointer_tables"])],
+        [],
+        list(image.warnings),
+    )
+    r2_structures = r2_pass(
+        image,
+        "structures",
+        [_unavailable(block, "raw_bytes", R2_NO_SOURCE["structures"])],
+        [],
+        list(image.warnings),
+    )
+    r2_complete = r2_pass(
+        image,
+        "strings",
+        [
+            {
+                "name": ".rodata",
+                "stage": "raw_bytes",
+                "start": 0x403000,
+                "end": 0x404000,
+                "coverage": "complete",
+                "unvisited": [],
+                "reason": None,
+            }
+        ],
+        [],
+        [],
+    )
+
+    async def ghidra_prepare(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        produced = {"strings": ghidra_failed, "structures": ghidra_missing}
+        return tuple(produced[name] for name in passes)
+
+    async def r2_prepare(target: str, passes: tuple[str, ...]) -> tuple[Any, ...]:
+        produced = {
+            "strings": r2_complete,
+            "functions": r2_failed,
+            "structures": r2_structures,
+            "pointer_tables": r2_missing,
+        }
+        return tuple(produced[name] for name in passes)
+
+    monkeypatch.setitem(prepare._PREPARE, "ghidra", ghidra_prepare)
+    monkeypatch.setitem(prepare._PREPARE, "r2", r2_prepare)
+    binary = _binary(tmp_path)
+
+    routed = _route_passes(str(binary), ("ghidra", "r2"), ("strings", "structures"))
+    by_pass = {row["pass"]: row for row in routed.routing}
+    ghidra_strings = next(
+        item for item in by_pass["strings"]["attempts"] if item["backend"] == "ghidra"
+    )
+    assert ghidra_strings["outcome"] == "failed"
+    assert ghidra_strings["reason"] == refusal
+    assert by_pass["strings"]["coverage"] != "complete"
+    assert by_pass["strings"]["backend"] == "r2"
+    assert all(
+        item["outcome"] == "unsupported" for item in by_pass["structures"]["attempts"]
+    )
+    assert by_pass["structures"]["state"] == "unsupported"
+
+    r2_only = _route_passes(str(binary), ("r2",), ("functions", "pointer_tables"))
+    r2_rows = {row["pass"]: row for row in r2_only.routing}
+    (functions_attempt,) = r2_rows["functions"]["attempts"]
+    assert functions_attempt["outcome"] == "failed"
+    assert "list_symbols" in (functions_attempt["reason"] or "")
+    (tables_attempt,) = r2_rows["pointer_tables"]["attempts"]
+    assert tables_attempt["outcome"] == "unsupported"
+    assert "exposes no tool" in (tables_attempt["reason"] or "")
+
+    report = prepare._record(
+        str(binary), "ghidra", ("ghidra", "r2"), ("strings", "structures"), routed
+    )
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.pass_results(report["analysis_id"])
+    (reused,) = _reused_routing(("strings",), stored)
+    assert reused["coverage"] != "complete"
+    assert not (reused["state"] == "answered" and reused["attempts"] == [])
+    failed = [item for item in reused["attempts"] if item["outcome"] == "failed"]
+    assert failed == [
+        {"backend": "ghidra", "outcome": "failed", "reason": refusal}
+    ]
+    assert _coverage(stored) != "complete"
+    held = next(
+        entry
+        for entry in stored
+        if entry["pass"] == "strings" and entry["backend"] == "ghidra"
+    )
+    assert _failure_reason(held) == refusal
