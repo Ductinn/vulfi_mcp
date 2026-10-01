@@ -837,6 +837,41 @@ def test_a_target_with_no_call_reference_says_where_it_looked(
     assert all(item["reason"] for item in evidence["ranges"]), evidence["ranges"]
 
 
+def test_a_lookup_that_could_not_be_made_is_not_a_missing_flag(
+    compiled_calls_binary: Path,
+    r2_config: Path,
+    managed_data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last place a failure could pass for an absence.
+
+    ``lookup_address`` only corroborates — the candidate's claim is the bytes
+    the pass read at that address — so losing it must not take the pass down.
+    What it must also not do is turn every candidate into "radare2 holds no
+    flag here", which is what returning ``None`` on a refusal did.
+    """
+    import vulfi_mcp.providers.r2 as adapter
+
+    whole = candidates(
+        live(prepare_r2(str(compiled_calls_binary), ("strings",))), "strings"
+    )
+    assert any(row["evidence"]["provider_flag"] for row in whole), whole
+    assert all(row["evidence"]["provider_flag_checked"] for row in whole)
+
+    drifted = dict(PINNED_SCHEMAS)
+    drifted["lookup_address"] = "0" * 64
+    monkeypatch.setattr(adapter, "PINNED_SCHEMAS", drifted)
+    results = live(prepare_r2(str(compiled_calls_binary), ("strings",)))
+    rows = candidates(results, "strings")
+    assert len(rows) == len(whole), "the bytes are still the evidence"
+    assert all(not row["evidence"]["provider_flag_checked"] for row in rows)
+    assert all(row["evidence"]["provider_flag_unavailable"] for row in rows)
+    assert any(
+        "lookup_address" in warning
+        for warning in one_pass(results, "strings")["warnings"]
+    ), one_pass(results, "strings")["warnings"]
+
+
 def test_the_adapter_allowlist_is_a_constant_no_caller_can_widen() -> None:
     """The tool surface is the adapter's, and it holds no escape."""
     assert BACKEND == "r2"

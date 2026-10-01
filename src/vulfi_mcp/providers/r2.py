@@ -479,21 +479,25 @@ def _config() -> ProviderConfig:
 
 
 class _Image:
-    """One open binary, and everything about it this session measured."""
+    """One open binary, and everything about it this session measured.
 
-    __slots__ = ("base", "bits", "format", "sections", "warnings")
+    Exactly three things, because exactly three are read. ``bits`` and
+    ``format`` used to be here, assigned from ``show_info`` and consumed by
+    nothing: once every scalar became strict, a drifted ``bits`` could end a
+    session over a field no result carries, and ``format`` was the module's
+    last unguarded ``or "unknown"`` default on provider text. Strictness on a
+    value nobody uses is cost without protection, so neither is read any more.
+    """
+
+    __slots__ = ("base", "sections", "warnings")
 
     def __init__(
         self,
         base: int,
-        bits: int,
-        format_name: str,
         sections: list[dict[str, Any]],
         warnings: list[str],
     ) -> None:
         self.base = base
-        self.bits = bits
-        self.format = format_name
         self.sections = sections
         self.warnings = warnings
 
@@ -539,13 +543,7 @@ async def _open(session: ProviderSession) -> _Image:
             "the radare2 provider reports no mapped section for"
             f" {session.remote_path}, so there is no address range to read"
         )
-    return _Image(
-        _scalar(info, "baddr"),
-        _scalar(info, "bits"),
-        str(info.get("format") or "unknown"),
-        sections,
-        warnings,
-    )
+    return _Image(_scalar(info, "baddr"), sections, warnings)
 
 
 async def _release(session: ProviderSession) -> None:
@@ -694,6 +692,19 @@ async def _paged(session: ProviderSession, tool: str, **arguments: Any) -> list[
             raise R2FormatError(
                 f"the radare2 provider's {tool!r} answered {total} lines and"
                 f" stopped producing them at line {len(lines)}"
+            )
+        if page == lines[-len(page):]:
+            # A provider that ignores ``cursor`` repeats its first page, and a
+            # repetition whose length happens to land on the declared count
+            # would otherwise be accepted as a whole listing of duplicates.
+            # 1.8.8 honours ``cursor`` and this cannot fire against it; the
+            # check is here because "the count was satisfied" is not evidence
+            # that the lines were different ones.
+            raise R2FormatError(
+                f"the radare2 provider's {tool!r} answered the same"
+                f" {len(page)} lines again at cursor {len(lines)}, so its"
+                " pages do not advance and the listing has no end this"
+                " adapter can find"
             )
         lines.extend(page)
     raise R2FormatError(
@@ -965,11 +976,12 @@ async def _flag_at(session: ProviderSession, address: int) -> str | None:
     inside one rather than at it. Only an exact hit is reported, because
     "there is a string eight bytes before this" is not a fact about this
     address.
+
+    ``None`` means the provider holds nothing here. A lookup that could not be
+    *made* raises, because those are not the same answer — this was the last
+    place in the module where they were.
     """
-    try:
-        answer = _rows(await _call(session, "lookup_address", address=_hex(address)))
-    except ProviderError:
-        return None
+    answer = _rows(await _call(session, "lookup_address", address=_hex(address)))
     if not answer:
         return None
     name = answer[0].strip()
@@ -1017,6 +1029,7 @@ async def _strings_pass(session: ProviderSession, image: _Image) -> PreparedPass
     candidates: list[Candidate] = []
     warnings = list(image.warnings)
     budget = MAX_PASS_READ_BYTES
+    unchecked: str | None = None
     for block in image.sections:
         if block["executable"]:
             ranges.append(_unreached(block, "raw_bytes", _CODE_NOT_SWEPT))
@@ -1043,8 +1056,23 @@ async def _strings_pass(session: ProviderSession, image: _Image) -> PreparedPass
                     f" {found['start']:#x} was not examined"
                 )
                 break
-            flag = await _flag_at(session, int(found["start"]))
-            candidates.append(_string_candidate(block, found, flag))
+            flag: str | None = None
+            if unchecked is None:
+                try:
+                    flag = await _flag_at(session, int(found["start"]))
+                except ProviderError as refused:
+                    # Corroboration only: the candidate's claim is the bytes
+                    # this pass read at this address, and those are already in
+                    # hand. So the lookup stops rather than taking the pass
+                    # down — and every candidate records that it was not made,
+                    # instead of all of them recording that there was no flag.
+                    unchecked = str(refused)
+                    warnings.append(
+                        "the provider's 'lookup_address' stopped answering"
+                        f" ({unchecked}), so no candidate below records whether"
+                        " radare2 already holds a flag at its address"
+                    )
+            candidates.append(_string_candidate(block, found, flag, unchecked))
     return _pass_result(image, "strings", ranges, candidates, warnings)
 
 
@@ -1235,7 +1263,10 @@ def _is_text(text: str) -> bool:
 
 
 def _string_candidate(
-    block: Mapping[str, Any], found: Mapping[str, Any], flag: str | None
+    block: Mapping[str, Any],
+    found: Mapping[str, Any],
+    flag: str | None,
+    unchecked: str | None,
 ) -> Candidate:
     return {
         "candidate_id": f"r2:string:{found['encoding']}:{found['start']:08x}",
@@ -1253,6 +1284,10 @@ def _string_candidate(
             "bytes": bytes(found["raw"]).hex(),
             "text": found["text"],
             "provider_flag": flag,
+            # ``None`` with ``provider_flag_checked`` true means radare2 holds
+            # nothing at this address; false means nobody asked, and why.
+            "provider_flag_checked": unchecked is None,
+            "provider_flag_unavailable": unchecked,
         },
         "confidence": 0.8,
         "state": "candidate",
@@ -1443,9 +1478,16 @@ def _pass_result(
                 f"{item['reason']}; {blocked}" if item["reason"] else blocked
             )
             # ``contracts.AddressRange`` says a partial range names the rest in
-            # ``unvisited``, and the rest here is the whole range: the pass left
-            # rows behind without knowing where they were, so it cannot say
-            # which bytes of this one it really described.
+            # ``unvisited``, and the whole range is named here deliberately —
+            # *not* because the pass does not know which rows it left out (the
+            # cap path prints the first one), but because knowing which rows
+            # were omitted says nothing about which *bytes* they cover: this
+            # provider states an extent only for a function the pass asked
+            # about, and it did not ask about these. Subtracting the extents it
+            # did measure would leave an empty remainder on exactly the ranges
+            # the veto exists to deny, so the conservative answer stands: the
+            # range is reported unexamined, which under-claims coverage and can
+            # never assert an absence that was not measured.
             item["unvisited"] = [
                 {"start": int(item["start"]), "end": int(item["end"])}
             ]
