@@ -55,16 +55,24 @@ fallback to IDA is reported, because no fallback happens.
 from __future__ import annotations
 
 import hashlib
+import json
+import shlex
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 from vulfi_mcp.catalog import (
     CATALOG_UNAVAILABLE_REASON,
     Catalog,
+    CatalogError,
     get_catalog,
     open_catalog,
 )
-from vulfi_mcp.contracts import Candidate, PreparationPage, PreparationResult
+from vulfi_mcp.contracts import (
+    Candidate,
+    JsonValue,
+    PreparationPage,
+    PreparationResult,
+)
 from vulfi_mcp.ida_adapter import (
     BACKEND,
     IDB_SUFFIXES,
@@ -81,6 +89,9 @@ from vulfi_mcp.ida_runtime import (
     validate_page,
     validate_prepare_limits,
     validate_prepare_passes,
+    proposal_payload,
+    validate_proposal,
+    validate_proposal_request,
 )
 
 __all__ = [
@@ -91,10 +102,17 @@ __all__ = [
     "NOTHING_PREPARED_REASON",
     "NO_MANAGED_DATABASE_REASON",
     "PASSES",
+    "PROPOSALS_ARE_INERT",
+    "WRITABLE_BACKENDS",
     "PreparationError",
+    "ProposalResult",
+    "ProposalSubmission",
+    "check_proposal_against_candidate",
     "ensure_prepared",
+    "mint_proposal_id",
     "prepare_target",
     "preparation_page",
+    "propose_recovery",
     "resolve_backend",
     "run_ida_passes",
 ]
@@ -124,6 +142,33 @@ IMPLEMENTED_BACKENDS: Final[tuple[str, ...]] = ("auto", "ida")
 _RUN: Final = "prepare"
 _SUMMARY: Final = "preparation_summary"
 _RECORD: Final = "record_preparation"
+_EVIDENCE: Final = "proposal_evidence"
+
+#: Backends whose candidates this build can write a reviewed change back to.
+#: Plan 3 adds the external providers; until one of them can write safely, a
+#: proposal against its candidate is refused by name rather than applied
+#: against the IDA analysis as if that were the same thing.
+WRITABLE_BACKENDS: Final[tuple[str, ...]] = (BACKEND,)
+
+#: The candidate kinds each proposed change may be made to. A name can be
+#: given to anything preparation found; the other four are changes to one
+#: particular kind of thing and are refused against any other.
+_PROPOSAL_CANDIDATES: Final[dict[str, tuple[str, ...]]] = {
+    "name": ("function", "string", "structure", "pointer_table"),
+    "function_boundary": ("function",),
+    "string_decode": ("string",),
+    "structure_field": ("structure",),
+    "pointer_table": ("pointer_table",),
+}
+
+#: Said on every proposal result, because it is the one thing a reader of one
+#: must not get wrong.
+PROPOSALS_ARE_INERT: Final = (
+    "a stored proposal changes nothing: no managed database was opened for"
+    " writing, no artifact revision moved, and no VulFi MCP tool can approve"
+    " one. An operator applies a proposal with 'vulfi-mcp review approve',"
+    " which revalidates its evidence against the current revision first"
+)
 
 #: Candidates one result carries inline. The count is always exact and
 #: ``vulfi_preparation`` pages the rest; a run may produce two thousand
@@ -168,6 +213,73 @@ NOTHING_PREPARED_REASON: Final = (
 
 class PreparationError(ValueError):
     """A preparation request was refused before any database was opened."""
+
+
+class ProposalSubmission(TypedDict):
+    """What became of one submitted proposal.
+
+    ``accepted`` is the whole claim, and it is a claim about *storage*:
+    ``True`` means this proposal is recorded ``pending`` and is waiting for
+    an operator, not that anything has changed. ``False`` means it was not
+    stored at all, and ``reason`` says what was wrong with it — an
+    unpermitted kind, a value that is not an identifier, evidence the
+    candidate does not carry, an address that is not the candidate's, a
+    definition already there, or a backend with no safe writer.
+
+    ``effect`` is the one-line description of what approving it would do, as
+    the reviewer will be shown it, so the agent that proposed it and the
+    operator who decides on it read the same sentence.
+    """
+
+    index: int
+    accepted: bool
+    proposal_id: str | None
+    candidate_id: str | None
+    kind: str | None
+    address_space: str | None
+    start: int | None
+    end: int | None
+    value: dict[str, JsonValue]
+    evidence: dict[str, JsonValue]
+    rationale: str | None
+    state: str | None
+    effect: str | None
+    expected_revision: int | None
+    reason: str | None
+
+
+class ProposalResult(TypedDict):
+    """What one ``vulfi_propose_recovery`` call stored, and what it did not.
+
+    ``applied`` is always ``False``. It is in the result because the one
+    thing a reader of a proposal result must not conclude is that something
+    happened: this tool writes rows in the catalog and nothing else.
+    ``preparation_revision`` is the artifact revision these proposals were
+    written against, and is what an operator passes to the review command as
+    ``--expected-revision``; an approval made against a revision the artifact
+    has since left is refused rather than applied.
+
+    The contracts for this tool live here rather than in
+    :mod:`vulfi_mcp.contracts` because the proposal path is this module's,
+    and :mod:`vulfi_mcp.server` imports the published type from here exactly
+    as it imports the others from there.
+    """
+
+    path: str
+    idb_path: str
+    backend: str
+    analysis_id: str
+    target_key: str
+    source_sha256: str | None
+    managed_idb_id: str | None
+    preparation_revision: int
+    applied: bool
+    accepted_total: int
+    refused_total: int
+    proposals: list[ProposalSubmission]
+    review_command: str
+    notice: str
+    warnings: list[str]
 
 
 # --------------------------------------------------------------------------
@@ -401,6 +513,340 @@ def ensure_prepared(
         " analysis_id to prepare the target, or call vulfi_prepare first."
         " Nothing was analyzed, nothing was created and nothing was scanned."
     )
+
+
+# --------------------------------------------------------------------------
+# Proposals: stored, never applied
+# --------------------------------------------------------------------------
+
+
+def propose_recovery(
+    path: str, analysis_id: str, proposals: list[dict[str, object]]
+) -> ProposalResult:
+    """Store what an agent proposes for one recorded preparation revision.
+
+    This is the only mutation the proposal path exposes through MCP, and the
+    only thing it mutates is the catalog. Nothing here opens a database for
+    writing, nothing here moves an artifact revision, and nothing here can
+    approve anything: an accepted proposal is stored ``pending`` and takes
+    effect only when an operator approves it with ``vulfi-mcp review``, which
+    is a different program run with a different principal's credentials.
+
+    Each proposal is answered on its own. A proposal that is refused is
+    refused with the reason — an unpermitted kind, a value that is not an
+    identifier, no evidence, evidence the named candidate does not carry, an
+    address that is not the candidate's, a range already defined, a backend
+    this build cannot write back to — and the rest of the request still
+    stands. Nothing refused is stored.
+
+    Raises :class:`PreparationError` when the request itself cannot be
+    answered: a target nothing has prepared, a catalog that is not there, or
+    a revision this target does not hold. None of those creates anything.
+    """
+    wanted = _analysis_argument(analysis_id)
+    requested = _proposal_request(proposals)
+    # A read of an existing analysis, so it resolves the managed database and
+    # never makes one: only vulfi_scan and vulfi_prepare may do that.
+    idb_path = existing_managed_idb(path)
+    if idb_path is None:
+        raise PreparationError(
+            f"nothing can be proposed for {path!r}: {NO_MANAGED_DATABASE_REASON}."
+            " Nothing was analyzed, created or stored"
+        )
+    checked = [_checked_proposal(item) for item in requested]
+    accepted = [body for body, _ in checked if body is not None]
+    # One lease, read-only: the current state of every proposed range, and
+    # the managed record's own summary, from the one operation that reports
+    # both. A submission never costs a save.
+    observed = invoke_ida(
+        idb_path,
+        _EVIDENCE,
+        {"proposals": [proposal_payload(body) for body in accepted]},
+    )
+    sites = _sites(observed, accepted)
+    revision = _revision(_preparation(observed))
+    managed_idb_id = _text(observed.get("managed_idb_id"))
+    probe = get_catalog(path, managed_idb_id)
+    if probe is None:
+        raise PreparationError(
+            f"nothing can be proposed for {path!r}: {CATALOG_UNAVAILABLE_REASON}"
+        )
+    probe.close()
+    with open_catalog(path, managed_idb_id) as catalog:
+        if catalog.analysis(wanted) is None:
+            raise PreparationError(
+                f"analysis_id={analysis_id!r} names no preparation revision of"
+                " this target, so there are no candidates to propose anything"
+                " about. Call vulfi_preparation to see the revision this"
+                " target holds. Nothing was stored"
+            )
+        submissions = [
+            _submit(catalog, wanted, index, body, refusal, sites, revision)
+            for index, (body, refusal) in enumerate(checked)
+        ]
+        report: ProposalResult = {
+            "path": path,
+            "idb_path": idb_path,
+            "backend": BACKEND,
+            "analysis_id": wanted,
+            "target_key": catalog.target_key,
+            "source_sha256": catalog.source_sha256,
+            "managed_idb_id": catalog.managed_idb_id,
+            "preparation_revision": revision,
+            "applied": False,
+            "accepted_total": sum(1 for row in submissions if row["accepted"]),
+            "refused_total": sum(1 for row in submissions if not row["accepted"]),
+            "proposals": submissions,
+            "review_command": _review_command(path),
+            "notice": PROPOSALS_ARE_INERT,
+            "warnings": [
+                f"proposal {row['index']} was not stored: {row['reason']}"
+                for row in submissions
+                if not row["accepted"]
+            ],
+        }
+    return report
+
+
+def check_proposal_against_candidate(
+    proposal: dict[str, Any], candidate: dict[str, Any]
+) -> None:
+    """Refuse a proposal that is not about the candidate it names.
+
+    :func:`vulfi_mcp.ida_runtime.validate_proposal` has already decided the
+    proposal is well formed on its own. This is the other half: whether the
+    thing it claims to be about exists, was produced by a backend with a safe
+    writer, is the kind of thing this change can be made to, sits where the
+    proposal says it does, and really records the evidence the proposal
+    quotes back at it.
+    """
+    backend = candidate.get("backend")
+    if backend not in WRITABLE_BACKENDS:
+        raise PreparationError(
+            f"candidate {proposal['candidate_id']!r} was recovered by the"
+            f" {backend!r} backend, and this build has no safe way to write a"
+            f" change back to a {backend} analysis: that provider arrives with"
+            " Plan 3. The proposal is refused rather than applied somewhere"
+            " else — nothing was applied, nothing was stored, and no change"
+            " was made on that backend's behalf"
+        )
+    permitted = _PROPOSAL_CANDIDATES[proposal["kind"]]
+    if candidate.get("kind") not in permitted:
+        raise PreparationError(
+            f"a {proposal['kind']!r} proposal is a change to a candidate of"
+            f" kind {', '.join(permitted)}, and {proposal['candidate_id']!r}"
+            f" is a {candidate.get('kind')!r} candidate"
+        )
+    if proposal["address_space"] != candidate.get("address_space"):
+        raise PreparationError(
+            f"this proposal is about address space"
+            f" {proposal['address_space']!r} and candidate"
+            f" {proposal['candidate_id']!r} is in"
+            f" {candidate.get('address_space')!r}"
+        )
+    if proposal["address"] != candidate.get("address"):
+        held = candidate.get("address")
+        where = "no provable address" if held is None else f"{held:#x}"
+        raise PreparationError(
+            f"this proposal is about {proposal['address']:#x} and candidate"
+            f" {proposal['candidate_id']!r} is at {where}: a proposal changes"
+            " the thing its candidate describes, at the address the candidate"
+            " was recovered from"
+        )
+    evidence = candidate.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    for fact, claimed in proposal["evidence"].items():
+        if fact not in evidence:
+            raise PreparationError(
+                f"this proposal quotes {fact!r} as evidence and candidate"
+                f" {proposal['candidate_id']!r} records no such fact; quote"
+                " the evidence the candidate really carries"
+            )
+        if evidence[fact] != claimed:
+            raise PreparationError(
+                f"this proposal quotes {fact}={claimed!r} and candidate"
+                f" {proposal['candidate_id']!r} records"
+                f" {fact}={evidence[fact]!r}"
+            )
+
+
+def mint_proposal_id(analysis_id: str, proposal: dict[str, Any]) -> str:
+    """The id of the change these facts describe.
+
+    Derived rather than random, so submitting the same proposal twice names
+    the one that is already there — with whatever an operator has since
+    decided about it — instead of quietly opening a second review of the same
+    change.
+    """
+    digest = hashlib.sha256()
+    for part in (
+        analysis_id,
+        proposal["candidate_id"],
+        proposal["kind"],
+        str(proposal["address"]),
+        json.dumps(proposal["value"], sort_keys=True, separators=(",", ":")),
+    ):
+        digest.update(part.encode("utf-8", "surrogateescape"))
+        digest.update(b"\x00")
+    return f"prop-{digest.hexdigest()[:32]}"
+
+
+def _proposal_request(proposals: object) -> list[object]:
+    try:
+        return validate_proposal_request(proposals)
+    except OperationError as refused:
+        raise PreparationError(str(refused)) from refused
+
+
+def _checked_proposal(item: object) -> tuple[dict[str, Any] | None, str | None]:
+    """One proposal as validated data, or exactly what is wrong with it."""
+    try:
+        return validate_proposal(item), None
+    except OperationError as refused:
+        return None, str(refused)
+
+
+def _sites(
+    observed: dict[str, object], accepted: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The worker's report on each accepted range, in the order it was sent."""
+    reviewed = _entries(observed.get("proposals"))
+    if len(reviewed) != len(accepted):
+        raise PreparationError(
+            f"the IDA worker reported on {len(reviewed)} of the"
+            f" {len(accepted)} proposed ranges, so there is no way to tell"
+            " which answer belongs to which proposal"
+        )
+    return reviewed
+
+
+def _preparation(observed: dict[str, object]) -> dict[str, Any]:
+    stored = observed.get("preparation")
+    if not isinstance(stored, dict):
+        raise PreparationError(
+            f"the managed record carries no preparation summary: {stored!r}"
+        )
+    return stored
+
+
+def _submit(
+    catalog: Catalog,
+    analysis_id: str,
+    index: int,
+    body: dict[str, Any] | None,
+    refusal: str | None,
+    sites: list[dict[str, Any]],
+    revision: int,
+) -> ProposalSubmission:
+    """Store one accepted proposal, or report why this one is not stored."""
+    if body is None:
+        return _refused(index, {}, str(refusal))
+    # Each site report names the range it is about, so a report is matched to
+    # its proposal rather than trusted to arrive in the order it was sent.
+    site = sites[_position(sites, body)]
+    try:
+        candidate = catalog.candidate(analysis_id, body["candidate_id"])
+        if candidate is None:
+            raise PreparationError(
+                f"no candidate {body['candidate_id']!r} is recorded under"
+                f" analysis {analysis_id!r} of this target, so there is"
+                " nothing for this proposal to be about"
+            )
+        check_proposal_against_candidate(body, candidate)
+        refusal = _text(site.get("refusal"))
+        if refusal is not None:
+            raise PreparationError(refusal)
+        proposal_id = mint_proposal_id(analysis_id, body)
+        held = catalog.proposal(proposal_id)
+        if held is not None:
+            return _refused(
+                index,
+                body,
+                f"this exact change is already recorded as {proposal_id},"
+                f" whose state is {held['state']!r}; a second submission of it"
+                " would open a second review of one change",
+                proposal_id=proposal_id,
+                state=str(held["state"]),
+            )
+        stored = catalog.record_proposal(
+            analysis_id,
+            proposal_id=proposal_id,
+            candidate_id=body["candidate_id"],
+            kind=body["kind"],
+            address_space=body["address_space"],
+            address=body["address"],
+            value=body["value"],
+            evidence=body["evidence"],
+            rationale=body["rationale"],
+        )
+    except (PreparationError, CatalogError) as refused:
+        return _refused(index, body, str(refused))
+    return {
+        "index": index,
+        "accepted": True,
+        "proposal_id": str(stored["proposal_id"]),
+        "candidate_id": body["candidate_id"],
+        "kind": body["kind"],
+        "address_space": body["address_space"],
+        "start": body["start"],
+        "end": body["end"],
+        "value": body["value"],
+        "evidence": body["evidence"],
+        "rationale": body["rationale"],
+        "state": str(stored["state"]),
+        "effect": _text(site.get("effect")),
+        "expected_revision": revision,
+        "reason": None,
+    }
+
+
+def _position(sites: list[dict[str, Any]], body: dict[str, Any]) -> int:
+    """Where this proposal's site report is, by the range it asked about."""
+    for index, site in enumerate(sites):
+        if (
+            site.get("candidate_id") == body["candidate_id"]
+            and site.get("kind") == body["kind"]
+            and site.get("start") == body["start"]
+            and site.get("end") == body["end"]
+        ):
+            return index
+    raise PreparationError(
+        f"the IDA worker reported on no range matching candidate"
+        f" {body['candidate_id']!r} at {body['start']:#x}"
+    )
+
+
+def _refused(
+    index: int,
+    body: dict[str, Any],
+    reason: str,
+    *,
+    proposal_id: str | None = None,
+    state: str | None = None,
+) -> ProposalSubmission:
+    """One proposal that was not stored, and exactly why it was not."""
+    return {
+        "index": index,
+        "accepted": False,
+        "proposal_id": proposal_id,
+        "candidate_id": _text(body.get("candidate_id")),
+        "kind": _text(body.get("kind")),
+        "address_space": _text(body.get("address_space")),
+        "start": body.get("start"),
+        "end": body.get("end"),
+        "value": body.get("value", {}),
+        "evidence": body.get("evidence", {}),
+        "rationale": _text(body.get("rationale")),
+        "state": state,
+        "effect": None,
+        "expected_revision": None,
+        "reason": reason,
+    }
+
+
+def _review_command(path: str) -> str:
+    """The command an operator runs to see what is waiting for them."""
+    return f"vulfi-mcp review list --path {shlex.quote(path)}"
 
 
 # --------------------------------------------------------------------------

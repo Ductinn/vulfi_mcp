@@ -70,13 +70,14 @@ STOCK_TOOLS = frozenset(
     }
 )
 
-#: The six tools this milestone adds.
+#: The seven tools this milestone adds.
 VULFI_TOOLS = frozenset(
     {
         "vulfi_rule_template",
         "vulfi_scan",
         "vulfi_prepare",
         "vulfi_preparation",
+        "vulfi_propose_recovery",
         "vulfi_findings",
         "vulfi_triage",
     }
@@ -471,10 +472,10 @@ def _scan_triage_and_restart(
     server = mcp_server()
 
     # Throwaway discovery check: this entry point extends the official server,
-    # so its six tools answer beside the six added here.
+    # so its six tools answer beside the seven added here.
     listed = server.tools()
     assert STOCK_TOOLS | VULFI_TOOLS <= set(listed)
-    assert len(listed) == 12, sorted(listed)
+    assert len(listed) == 13, sorted(listed)
 
     template = server.call("vulfi_rule_template", {}, timeout=HANDSHAKE_TIMEOUT)
     assert "rule_schema" in template
@@ -643,14 +644,14 @@ def test_every_successful_result_validates_against_its_advertised_schema(
     mcp_server: Callable[[], _Server],
     durable_or_reported: Callable[[], AbstractContextManager[list[str]]],
 ) -> None:
-    """A client that validates structured output accepts all six tools.
+    """A client that validates structured output accepts all seven tools.
 
     MCP 2025-06-18 says a client SHOULD validate a tool result's
     ``structuredContent`` against the ``outputSchema`` that tool advertises, so
     a schema the tool's own payload violates makes every successful call a
     failed one. This takes the schemas the running server publishes — not a
     copy written here — and checks a real successful payload from each of the
-    four VulFi tools against its own.
+    seven VulFi tools against its own.
     """
     with durable_or_reported() as produced, _rollback_survives_the_transport():
         try:
@@ -702,6 +703,38 @@ def _validate_every_vulfi_payload(
     recovered = server.call("vulfi_preparation", target, timeout=HANDSHAKE_TIMEOUT)
     assert recovered["candidates"], recovered
     payloads["vulfi_preparation"] = recovered
+    # One proposal against a candidate this preparation really recorded, so
+    # the nested submission schema is exercised by a row and not by an empty
+    # list. Whether the proposal is *accepted* is the proposal tests' subject;
+    # what this file checks is that the payload matches the published schema
+    # either way.
+    about = next(
+        row
+        for row in prepared["candidates"]
+        if row["state"] == "candidate" and row["address"] is not None
+    )
+    proposed = server.call(
+        "vulfi_propose_recovery",
+        {
+            **target,
+            "analysis_id": prepared["analysis_id"],
+            "proposals": [
+                {
+                    "candidate_id": about["candidate_id"],
+                    "kind": "name",
+                    "address_space": about["address_space"],
+                    "address": about["address"],
+                    "value": {"name": "vulfi_schema_probe"},
+                    "evidence": {"segment": about["evidence"]["segment"]},
+                    "rationale": "a name for the candidate this schema check uses",
+                }
+            ],
+        },
+        timeout=HANDSHAKE_TIMEOUT,
+    )
+    assert len(proposed["proposals"]) == 1, proposed
+    assert proposed["applied"] is False
+    payloads["vulfi_propose_recovery"] = proposed
 
     for name in sorted(VULFI_TOOLS):
         schema = advertised[name]

@@ -63,6 +63,11 @@ __all__ = [
     "MAX_EXPRESSION_NODES",
     "MAX_PAGE_LIMIT",
     "MAX_PREPARE_WARNINGS",
+    "MAX_PROPOSALS",
+    "MAX_PROPOSAL_EVIDENCE_FACTS",
+    "MAX_PROPOSAL_FIELDS",
+    "MAX_PROPOSAL_NAME_LENGTH",
+    "MAX_PROPOSED_TABLE_ENTRIES",
     "MAX_RATIONALE_LENGTH",
     "MAX_SCAN_NAME_LENGTH",
     "MIN_DEFINED_STRING_CHARS",
@@ -75,6 +80,9 @@ __all__ = [
     "PREPARE_LIMITS",
     "PREPARE_PASSES",
     "PRIORITIES",
+    "PROPOSAL_ENCODINGS",
+    "PROPOSAL_KINDS",
+    "PROPOSAL_STATES",
     "SCHEMA_VERSION",
     "TRIAGE_STATUSES",
     "UNAVAILABLE",
@@ -95,6 +103,7 @@ __all__ = [
     "capability_fingerprint",
     "evaluate_rule",
     "finding_order",
+    "proposal_payload",
     "run",
     "utc_now",
     "validate_analysis_id",
@@ -102,6 +111,8 @@ __all__ = [
     "validate_page",
     "validate_prepare_limits",
     "validate_prepare_passes",
+    "validate_proposal",
+    "validate_proposal_request",
     "validate_rationale",
     "validate_scan_name",
     "validate_scope",
@@ -3706,6 +3717,395 @@ def validate_analysis_id(value: object) -> str:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Proposals: what an agent may ask an operator to approve
+# ---------------------------------------------------------------------------
+#
+# Everything below is about *data*. A proposal names one candidate this
+# catalog already holds, quotes that candidate's own evidence back, and asks
+# for one of five changes in a closed vocabulary. It is validated here, on
+# the host, before any database is opened, and validated again in the worker
+# before anything is applied, by this same code.
+#
+# The vocabulary being closed is the whole defence. Every field a proposal
+# may carry is listed, every value a kind may carry is listed, and every
+# string that becomes a symbol in the database has to be an ASCII identifier.
+# A script, a provider command, a shell fragment or a Python expression
+# cannot be spelled in it at all — not because it would be refused on its way
+# to an interpreter, but because there is no interpreter anywhere on this
+# path and no field that could carry one.
+
+#: The five changes a proposal may ask for. The design names these and no
+#: others, and a sixth is refused by name rather than ignored.
+PROPOSAL_KINDS: Final[tuple[str, ...]] = (
+    "name",
+    "function_boundary",
+    "string_decode",
+    "structure_field",
+    "pointer_table",
+)
+
+#: Where a proposal can be in its life. ``approved`` is the operator's
+#: decision recorded *before* the write it authorizes, so a decision that was
+#: never confirmed applied is visible afterwards rather than lost; ``applied``
+#: is the only state that claims the managed artifact really changed.
+PROPOSAL_STATES: Final[tuple[str, ...]] = (
+    "pending",
+    "approved",
+    "rejected",
+    "applied",
+    "stale",
+)
+
+#: Proposals one request may carry.
+MAX_PROPOSALS: Final = 50
+#: Candidate evidence facts one proposal may quote back.
+MAX_PROPOSAL_EVIDENCE_FACTS: Final = 32
+#: Fields one proposed layout may describe.
+MAX_PROPOSAL_FIELDS: Final = 64
+#: Longest identifier a proposal may ask to write into the database.
+MAX_PROPOSAL_NAME_LENGTH: Final = 64
+#: Entries one proposed pointer table may cover.
+MAX_PROPOSED_TABLE_ENTRIES: Final = 4096
+
+#: Encodings a reviewed string may be *defined* with. UTF-16BE is absent on
+#: purpose: this IDA registers no big-endian UTF-16 string type, so there is
+#: no writer for one, and a proposal to define one is refused here rather
+#: than accepted, reviewed, and discovered to be unapplicable at the moment
+#: an operator has already approved it.
+PROPOSAL_ENCODINGS: Final[tuple[str, ...]] = ("ascii", "utf-16le")
+
+#: Widths a proposed field may have, matching what the structures pass can
+#: spell as a type.
+_PROPOSAL_WIDTHS: Final = (1, 2, 4, 8)
+
+#: Exactly the fields one proposal carries. Anything else is refused by name.
+_PROPOSAL_FIELDS: Final = frozenset(
+    {
+        "candidate_id",
+        "kind",
+        "address_space",
+        "address",
+        "value",
+        "evidence",
+        "rationale",
+    }
+)
+
+
+def validate_proposal_request(value: object) -> list[object]:
+    """Accept the shape of one ``vulfi_propose_recovery`` request.
+
+    Only the shape. Each proposal inside it is validated on its own by
+    :func:`validate_proposal`, so one unacceptable proposal is reported as
+    one unacceptable proposal and the rest of the request still stands.
+    """
+    if not isinstance(value, list):
+        raise OperationError(
+            f"proposals must be a list, got {type(value).__name__}"
+        )
+    if not value:
+        raise OperationError(
+            "proposals: send at least one proposal; an empty list proposes"
+            " nothing, which is not the same as proposing nothing be done"
+        )
+    if len(value) > MAX_PROPOSALS:
+        raise OperationError(
+            f"proposals carries {len(value)} entries; one request may carry"
+            f" {MAX_PROPOSALS}"
+        )
+    return list(value)
+
+
+def validate_proposal(value: object) -> dict[str, Any]:
+    """Accept one proposal, or say exactly what is wrong with it.
+
+    The returned body is normalized and carries the half-open address range
+    the change covers, derived from the kind and the proposed value rather
+    than supplied beside them: a reviewer is never shown a range the proposal
+    itself did not imply, and there is no second spelling of it to disagree.
+    """
+    if not isinstance(value, dict):
+        raise OperationError(
+            f"a proposal must be an object, got {type(value).__name__}"
+        )
+    unknown = sorted(str(key) for key in set(value) - _PROPOSAL_FIELDS)
+    if unknown:
+        raise OperationError(
+            f"a proposal carries {', '.join(unknown)}, which is not one of the"
+            f" fields a proposal has ({', '.join(sorted(_PROPOSAL_FIELDS))});"
+            " a proposal is data this server stores and shows an operator,"
+            " never anything it runs"
+        )
+    kind = value.get("kind")
+    if kind not in PROPOSAL_KINDS:
+        raise OperationError(
+            f"kind={kind!r} is not a change a proposal may ask for; the"
+            f" permitted kinds are {', '.join(PROPOSAL_KINDS)}"
+        )
+    address = _proposal_whole(value.get("address"), "address")
+    proposed, end = _PROPOSAL_VALUES[str(kind)](value.get("value"), address)
+    return {
+        "candidate_id": _proposal_text(
+            value.get("candidate_id"), "candidate_id", MAX_ANALYSIS_ID_LENGTH
+        ),
+        "kind": str(kind),
+        "address_space": _proposal_text(
+            value.get("address_space"), "address_space", MAX_SCAN_NAME_LENGTH
+        ),
+        "address": address,
+        "start": address,
+        "end": end,
+        "value": proposed,
+        "evidence": _proposal_claim(value.get("evidence")),
+        "rationale": _proposal_rationale(value.get("rationale")),
+    }
+
+
+def proposal_payload(proposal: dict[str, Any]) -> dict[str, Any]:
+    """One validated proposal, back in the shape it was submitted in.
+
+    :func:`validate_proposal` adds the address range the kind and the value
+    imply, and refuses a proposal that carries a field it does not have. A
+    validated body therefore cannot be sent anywhere that validates it again
+    — the worker, which trusts nothing the host shaped — without first being
+    reduced to what was really proposed. The derived range is not sent
+    because the far side derives it, which is the only way there is one
+    answer to what range a proposal covers.
+    """
+    return {field: proposal[field] for field in sorted(_PROPOSAL_FIELDS)}
+
+
+def _proposal_rationale(value: object) -> str:
+    """The agent's own words, bounded exactly as an assessment's are."""
+    try:
+        return validate_rationale(value)
+    except OperationError as refused:
+        raise OperationError(f"a proposal's {refused}") from refused
+
+
+def _proposal_text(value: object, what: str, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise OperationError(f"{what} must be a non-empty string, got {value!r}")
+    if len(value) > limit:
+        raise OperationError(
+            f"{what} is {len(value)} characters; the limit is {limit}"
+        )
+    return value
+
+
+def _proposal_whole(value: object, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise OperationError(f"{what} must be an integer >= 0, got {value!r}")
+    return value
+
+
+def _proposal_identifier(value: object, what: str) -> str:
+    """One ASCII identifier, which is all a name written into a database is.
+
+    This is where a proposed *value* stops being able to express anything
+    executable: ``__import__('os').system('id')`` and ``$(id)`` are both
+    refused here, as names, long before anything could ask what they mean.
+    """
+    if not isinstance(value, str) or not value:
+        raise OperationError(f"{what} must be a non-empty string, got {value!r}")
+    if len(value) > MAX_PROPOSAL_NAME_LENGTH:
+        raise OperationError(
+            f"{what} is {len(value)} characters; the limit is"
+            f" {MAX_PROPOSAL_NAME_LENGTH}"
+        )
+    if not (value.isascii() and value.isidentifier()):
+        raise OperationError(
+            f"{what}={value!r} is not an ASCII identifier, and an identifier is"
+            " all a name written into an analysis may be"
+        )
+    return value
+
+
+def _proposal_claim(value: object) -> dict[str, Any]:
+    """The candidate evidence this proposal rests on, quoted back verbatim.
+
+    A proposal that cites nothing is refused here. Whether what it cites is
+    *true* is decided against the stored candidate by
+    :func:`vulfi_mcp.prepare.check_proposal_against_candidate`, which is the
+    only place that has the candidate to compare with.
+    """
+    if not isinstance(value, dict):
+        raise OperationError(
+            "a proposal's evidence must be an object quoting the facts its"
+            f" candidate records, got {type(value).__name__}"
+        )
+    if not value:
+        raise OperationError(
+            "a proposal's evidence is empty: quote at least one fact the named"
+            " candidate records, so a reviewer can check the proposal against"
+            " the evidence it claims to rest on"
+        )
+    if len(value) > MAX_PROPOSAL_EVIDENCE_FACTS:
+        raise OperationError(
+            f"a proposal's evidence quotes {len(value)} facts; the limit is"
+            f" {MAX_PROPOSAL_EVIDENCE_FACTS}"
+        )
+    for key in value:
+        if not isinstance(key, str) or not key:
+            raise OperationError(
+                f"a proposal's evidence is keyed by {key!r}, and every key must"
+                " be the name of a fact the candidate records"
+            )
+    return dict(value)
+
+
+def _proposal_value(
+    value: object, kind: str, expected: tuple[str, ...]
+) -> dict[str, Any]:
+    """One proposed value, with exactly the keys its kind has and no others."""
+    if not isinstance(value, dict):
+        raise OperationError(
+            f"a {kind} proposal's value must be an object, got"
+            f" {type(value).__name__}"
+        )
+    held = {str(key) for key in value}
+    unknown = sorted(held - set(expected))
+    missing = sorted(set(expected) - held)
+    if unknown or missing:
+        raise OperationError(
+            f"a {kind} proposal's value must carry exactly"
+            f" {', '.join(expected)}"
+            + (f"; it also carries {', '.join(unknown)}" if unknown else "")
+            + (f"; it is missing {', '.join(missing)}" if missing else "")
+        )
+    return dict(value)
+
+
+def _proposal_name_value(value: object, address: int) -> tuple[dict[str, Any], int]:
+    fields = _proposal_value(value, "name", ("name",))
+    return {"name": _proposal_identifier(fields["name"], "value.name")}, address + 1
+
+
+def _proposal_boundary_value(
+    value: object, address: int
+) -> tuple[dict[str, Any], int]:
+    fields = _proposal_value(value, "function_boundary", ("end",))
+    end = _proposal_whole(fields["end"], "value.end")
+    if end <= address:
+        raise OperationError(
+            f"value.end={end:#x} is not past the entry {address:#x}, so this"
+            " proposal describes no function at all"
+        )
+    if end - address > MAX_FUNCTION_BYTES:
+        raise OperationError(
+            f"value.end={end:#x} is {end - address} bytes past the entry;"
+            f" one function may span {MAX_FUNCTION_BYTES}"
+        )
+    return {"end": end}, end
+
+
+def _proposal_string_value(value: object, address: int) -> tuple[dict[str, Any], int]:
+    fields = _proposal_value(value, "string_decode", ("encoding", "length"))
+    encoding = fields["encoding"]
+    if encoding not in PROPOSAL_ENCODINGS:
+        raise OperationError(
+            f"value.encoding={encoding!r} is not an encoding this build can"
+            f" define a string in; the ones it can are"
+            f" {', '.join(PROPOSAL_ENCODINGS)}. A UTF-16BE run is reported"
+            " with its exact bytes and never defined, because this IDA"
+            " registers no big-endian UTF-16 string type and there is no"
+            " writer to approve"
+        )
+    length = _proposal_whole(fields["length"], "value.length")
+    if not 1 <= length <= MAX_STRING_BYTES:
+        raise OperationError(
+            f"value.length must be in 1..{MAX_STRING_BYTES}, got {length}"
+        )
+    return {"encoding": str(encoding), "length": length}, address + length
+
+
+def _proposal_layout_value(value: object, address: int) -> tuple[dict[str, Any], int]:
+    fields = _proposal_value(value, "structure_field", ("type_name", "fields"))
+    type_name = _proposal_identifier(fields["type_name"], "value.type_name")
+    rows = fields["fields"]
+    if not isinstance(rows, list) or not rows:
+        raise OperationError(
+            "value.fields must be a non-empty list of the fields this layout"
+            f" has, got {rows!r}"
+        )
+    if len(rows) > MAX_PROPOSAL_FIELDS:
+        raise OperationError(
+            f"value.fields describes {len(rows)} fields; the limit is"
+            f" {MAX_PROPOSAL_FIELDS}"
+        )
+    described: list[dict[str, Any]] = []
+    names: set[str] = set()
+    reach = 0
+    for index, row in enumerate(rows):
+        entry = _proposal_value(row, f"structure_field fields[{index}]",
+                                ("offset", "width", "name"))
+        offset = _proposal_whole(entry["offset"], f"value.fields[{index}].offset")
+        width = entry["width"]
+        if width not in _PROPOSAL_WIDTHS:
+            raise OperationError(
+                f"value.fields[{index}].width must be one of"
+                f" {', '.join(str(one) for one in _PROPOSAL_WIDTHS)},"
+                f" got {width!r}"
+            )
+        if offset != reach:
+            # A layout with a hole in it is a layout nobody established, and
+            # one with an overlap is a union. Both are refused rather than
+            # written into the database as if they were proven.
+            raise OperationError(
+                f"value.fields[{index}] starts at offset {offset} where the"
+                f" fields before it reach {reach}: a proposed layout must"
+                " cover its bytes from offset 0 with no gap and no overlap"
+            )
+        if offset % width:
+            raise OperationError(
+                f"value.fields[{index}] puts a {width}-byte field at offset"
+                f" {offset}, which is not a multiple of its own width"
+            )
+        name = _proposal_identifier(entry["name"], f"value.fields[{index}].name")
+        if name in names:
+            raise OperationError(
+                f"value.fields[{index}] repeats the field name {name!r}"
+            )
+        names.add(name)
+        described.append({"offset": offset, "width": int(width), "name": name})
+        reach = offset + int(width)
+    return {"type_name": type_name, "fields": described}, address + reach
+
+
+def _proposal_table_value(value: object, address: int) -> tuple[dict[str, Any], int]:
+    fields = _proposal_value(value, "pointer_table", ("entry_count", "pointer_width"))
+    count = _proposal_whole(fields["entry_count"], "value.entry_count")
+    width = fields["pointer_width"]
+    if width not in (4, 8):
+        raise OperationError(
+            f"value.pointer_width must be 4 or 8, got {width!r}"
+        )
+    if not MIN_POINTER_TABLE_ENTRIES <= count <= MAX_PROPOSED_TABLE_ENTRIES:
+        raise OperationError(
+            f"value.entry_count must be in {MIN_POINTER_TABLE_ENTRIES}.."
+            f"{MAX_PROPOSED_TABLE_ENTRIES}, got {count}: one relocated pointer"
+            " is a pointer, not a table"
+        )
+    return (
+        {"entry_count": count, "pointer_width": int(width)},
+        address + count * int(width),
+    )
+
+
+#: One validator per kind, each returning the normalized value and the end of
+#: the address range that value implies.
+_PROPOSAL_VALUES: Final[
+    dict[str, Callable[[object, int], tuple[dict[str, Any], int]]]
+] = {
+    "name": _proposal_name_value,
+    "function_boundary": _proposal_boundary_value,
+    "string_decode": _proposal_string_value,
+    "structure_field": _proposal_layout_value,
+    "pointer_table": _proposal_table_value,
+}
+
+
 def validate_preparation_coverage(value: object) -> dict[str, str]:
     """Accept the bounded per-pass coverage the managed record may carry.
 
@@ -5484,89 +5884,17 @@ class _Preparation:
 
     def _existing_type(self, address: int) -> dict[str, Any] | None:
         """The type the database already holds at ``address``, read back out."""
-        held = self._types.tinfo_t()
-        if not self._nalt.get_tinfo(held, address):
-            return None
-        fields: list[dict[str, Any]] = []
-        details = self._types.udt_type_data_t()
-        if held.is_udt() and held.get_udt_details(details):
-            shape = "struct"
-            fields = [
-                {
-                    "name": member.name,
-                    "offset": member.offset // 8,
-                    "size": member.size // 8,
-                }
-                for member in details
-            ]
-        elif held.is_array():
-            shape = "array"
-            width = held.get_array_element().get_size()
-            fields = [
-                {"name": f"element_{index}", "offset": index * width, "size": width}
-                for index in range(held.get_array_nelems())
-            ]
-        else:
-            shape = "scalar"
-        size = held.get_size()
-        return {
-            "name": str(held),
-            # ``tinfo_t.get_size`` answers ``BADSIZE`` for a type with no
-            # size of its own — an imported function's prototype, say — and
-            # publishing that as a number no reader could use would be worse
-            # than saying it is not known.
-            "size": None if size == _UNKNOWN_TYPE_SIZE else size,
-            "shape": shape,
-            "fields": fields,
-        }
+        return _type_at(address)
 
     def _field_conflicts(
         self, base: int, fields: list[tuple[int, int]]
     ) -> list[str]:
         """Definitions already in the database that these fields would replace."""
-        found: list[str] = []
-        for offset, width in fields:
-            address = base + offset
-            held = self._existing_type(address)
-            if held is not None:
-                found.append(f"the type {held['name']} at {address:#x}")
-                continue
-            flags = self._bytes.get_flags(address)
-            if self._bytes.is_head(flags) and not self._bytes.is_unknown(flags):
-                size = self._bytes.get_item_size(address)
-                if size != width:
-                    found.append(
-                        f"an item of {size} bytes at {address:#x}, where the"
-                        f" accesses prove a field of {width}"
-                    )
-                    continue
-            inside = next(
-                (
-                    step
-                    for step in range(address + 1, address + width)
-                    if self._bytes.is_head(self._bytes.get_flags(step))
-                ),
-                None,
-            )
-            if inside is not None:
-                found.append(
-                    f"an item starting at {inside:#x}, inside the {width}-byte"
-                    f" field at {address:#x}"
-                )
-        return found
+        return _held_definitions(base, fields, because="the accesses prove")
 
     def _member_type(self, width: int) -> Any:
         """An unsigned integer of ``width`` bytes: a size, not a meaning."""
-        member = self._types.tinfo_t()
-        member.create_simple_type(
-            {
-                1: self._types.BTF_UINT8,
-                2: self._types.BTF_UINT16,
-                4: self._types.BTF_UINT32,
-                8: self._types.BTF_UINT64,
-            }[width]
-        )
-        return member
+        return _integer_member(width)
 
     def _define_structure(
         self, base: int, fields: list[tuple[int, int]], shape: str, name: str
@@ -6066,14 +6394,741 @@ def _run_preparation(payload: dict[str, object]) -> dict[str, object]:
     return _Preparation(payload).run()
 
 
+# ---------------------------------------------------------------------------
+# Applying a proposal an operator approved
+# ---------------------------------------------------------------------------
+#
+# This is the only code in this module that writes something nobody proved.
+# The four passes above apply what their evidence establishes and describe
+# everything else; what is applied here is a human's judgement about a
+# candidate, which is a different warrant and is treated as one.
+#
+# Three rules follow from that.
+#
+# **The database decides, not the decision.** An approval carries the
+# revision the operator reviewed against. If the artifact has moved on, or
+# the bytes under the proposal are no longer the bytes its candidate
+# recorded, or something has been defined over the range in the meantime,
+# nothing is applied and the proposal is reported stale. The operator's
+# approval is not a promise about a database they can no longer see.
+#
+# **Nothing is replaced.** A conflict is a refusal, never an overwrite: a
+# name already there, a function already covering the range, an item or a
+# type already defined over the bytes. That is also what makes the recovery
+# below exact — the range held nothing of ours, so putting it back is a
+# deletion and not a reconstruction.
+#
+# **A checkpoint is taken before the write and travels back with it.** The
+# adapter keeps the bytes each save replaces, which covers the file; this
+# covers the definition, so a host that cannot record the approval it just
+# made durable can take it off again instead of leaving two stores
+# disagreeing about what happened.
+
+#: Defined items one site reports. The count is not bounded by this — a
+#: conflict is reported whether or not every item of it is quoted.
+MAX_QUOTED_SITE_ITEMS: Final = 64
+
+#: Ranges one evidence read may ask about.
+MAX_EVIDENCE_RANGES: Final = MAX_PROPOSALS
+
+
+def _type_at(address: int) -> dict[str, Any] | None:
+    """The type the database already holds at ``address``, read back out."""
+    import ida_nalt
+    import ida_typeinf
+
+    held = ida_typeinf.tinfo_t()
+    if not ida_nalt.get_tinfo(held, address):
+        return None
+    fields: list[dict[str, Any]] = []
+    details = ida_typeinf.udt_type_data_t()
+    if held.is_udt() and held.get_udt_details(details):
+        shape = "struct"
+        fields = [
+            {
+                "name": member.name,
+                "offset": member.offset // 8,
+                "size": member.size // 8,
+            }
+            for member in details
+        ]
+    elif held.is_array():
+        shape = "array"
+        width = held.get_array_element().get_size()
+        fields = [
+            {"name": f"element_{index}", "offset": index * width, "size": width}
+            for index in range(held.get_array_nelems())
+        ]
+    else:
+        shape = "scalar"
+    size = held.get_size()
+    return {
+        "name": str(held),
+        # ``tinfo_t.get_size`` answers ``BADSIZE`` for a type with no size of
+        # its own — an imported function's prototype, say — and publishing
+        # that as a number no reader could use would be worse than saying it
+        # is not known.
+        "size": None if size == _UNKNOWN_TYPE_SIZE else size,
+        "shape": shape,
+        "fields": fields,
+    }
+
+
+def _held_definitions(
+    base: int, fields: list[tuple[int, int]], *, because: str
+) -> list[str]:
+    """Definitions already in the database that these fields would replace.
+
+    ``because`` names what claims the field width, because the two callers
+    have different warrants for it: the structures pass has accesses that
+    prove one, and a reviewed proposal has a layout an operator approved.
+    """
+    import ida_bytes
+
+    found: list[str] = []
+    for offset, width in fields:
+        address = base + offset
+        held = _type_at(address)
+        if held is not None:
+            found.append(f"the type {held['name']} at {address:#x}")
+            continue
+        flags = ida_bytes.get_flags(address)
+        if ida_bytes.is_head(flags) and not ida_bytes.is_unknown(flags):
+            size = ida_bytes.get_item_size(address)
+            if size != width:
+                found.append(
+                    f"an item of {size} bytes at {address:#x}, where"
+                    f" {because} a field of {width}"
+                )
+                continue
+        inside = next(
+            (
+                step
+                for step in range(address + 1, address + width)
+                if ida_bytes.is_head(ida_bytes.get_flags(step))
+            ),
+            None,
+        )
+        if inside is not None:
+            found.append(
+                f"an item starting at {inside:#x}, inside the {width}-byte"
+                f" field at {address:#x}"
+            )
+    return found
+
+
+def _proposal_site(start: int, end: int) -> dict[str, Any]:
+    """Everything an operator and a revalidation need about one range.
+
+    The same facts answer both questions, deliberately: what the reviewer is
+    shown before they confirm is exactly what the apply rechecks afterwards,
+    so there is no second description of the database to drift apart from the
+    first.
+    """
+    import ida_bytes
+    import ida_funcs
+    import ida_name
+    import ida_segment
+
+    segment = ida_segment.getseg(start)
+    last = ida_segment.getseg(end - 1) if end > start else segment
+    inside = (
+        segment is not None
+        and last is not None
+        and segment.start_ea == last.start_ea
+    )
+    raw = ida_bytes.get_bytes(start, end - start) if inside else None
+    raw = raw or b""
+    # Every function overlapping the range, not only one containing its
+    # start: a function that *begins* inside the range is just as much a
+    # reason not to define another over it.
+    owner = ida_funcs.get_func(start)
+    walker = owner if owner is not None else ida_funcs.get_next_func(start)
+    functions: list[dict[str, Any]] = []
+    while inside and walker is not None and walker.start_ea < end:
+        functions.append(
+            {
+                "start": walker.start_ea,
+                "end": walker.end_ea,
+                "name": ida_funcs.get_func_name(walker.start_ea),
+            }
+        )
+        walker = ida_funcs.get_next_func(walker.start_ea)
+    items: list[dict[str, Any]] = []
+    cursor = start
+    while inside and cursor < end and len(items) < MAX_QUOTED_SITE_ITEMS:
+        item_flags = ida_bytes.get_flags(cursor)
+        size = max(1, ida_bytes.get_item_size(cursor))
+        if ida_bytes.is_head(item_flags) and not ida_bytes.is_unknown(item_flags):
+            items.append(
+                {
+                    "address": cursor,
+                    "size": size,
+                    "is_string": bool(ida_bytes.is_strlit(item_flags)),
+                }
+            )
+        cursor += size
+    flags = ida_bytes.get_flags(start)
+    holder = owner if owner is not None and owner.start_ea < end else None
+    return {
+        "start": start,
+        "end": end,
+        "size": end - start,
+        "mapped": inside,
+        "segment": None if not inside else (
+            ida_segment.get_segm_name(segment) or f"seg_{segment.start_ea:x}"
+        ),
+        "segment_start": None if segment is None else segment.start_ea,
+        "segment_end": None if segment is None else segment.end_ea,
+        "name": ida_name.get_name(start) if ida_bytes.has_name(flags) else None,
+        "function": None if not inside or holder is None else {
+            "start": holder.start_ea,
+            "end": holder.end_ea,
+            "name": ida_funcs.get_func_name(holder.start_ea),
+        },
+        "functions": functions,
+        "existing_type": _type_at(start) if inside else None,
+        "items": items,
+        **_quoted(raw),
+    }
+
+
+def _proposal_fields(proposal: dict[str, Any]) -> list[tuple[int, int]]:
+    """The ``(offset, width)`` slots one proposal would define, if any."""
+    kind = proposal["kind"]
+    value = proposal["value"]
+    if kind == "structure_field":
+        return [(field["offset"], field["width"]) for field in value["fields"]]
+    if kind == "pointer_table":
+        width = value["pointer_width"]
+        return [(index * width, width) for index in range(value["entry_count"])]
+    return []
+
+
+def _proposal_conflicts(proposal: dict[str, Any], site: dict[str, Any]) -> list[str]:
+    """Everything already in the database that this proposal would replace.
+
+    Noun phrases, so a caller can join them into its own sentence — the
+    structures pass and this one have different sentences to put them in.
+    :func:`_proposal_refusal` is what turns them into a decision.
+    """
+    start = proposal["start"]
+    end = proposal["end"]
+    kind = proposal["kind"]
+    found: list[str] = []
+    if kind == "name":
+        if site["name"] is not None:
+            found.append(f"the name {site['name']} at {start:#x}")
+    elif kind == "function_boundary":
+        for function in site["functions"]:
+            found.append(
+                f"the function {function['name']} over"
+                f" [{function['start']:#x}, {function['end']:#x})"
+            )
+    elif kind == "string_decode":
+        if site["existing_type"] is not None:
+            found.append(
+                f"the type {site['existing_type']['name']} at {start:#x}"
+            )
+        for item in site["items"]:
+            found.append(
+                f"an item of {item['size']} bytes at {item['address']:#x},"
+                f" inside [{start:#x}, {end:#x})"
+            )
+    else:
+        found.extend(
+            _held_definitions(
+                start, _proposal_fields(proposal), because="this layout puts"
+            )
+        )
+    return found
+
+
+def _proposal_refusal(proposal: dict[str, Any], site: dict[str, Any]) -> str | None:
+    """Why this proposal may not be applied to this range, or ``None``.
+
+    Two different things, one answer. An address outside any one mapped
+    segment is not a conflict with something already there — there is nothing
+    there at all — and a range that is mapped is refused only for what it
+    already holds.
+    """
+    if not site["mapped"]:
+        return (
+            f"[{proposal['start']:#x}, {proposal['end']:#x}) is not inside one"
+            " mapped segment of this image, so there is nothing there to"
+            " define"
+        )
+    conflicts = _proposal_conflicts(proposal, site)
+    if not conflicts:
+        return None
+    return (
+        "the managed database already holds "
+        + "; ".join(conflicts)
+        + ", and a review replaces nothing that is already there"
+    )
+
+
+def _proposal_drift(
+    proposal: dict[str, Any], candidate: dict[str, Any], site: dict[str, Any]
+) -> str | None:
+    """How the database has moved away from the candidate's own evidence.
+
+    Only facts the candidate recorded and this site can recompute are
+    compared, which is exactly the point: a proposal is approved against the
+    evidence it cites, and the evidence it cites has to still be true of the
+    database the change is about to be written to.
+    """
+    evidence = candidate.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    segment = evidence.get("segment")
+    if isinstance(segment, str) and segment and segment != site["segment"]:
+        return (
+            f"the candidate was recovered from segment {segment} and"
+            f" {proposal['start']:#x} is now in {site['segment']!r}"
+        )
+    digest = evidence.get("bytes_sha256")
+    covers = (
+        evidence.get("start") == proposal["start"]
+        and evidence.get("end") == proposal["end"]
+    )
+    if isinstance(digest, str) and covers and digest != site["bytes_sha256"]:
+        return (
+            f"the bytes in [{proposal['start']:#x}, {proposal['end']:#x}) now"
+            f" hash to {site['bytes_sha256']}, not to the {digest} this"
+            " candidate recorded"
+        )
+    return None
+
+
+def _proposal_effect(proposal: dict[str, Any]) -> str:
+    """What approving this proposal would do, in one line for a reviewer."""
+    start = proposal["start"]
+    end = proposal["end"]
+    value = proposal["value"]
+    if proposal["kind"] == "name":
+        return f"name {start:#x} {value['name']}"
+    if proposal["kind"] == "function_boundary":
+        return f"create a function over [{start:#x}, {end:#x})"
+    if proposal["kind"] == "string_decode":
+        return (
+            f"define a {value['encoding']} string of {value['length']} bytes"
+            f" at {start:#x}"
+        )
+    if proposal["kind"] == "structure_field":
+        fields = ", ".join(
+            f"{field['name']}@{field['offset']}:{field['width']}"
+            for field in value["fields"]
+        )
+        return f"type {start:#x} as {value['type_name']} {{{fields}}}"
+    return (
+        f"type {start:#x} as an array of {value['entry_count']} pointers"
+        f" {value['pointer_width']} bytes wide"
+    )
+
+
+def _proposal_evidence(payload: dict[str, object]) -> dict[str, object]:
+    """Report what each proposed range holds now, without changing anything.
+
+    ``mutated`` is ``False``: showing an operator what is there, and checking
+    a submission against it, must never be the reason a managed database was
+    rewritten.
+    """
+    raw = payload.get("proposals")
+    if not isinstance(raw, list):
+        raise OperationError(
+            f"proposal_evidence: 'proposals' must be a list, got {raw!r}"
+        )
+    if len(raw) > MAX_EVIDENCE_RANGES:
+        raise OperationError(
+            f"proposal_evidence: {len(raw)} proposals is more than the"
+            f" {MAX_EVIDENCE_RANGES} one call may ask about"
+        )
+    record, _ = _read_record()
+    reviewed = []
+    for item in raw:
+        proposal = validate_proposal(item)
+        site = _proposal_site(proposal["start"], proposal["end"])
+        reviewed.append(
+            {
+                "candidate_id": proposal["candidate_id"],
+                "kind": proposal["kind"],
+                "start": proposal["start"],
+                "end": proposal["end"],
+                "site": site,
+                "conflicts": _proposal_conflicts(proposal, site),
+                "refusal": _proposal_refusal(proposal, site),
+                "effect": _proposal_effect(proposal),
+            }
+        )
+    return {
+        "mutated": False,
+        **_preparation_report(record),
+        "address_space": ADDRESS_SPACE_IMAGE,
+        "proposals": reviewed,
+    }
+
+
+def _apply_name(proposal: dict[str, Any]) -> str | None:
+    import ida_name
+
+    wanted = proposal["value"]["name"]
+    try:
+        named = bool(
+            ida_name.set_name(proposal["start"], wanted, ida_name.SN_CHECK)
+        )
+    except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+        return (
+            f"IDA refused to name {proposal['start']:#x}:"
+            f" {type(error).__name__}: {error}"
+        )
+    if not named:
+        return (
+            f"IDA refused to name {proposal['start']:#x} {wanted!r}; a name"
+            " this database already uses elsewhere is the usual reason"
+        )
+    return None
+
+
+def _apply_function_boundary(proposal: dict[str, Any]) -> str | None:
+    import ida_funcs
+
+    entry = proposal["start"]
+    end = proposal["end"]
+    try:
+        created = bool(ida_funcs.add_func(entry, end))
+    except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+        return (
+            f"IDA refused to create a function at {entry:#x}:"
+            f" {type(error).__name__}: {error}"
+        )
+    if not created:
+        return f"IDA refused to create a function at {entry:#x}"
+    function = ida_funcs.get_func(entry)
+    if function is None or function.start_ea != entry:
+        return f"IDA reported a function at {entry:#x} that it does not hold"
+    return None
+
+
+def _apply_string_decode(proposal: dict[str, Any]) -> str | None:
+    import ida_bytes
+    import ida_nalt
+
+    start = proposal["start"]
+    length = proposal["value"]["length"]
+    string_type = {
+        "ascii": ida_nalt.STRTYPE_C,
+        "utf-16le": ida_nalt.STRTYPE_C_16,
+    }[proposal["value"]["encoding"]]
+    try:
+        created = bool(ida_bytes.create_strlit(start, length, string_type))
+    except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+        return (
+            f"IDA refused to define a string at {start:#x}:"
+            f" {type(error).__name__}: {error}"
+        )
+    if not created:
+        return f"IDA refused to define a string at {start:#x}"
+    defined = ida_bytes.get_item_size(start)
+    if defined != length:
+        return (
+            f"IDA defined {defined} bytes at {start:#x}, not the {length} this"
+            " proposal named, so the definition does not match what was"
+            " approved"
+        )
+    return None
+
+
+def _integer_member(width: int) -> Any:
+    """An unsigned integer of ``width`` bytes: a size, not a meaning."""
+    import ida_typeinf
+
+    member = ida_typeinf.tinfo_t()
+    member.create_simple_type(
+        {
+            1: ida_typeinf.BTF_UINT8,
+            2: ida_typeinf.BTF_UINT16,
+            4: ida_typeinf.BTF_UINT32,
+            8: ida_typeinf.BTF_UINT64,
+        }[width]
+    )
+    return member
+
+
+def _apply_structure_field(proposal: dict[str, Any]) -> str | None:
+    import ida_typeinf
+
+    base = proposal["start"]
+    name = proposal["value"]["type_name"]
+    try:
+        table = ida_typeinf.get_idati()
+        if ida_typeinf.tinfo_t().get_named_type(table, name):
+            return (
+                f"this database already holds a type called {name}, which a"
+                " review replaces nothing that is already there"
+            )
+        record = ida_typeinf.udt_type_data_t()
+        record.is_union = False
+        for field in proposal["value"]["fields"]:
+            member = ida_typeinf.udm_t()
+            member.name = field["name"]
+            member.offset = field["offset"] * 8
+            member.size = field["width"] * 8
+            member.type = _integer_member(field["width"])
+            record.push_back(member)
+        layout = ida_typeinf.tinfo_t()
+        if not layout.create_udt(record):
+            return f"IDA refused to build the structure {name} for {base:#x}"
+        code = layout.set_named_type(table, name)
+        if code != 0:
+            return (
+                f"IDA refused to register the type {name} for {base:#x}:"
+                f" tinfo code {code}"
+            )
+        applied = bool(
+            ida_typeinf.apply_tinfo(base, layout, ida_typeinf.TINFO_DEFINITE)
+        )
+    except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+        return (
+            f"IDA refused to type {base:#x}: {type(error).__name__}: {error}"
+        )
+    if not applied:
+        return f"IDA refused to apply the layout {name} at {base:#x}"
+    return None
+
+
+def _apply_pointer_table(proposal: dict[str, Any]) -> str | None:
+    import ida_typeinf
+
+    start = proposal["start"]
+    count = proposal["value"]["entry_count"]
+    try:
+        element = ida_typeinf.tinfo_t()
+        void = ida_typeinf.tinfo_t()
+        void.create_simple_type(ida_typeinf.BTF_VOID)
+        if not element.create_ptr(void):
+            return f"IDA refused to build a pointer type for {start:#x}"
+        table = ida_typeinf.tinfo_t()
+        if not table.create_array(element, count):
+            return (
+                f"IDA refused to build an array of {count} pointers for"
+                f" {start:#x}"
+            )
+        applied = bool(
+            ida_typeinf.apply_tinfo(start, table, ida_typeinf.TINFO_DEFINITE)
+        )
+    except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+        return (
+            f"IDA refused to type the table at {start:#x}:"
+            f" {type(error).__name__}: {error}"
+        )
+    if not applied:
+        return f"IDA refused to apply a pointer table at {start:#x}"
+    return None
+
+
+#: What each change could overwrite, and therefore what a checkpoint has to
+#: be empty of for the recovery below to be exact. Naming a byte replaces a
+#: name and nothing else; creating a function replaces a function; the three
+#: that type bytes replace a type and the items under it. The facts a change
+#: cannot touch are left out on purpose — an instruction already decoded
+#: where a name is being set is not something ``set_name`` disturbs, and
+#: refusing to recover because of one would strand every change made over
+#: code IDA had already decoded.
+_REPLACEABLE_BY: Final[dict[str, tuple[str, ...]]] = {
+    "name": ("name",),
+    "function_boundary": ("function",),
+    "string_decode": ("existing_type", "items"),
+    "structure_field": ("existing_type", "items"),
+    "pointer_table": ("existing_type", "items"),
+}
+
+#: One writer per kind. There is no sixth entry and no default: a kind with
+#: no safe writer is refused in validation, never applied approximately.
+_PROPOSAL_WRITERS: Final[dict[str, Callable[[dict[str, Any]], str | None]]] = {
+    "name": _apply_name,
+    "function_boundary": _apply_function_boundary,
+    "string_decode": _apply_string_decode,
+    "structure_field": _apply_structure_field,
+    "pointer_table": _apply_pointer_table,
+}
+
+
+def _apply_reviewed_proposal(payload: dict[str, object]) -> dict[str, object]:
+    """Apply one approved proposal, or say exactly why nothing was applied.
+
+    A refusal is a result, not an exception: the host has an approval
+    recorded against this proposal and has to be able to write down what
+    became of it. The one thing this never returns is a revision it did not
+    move — ``applied`` and the new ``revision`` are set together, in the same
+    record write the adapter then saves, or neither is.
+    """
+    proposal = validate_proposal(payload.get("proposal"))
+    expected = _proposal_whole(payload.get("expected_revision"), "expected_revision")
+    candidate = payload.get("candidate")
+    if not isinstance(candidate, dict):
+        raise OperationError(
+            "apply_reviewed_proposal: 'candidate' must be the stored candidate"
+            f" this proposal names, got {candidate!r}"
+        )
+    record, _ = _read_record()
+    preparation = record["preparation"]
+    revision = int(preparation.get("revision") or 0)
+    site = _proposal_site(proposal["start"], proposal["end"])
+    report: dict[str, object] = {
+        "mutated": False,
+        "applied": False,
+        "stale": False,
+        "revision": revision,
+        "previous_revision": revision,
+        "expected_revision": expected,
+        "effect": _proposal_effect(proposal),
+        "site": site,
+        "checkpoint": None,
+        "reason": None,
+        **_preparation_report(record),
+    }
+    if revision != expected:
+        report["stale"] = True
+        report["reason"] = (
+            f"this approval was made against revision {expected} and the"
+            f" managed artifact now carries revision {revision}, so the"
+            " evidence it rests on is not the evidence it would be applied"
+            " to; nothing was applied"
+        )
+        return report
+    drift = _proposal_drift(proposal, candidate, site)
+    if drift is not None:
+        report["stale"] = True
+        report["reason"] = f"{drift}; nothing was applied"
+        return report
+    refusal = _proposal_refusal(proposal, site)
+    if refusal is not None:
+        report["reason"] = refusal
+        return report
+    checkpoint = {
+        "kind": proposal["kind"],
+        "start": proposal["start"],
+        "end": proposal["end"],
+        "name": site["name"],
+        "function": site["function"],
+        "existing_type": site["existing_type"],
+        "items": site["items"],
+        "type_name": proposal["value"].get("type_name"),
+    }
+    failure = _PROPOSAL_WRITERS[proposal["kind"]](proposal)
+    if failure is not None:
+        report["reason"] = failure
+        return report
+    revision += 1
+    preparation["revision"] = revision
+    _write_record(record)
+    report.update(
+        mutated=True,
+        applied=True,
+        revision=revision,
+        checkpoint=checkpoint,
+        site=_proposal_site(proposal["start"], proposal["end"]),
+        **_preparation_report(record),
+    )
+    return report
+
+
+def _recover_reviewed_proposal(payload: dict[str, object]) -> dict[str, object]:
+    """Put back what one applied proposal replaced, from its checkpoint.
+
+    This is exact rather than approximate because the apply refused every
+    conflict: the range held no name, no function, no item and no type of
+    ours before the change, so taking the change off is a deletion. A
+    checkpoint that says otherwise is reported as unrecoverable instead of
+    being half-undone.
+    """
+    checkpoint = payload.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise OperationError(
+            "recover_reviewed_proposal: 'checkpoint' must be the object the"
+            f" apply returned, got {checkpoint!r}"
+        )
+    import ida_bytes
+    import ida_funcs
+    import ida_name
+
+    kind = checkpoint.get("kind")
+    start = _proposal_whole(checkpoint.get("start"), "checkpoint.start")
+    end = _proposal_whole(checkpoint.get("end"), "checkpoint.end")
+    if kind not in PROPOSAL_KINDS:
+        raise OperationError(
+            f"recover_reviewed_proposal: checkpoint.kind={kind!r} is not one"
+            f" of {', '.join(PROPOSAL_KINDS)}"
+        )
+    held = [
+        fact for fact in _REPLACEABLE_BY[str(kind)] if checkpoint.get(fact)
+    ]
+    if held:
+        # A definition of the kind this change could have replaced was
+        # already there. The apply refuses those, so this should not happen —
+        # and if it has, taking the change off would delete something that
+        # was not ours to delete. The divergence is reported rather than
+        # guessed at.
+        return {
+            "mutated": False,
+            "recovered": False,
+            "reason": (
+                f"the checkpoint for [{start:#x}, {end:#x}) records"
+                f" {', '.join(held)} that a {kind} change would have replaced,"
+                " which this build cannot rebuild; the managed artifact is"
+                " left exactly as the apply left it"
+            ),
+            "site": _proposal_site(start, end),
+        }
+    failures: list[str] = []
+    try:
+        if kind == "name":
+            if not ida_name.set_name(start, "", ida_name.SN_NOCHECK):
+                failures.append(f"IDA refused to clear the name at {start:#x}")
+        elif kind == "function_boundary":
+            if not ida_funcs.del_func(start):
+                failures.append(f"IDA refused to delete the function at {start:#x}")
+        else:
+            import ida_nalt
+
+            ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, end - start)
+            ida_nalt.del_tinfo(start)
+            name = checkpoint.get("type_name")
+            if isinstance(name, str) and name:
+                import ida_typeinf
+
+                ida_typeinf.del_named_type(
+                    ida_typeinf.get_idati(), name, ida_typeinf.NTF_TYPE
+                )
+    except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+        failures.append(f"{type(error).__name__}: {error}")
+    record, _ = _read_record()
+    preparation = record["preparation"]
+    revision = int(preparation.get("revision") or 0) + 1
+    preparation["revision"] = revision
+    _write_record(record)
+    return {
+        "mutated": True,
+        "recovered": not failures,
+        "revision": revision,
+        "reason": "; ".join(failures) or None,
+        "site": _proposal_site(start, end),
+        **_preparation_report(record),
+    }
+
+
 #: Every operation ``run`` accepts, by name. Each takes the JSON payload and
 #: returns a JSON-native dictionary.
 _OPERATIONS: Final[dict[str, Callable[[dict[str, object]], dict[str, object]]]] = {
+    "apply_reviewed_proposal": _apply_reviewed_proposal,
     "database_summary": _database_summary,
     "findings_page": _findings_page,
     "prepare": _run_preparation,
     "preparation_summary": _preparation_summary,
+    "proposal_evidence": _proposal_evidence,
     "record_preparation": _record_preparation,
+    "recover_reviewed_proposal": _recover_reviewed_proposal,
     "scan": _scan,
     "store_scan": _store_scan,
     "triage": _triage,

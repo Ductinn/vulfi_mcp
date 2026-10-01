@@ -1,9 +1,9 @@
-"""The public MCP entry point: six VulFi tools beside the six stock IDA ones.
+"""The public MCP entry point: seven VulFi tools beside the six stock IDA ones.
 
 Importing this module registers the VulFi tools on the process-wide server the
 official ``ida-mcp`` package already owns, so one stdio connection serves the
-six stock IDA tools and these six together. There is no second MCP server and
-no fork of the official one.
+six stock IDA tools and these seven together. There is no second MCP server
+and no fork of the official one.
 
 What this milestone implements is the IDA backend and nothing else. A caller
 may pass the parameters the full design reserves — ``backend`` and
@@ -18,12 +18,23 @@ justifies in a managed analysis, ``vulfi_preparation`` pages what it found
 without re-running it, and ``vulfi_scan`` prepares before it scans unless a
 recorded revision already matches the request.
 
+``vulfi_propose_recovery`` is the one thing an agent may ask for that
+preparation's own evidence does not justify — and it is stored, not done.
+**No tool in this module approves anything.** Applying a proposal lives in
+:mod:`vulfi_mcp.operator` and is reached only by running ``vulfi-mcp review``
+at a shell, where an operator is shown the bytes and the definitions already
+in the database and has to type the decision out. That separation is
+procedural: anything holding the operator's own OS credentials can run that
+command, so an installation needing enforced human separation has to run this
+server as a different principal from the reviewer.
+
 Three rules shape the order of every tool body. Untrusted input is validated
-first, so a malformed rule, scan name, page window, pass list or assessment
-can never be the reason a managed IDB or its netnode came into existence.
-Only ``vulfi_scan`` and ``vulfi_prepare`` may bring a managed database into
-existence at all; every read reports an unavailable store instead. And stdout
-is the MCP transport: this module writes nothing to it.
+first, so a malformed rule, scan name, page window, pass list, proposal or
+assessment can never be the reason a managed IDB or its netnode came into
+existence. Only ``vulfi_scan`` and ``vulfi_prepare`` may bring a managed
+database into existence at all; every read, and every proposal, reports an
+unavailable store instead. And stdout is the MCP transport: this module
+writes nothing to it.
 """
 
 # Deliberately not `from __future__ import annotations`. The official `@tool`
@@ -32,6 +43,7 @@ is the MCP transport: this module writes nothing to it.
 # globals, where this module's names do not exist. Real annotation objects,
 # evaluated here at definition time, are the ones that survive that wrapping.
 
+import sys
 from typing import Annotated
 
 from ida_mcp.mcp import serve_stdio, tool
@@ -62,9 +74,11 @@ from vulfi_mcp.ida_runtime import (
     validate_status,
 )
 from vulfi_mcp.prepare import (
+    ProposalResult,
     ensure_prepared,
     prepare_target,
     preparation_page,
+    propose_recovery,
     resolve_backend,
 )
 from vulfi_mcp.rules import Rule, load_stock_rules, rule_template, validate_rules
@@ -74,6 +88,7 @@ __all__ = [
     "vulfi_findings",
     "vulfi_prepare",
     "vulfi_preparation",
+    "vulfi_propose_recovery",
     "vulfi_rule_template",
     "vulfi_scan",
     "vulfi_triage",
@@ -260,6 +275,54 @@ def vulfi_preparation(
     return preparation_page(path, analysis_id, offset, limit)
 
 
+@tool(title="Propose a recovery for an operator to review")
+def vulfi_propose_recovery(
+    path: Annotated[
+        str,
+        "Path to the binary or saved .i64/.idb whose preparation the"
+        " proposals are about. The target must already have been prepared;"
+        " this tool never creates a managed database.",
+    ],
+    analysis_id: Annotated[
+        str,
+        "The preparation revision the proposals are about, exactly as"
+        " vulfi_prepare or vulfi_preparation reported it.",
+    ],
+    proposals: Annotated[
+        list[dict[str, JsonValue]],
+        "Up to 50 proposals. Each is an object with 'candidate_id' (a"
+        " candidate this revision holds), 'kind' ('name',"
+        " 'function_boundary', 'string_decode', 'structure_field' or"
+        " 'pointer_table'), 'address_space' and 'address' (the candidate's"
+        " own), 'value' (that kind's fields and no others: {'name': ident} /"
+        " {'end': int} / {'encoding': 'ascii'|'utf-16le', 'length': int} /"
+        " {'type_name': ident, 'fields': [{'offset','width','name'}]} /"
+        " {'entry_count': int, 'pointer_width': 4|8}), 'evidence' (facts"
+        " quoted verbatim from that candidate's own evidence) and"
+        " 'rationale'. Every name is an ASCII identifier; there is no field"
+        " that can carry a script, a command or an expression.",
+    ],
+) -> ProposalResult:
+    """Store evidence-linked recovery proposals for an operator to review.
+    This changes no analysis: it writes rows in the preparation catalog and
+    nothing else. No managed database is opened for writing, no artifact
+    revision moves, and no MCP tool — this one included — can approve a
+    proposal. Applying one is a separate program: an operator runs `vulfi-mcp
+    review approve` at a shell, is shown the original bytes, the definitions
+    already in the database, the proposed change and its expected effect, and
+    types the decision out; the change is then revalidated against the
+    *current* artifact revision before it is applied, checkpointed, saved and
+    recorded. Each proposal is answered on its own: one that names a
+    candidate this revision does not hold, quotes evidence that candidate
+    does not carry, sits at an address that is not the candidate's, asks for
+    something already defined, or is about a backend this build cannot write
+    back to is refused with that reason and is not stored, while the rest of
+    the request still stands. A target nothing has prepared is refused
+    outright rather than prepared to hold a proposal.
+    """
+    return propose_recovery(path, analysis_id, proposals)
+
+
 @tool(title="Read stored VulFi findings")
 def vulfi_findings(
     path: Annotated[
@@ -352,5 +415,25 @@ def vulfi_triage(
 
 
 def main() -> None:
-    """Serve the stock IDA tools and these four over stdio, until EOF."""
-    serve_stdio()
+    """Serve the seven tools over stdio, or run the operator review command.
+
+    With no arguments this is the MCP server and stdout is its transport.
+    With ``review`` it is the operator's own command, which is deliberately
+    *not* reachable through MCP: it is the only path that applies a proposal,
+    and it asks a person first.
+    """
+    if not sys.argv[1:]:
+        serve_stdio()
+        return
+    if sys.argv[1] != "review":
+        raise SystemExit(
+            f"vulfi-mcp: {sys.argv[1]!r} is not a command. Run 'vulfi-mcp'"
+            " with no arguments to serve MCP over stdio, or 'vulfi-mcp review"
+            " --help' to review stored recovery proposals."
+        )
+    # Imported here, not at module scope: serving MCP must not need the
+    # review path, and the review path must not register MCP tools it will
+    # never serve.
+    from vulfi_mcp.operator import main as review
+
+    raise SystemExit(review(sys.argv[2:]))

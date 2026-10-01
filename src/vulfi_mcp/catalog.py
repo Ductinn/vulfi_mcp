@@ -47,7 +47,13 @@ from types import TracebackType
 from typing import Any, Final
 
 from vulfi_mcp.ida_adapter import IDB_SUFFIXES, data_dir
-from vulfi_mcp.ida_runtime import OperationError, utc_now, validate_page
+from vulfi_mcp.ida_runtime import (
+    PROPOSAL_KINDS,
+    PROPOSAL_STATES,
+    OperationError,
+    utc_now,
+    validate_page,
+)
 
 __all__ = [
     "ASSOCIATION_ASSERTED",
@@ -55,6 +61,8 @@ __all__ = [
     "CATALOG_NAME",
     "CATALOG_UNAVAILABLE_REASON",
     "MIN_SEGMENT_PROOF_BYTES",
+    "PROPOSAL_KINDS",
+    "PROPOSAL_STATES",
     "SCHEMA_VERSION",
     "Catalog",
     "CatalogError",
@@ -149,6 +157,24 @@ _SEGMENT_BYTES: Final = "segment_bytes"
 #: a proof and does not pretend to be one: it records that the join rests on
 #: the caller's say-so, and when.
 _ASSERTED_KIND: Final = "asserted_by_caller"
+
+# The five kinds a proposal may ask for and the five states one may be in are
+# imported from `ida_runtime` above, next to the validators that enforce
+# them: one vocabulary, not a copy of it in the store.
+
+#: Where a decision may go from where it is. A review records ``approved``
+#: before the write it authorizes, so a decision that never became durable is
+#: still visible afterwards; ``pending`` is how it comes back when the write
+#: did not land, and ``stale`` is how it ends when the artifact moved out
+#: from under it. ``rejected`` and ``applied`` are final: a second decision
+#: would overwrite one an operator really made.
+_PROPOSAL_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
+    "pending": frozenset({"approved", "rejected", "stale"}),
+    "approved": frozenset({"applied", "pending", "stale"}),
+    "rejected": frozenset(),
+    "applied": frozenset(),
+    "stale": frozenset(),
+}
 
 #: One schema, created once, in one transaction. The last five tables belong to
 #: Plans 3 and 4; they are created here so there is one versioned schema rather
@@ -791,6 +817,181 @@ class Catalog:
             )
         return stored
 
+    def record_proposal(
+        self,
+        analysis_id: str,
+        *,
+        proposal_id: str,
+        candidate_id: str,
+        kind: str,
+        address_space: str,
+        address: int | None,
+        value: dict[str, object],
+        evidence: dict[str, object],
+        rationale: str,
+    ) -> dict[str, object]:
+        """Store one agent-authored proposal, pending an operator's decision.
+
+        A row is always born ``pending``. There is deliberately no way to
+        create a decided one: the whole control this table exists for is that
+        the party who writes a proposal is not the party who approves it, and
+        a caller able to insert ``applied`` would be both.
+
+        The proposal has to name a candidate this analysis really holds. The
+        foreign key would catch it too, but it would catch it as a constraint
+        failure; a proposal about a candidate that is not there is an agent
+        naming something that does not exist, and is told so.
+
+        Nothing here touches the managed artifact, and nothing here can:
+        this module has no IDA path at all.
+        """
+        self._require_writable()
+        analysis = _validate_id(analysis_id, "analysis_id")
+        identifier = _validate_id(proposal_id, "proposal_id")
+        candidate = _validate_id(candidate_id, "candidate_id")
+        if kind not in PROPOSAL_KINDS:
+            raise CatalogError(
+                f"kind must be one of {', '.join(PROPOSAL_KINDS)}, got {kind!r}"
+            )
+        space = _validate_id(address_space, "address_space")
+        if address is not None and (
+            isinstance(address, bool) or not isinstance(address, int) or address < 0
+        ):
+            raise CatalogError(f"address must be an integer >= 0, got {address!r}")
+        if not isinstance(value, dict) or not value:
+            raise CatalogError(f"value must be a non-empty object, got {value!r}")
+        if not isinstance(evidence, dict) or not evidence:
+            raise CatalogError(
+                f"evidence must be a non-empty object, got {evidence!r}"
+            )
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise CatalogError("rationale must be a non-empty string")
+        # One column, one canonical document. The schema this build owns has
+        # one place for the proposal's own content, and splitting it across a
+        # column the schema does not have is not an option open to this task;
+        # packing both halves of it into that column as canonical JSON is,
+        # and :meth:`proposal` is the only reader of the packing.
+        body = _dump_json({"value": dict(value), "evidence": dict(evidence)})
+        if len(body) > MAX_EVIDENCE_BYTES:
+            raise CatalogError(
+                f"this proposal's value and evidence are {len(body)} bytes of"
+                f" JSON; the limit is {MAX_EVIDENCE_BYTES}"
+            )
+        now = utc_now()
+        with self._transaction() as connection:
+            held = connection.execute(
+                "SELECT 1 FROM candidates WHERE analysis_id = ? AND"
+                " candidate_id = ?",
+                (analysis, candidate),
+            ).fetchone()
+            if held is None:
+                raise CatalogError(
+                    f"no candidate {candidate!r} is recorded under analysis"
+                    f" {analysis!r} of this target, so there is nothing for"
+                    " this proposal to be about"
+                )
+            connection.execute(
+                "INSERT INTO proposals (proposal_id, analysis_id, candidate_id,"
+                " kind, address_space, address, value, rationale, state,"
+                " expected_revision, decided_at, decided_by, decision_reason,"
+                " created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL,"
+                " NULL, ?)",
+                (
+                    identifier,
+                    analysis,
+                    candidate,
+                    kind,
+                    space,
+                    address,
+                    body,
+                    rationale,
+                    now,
+                ),
+            )
+        stored = self.proposal(identifier)
+        if stored is None:  # pragma: no cover - the transaction just wrote it
+            raise CatalogError(
+                f"proposal {identifier!r} was written and cannot be read back"
+            )
+        return stored
+
+    def decide_proposal(
+        self,
+        proposal_id: str,
+        *,
+        state: str,
+        decided_by: str,
+        reason: str,
+        expected_revision: int | None = None,
+    ) -> dict[str, object]:
+        """Record what the review did with one proposal, if it may do it.
+
+        The transitions are the review path's own order, enforced here so
+        that no caller can shorten it. ``pending`` may be approved, rejected
+        or found stale. ``approved`` is the decision recorded *before* the
+        write it authorizes, so it may become ``applied`` when that write is
+        durable, fall back to ``pending`` when it was not, or become
+        ``stale``. ``pending`` may never become ``applied`` directly: that
+        would be a change applied without the approval that is the whole
+        control.
+
+        A row already decided stays decided. A second decision would rewrite
+        history that an operator made, and a reviewer reading this table
+        would have no way to tell which one happened.
+
+        ``expected_revision`` records the artifact revision the operator
+        reviewed against, and is kept once set: the state that follows a
+        decision does not get to rewrite which database it was made about.
+        """
+        self._require_writable()
+        identifier = _validate_id(proposal_id, "proposal_id")
+        if state not in PROPOSAL_STATES:
+            raise CatalogError(
+                f"state must be one of {', '.join(PROPOSAL_STATES)}, got"
+                f" {state!r}"
+            )
+        who = _validate_id(decided_by, "decided_by")
+        if not isinstance(reason, str) or not reason.strip():
+            # Every state, including the retreat to ``pending``: a decision
+            # with no reason recorded is one nobody can act on later.
+            raise CatalogError("reason must be a non-empty string")
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise CatalogError(
+                f"expected_revision must be an integer >= 0, got"
+                f" {expected_revision!r}"
+            )
+        now = utc_now()
+        with self._transaction() as connection:
+            held = self._held_proposal(connection, identifier)
+            allowed = _PROPOSAL_TRANSITIONS[str(held["state"])]
+            if state not in allowed:
+                raise CatalogError(
+                    f"proposal {identifier!r} is {held['state']!r} and may not"
+                    f" become {state!r}; from {held['state']!r} it may become"
+                    + (
+                        f" {', '.join(sorted(allowed))}"
+                        if allowed
+                        else " nothing: it is already decided"
+                    )
+                )
+            connection.execute(
+                "UPDATE proposals SET state = ?, decided_at = ?, decided_by = ?,"
+                " decision_reason = ?, expected_revision ="
+                " COALESCE(?, expected_revision) WHERE proposal_id = ?",
+                (state, now, who, reason, expected_revision, identifier),
+            )
+        stored = self.proposal(identifier)
+        if stored is None:  # pragma: no cover - the transaction just wrote it
+            raise CatalogError(
+                f"proposal {identifier!r} was decided and cannot be read back"
+            )
+        return stored
+
     # -- reads --------------------------------------------------------------
 
     def page_candidates(
@@ -928,6 +1129,137 @@ class Catalog:
                 (identifier,),
             )
         ]
+
+    def candidate(
+        self, analysis_id: str, candidate_id: str
+    ) -> dict[str, object] | None:
+        """One stored candidate of this target's analysis, or ``None``.
+
+        ``None`` means this analysis does not hold a candidate under that id —
+        including when a later run of its pass dropped it, which is the case
+        a proposal has to be refused for rather than applied against evidence
+        the store no longer has.
+        """
+        identifier = _validate_id(analysis_id, "analysis_id")
+        self._require_analysis(identifier)
+        row = self._connection.execute(
+            "SELECT candidate_id, pass_name, kind, backend, address_space,"
+            " address, evidence, confidence, state, reason FROM candidates"
+            " WHERE analysis_id = ? AND candidate_id = ?",
+            (identifier, _validate_id(candidate_id, "candidate_id")),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "candidate_id": row[0],
+            "pass": row[1],
+            "kind": row[2],
+            "backend": row[3],
+            "address_space": row[4],
+            "address": row[5],
+            "evidence": json.loads(row[6]),
+            "confidence": row[7],
+            "state": row[8],
+            "reason": row[9],
+        }
+
+    def proposal(self, proposal_id: str) -> dict[str, object] | None:
+        """One proposal *of this target*, or ``None``.
+
+        A proposal id another target owns answers ``None`` rather than that
+        target's row, for the same reason :meth:`analysis` does: a reviewer
+        asking about one image may not be handed, or approve, a decision
+        about another.
+        """
+        row = self._connection.execute(
+            "SELECT p.proposal_id, p.analysis_id, p.candidate_id, p.kind,"
+            " p.address_space, p.address, p.value, p.rationale, p.state,"
+            " p.expected_revision, p.decided_at, p.decided_by,"
+            " p.decision_reason, p.created_at FROM proposals p"
+            " JOIN analyses a ON a.analysis_id = p.analysis_id"
+            " WHERE p.proposal_id = ? AND a.target_key = ?",
+            (_validate_id(proposal_id, "proposal_id"), self._target.key),
+        ).fetchone()
+        return None if row is None else _proposal_row(row)
+
+    def page_proposals(
+        self,
+        analysis_id: str | None = None,
+        *,
+        state: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """One window of this target's proposals, newest decision last.
+
+        ``analysis_id`` narrows to one revision and ``state`` to one stage of
+        review; both default to everything this target holds, because an
+        operator opening the review command wants the queue, not a revision
+        they would have to know the id of first.
+        """
+        try:
+            offset, limit = validate_page(offset, limit)
+        except OperationError as error:
+            raise CatalogError(str(error)) from error
+        where = ["a.target_key = ?"]
+        parameters: list[object] = [self._target.key]
+        if analysis_id is not None:
+            where.append("p.analysis_id = ?")
+            parameters.append(_validate_id(analysis_id, "analysis_id"))
+        if state is not None:
+            if state not in PROPOSAL_STATES:
+                raise CatalogError(
+                    f"state must be one of {', '.join(PROPOSAL_STATES)}, got"
+                    f" {state!r}"
+                )
+            where.append("p.state = ?")
+            parameters.append(state)
+        clause = " AND ".join(where)
+        total = self._connection.execute(
+            "SELECT count(*) FROM proposals p JOIN analyses a"
+            f" ON a.analysis_id = p.analysis_id WHERE {clause}",
+            tuple(parameters),
+        ).fetchone()[0]
+        rows = self._connection.execute(
+            "SELECT p.proposal_id, p.analysis_id, p.candidate_id, p.kind,"
+            " p.address_space, p.address, p.value, p.rationale, p.state,"
+            " p.expected_revision, p.decided_at, p.decided_by,"
+            " p.decision_reason, p.created_at FROM proposals p"
+            f" JOIN analyses a ON a.analysis_id = p.analysis_id WHERE {clause}"
+            " ORDER BY p.created_at ASC, p.proposal_id ASC LIMIT ? OFFSET ?",
+            (*parameters, limit, offset),
+        ).fetchall()
+        proposals = [_proposal_row(row) for row in rows]
+        return {
+            "analysis_id": analysis_id,
+            "state": state,
+            **self._identity_payload(),
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "loaded": len(proposals),
+            "proposals": proposals,
+        }
+
+    def _held_proposal(
+        self, connection: sqlite3.Connection, proposal_id: str
+    ) -> dict[str, object]:
+        """The proposal a decision is about, inside that decision's write."""
+        row = connection.execute(
+            "SELECT p.proposal_id, p.analysis_id, p.candidate_id, p.kind,"
+            " p.address_space, p.address, p.value, p.rationale, p.state,"
+            " p.expected_revision, p.decided_at, p.decided_by,"
+            " p.decision_reason, p.created_at FROM proposals p"
+            " JOIN analyses a ON a.analysis_id = p.analysis_id"
+            " WHERE p.proposal_id = ? AND a.target_key = ?",
+            (proposal_id, self._target.key),
+        ).fetchone()
+        if row is None:
+            raise CatalogError(
+                f"no proposal {proposal_id!r} is recorded for target"
+                f" {self._target.key}"
+            )
+        return _proposal_row(row)
 
     # -- internals ----------------------------------------------------------
 
@@ -1553,6 +1885,34 @@ def _candidate(item: object, index: int, backend: str) -> dict[str, Any]:
         "confidence": float(confidence),
         "state": state,
         "reason": reason,
+    }
+
+
+def _proposal_row(row: tuple[Any, ...]) -> dict[str, object]:
+    """One stored proposal, with its packed value and evidence unpacked.
+
+    The column holds one canonical JSON document carrying both halves of the
+    proposal's own content; this is the only place that knows that, so every
+    reader above sees ``value`` and ``evidence`` as the separate things they
+    are.
+    """
+    body = json.loads(row[6])
+    return {
+        "proposal_id": row[0],
+        "analysis_id": row[1],
+        "candidate_id": row[2],
+        "kind": row[3],
+        "address_space": row[4],
+        "address": row[5],
+        "value": body.get("value", {}),
+        "evidence": body.get("evidence", {}),
+        "rationale": row[7],
+        "state": row[8],
+        "expected_revision": row[9],
+        "decided_at": row[10],
+        "decided_by": row[11],
+        "decision_reason": row[12],
+        "created_at": row[13],
     }
 
 
