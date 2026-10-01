@@ -253,3 +253,30 @@ def test_decompiler_unavailable_is_partial(
     assert health["unsupported_sites"] == 2
     assert health["evaluated_sites"] == 1
     assert result["findings"] == []
+
+
+def test_wrapper_discovery_without_a_decompiler_is_reported_not_lost(
+    compiled_shapes: Path, managed_data_dir: Path
+) -> None:
+    # `Possible Dangling Pointer` is the shipped `wrappers: true` rule, and its
+    # one branch is `set_to_null_after_call()`, which the disassembly-only
+    # backend answers on its own. So every direct site evaluates and nothing
+    # looks wrong — while `_wrapper_sites` needs a ctree it does not have and
+    # silently finds none. Unsaid, "no wrapper exists" and "wrapper discovery
+    # never ran" are the same answer, and the scan reads `complete` with half
+    # the rule unrun.
+    rule = _stock_rule("free")
+    result = _scan(compiled_shapes, (rule,), decompiler="disabled")
+
+    coverage = result["rule_coverage"][0]
+    assert coverage["state"] == "unsupported"
+    assert "wrapper discovery needs the decompiler" in (coverage["reason"] or "")
+    assert result["coverage"] == "partial"
+
+    # What it did find is the wrapped call itself, which the ctree run reports
+    # at a different address under a different id: `drop_buffer`'s call to
+    # `release_buffer` (see test_wrapper_loop_and_array_fact_detection) is
+    # exactly what did not run here.
+    assert [row["found_in"] for row in result["findings"]] == ["release_buffer"]
+    assert [row["evidence"]["wrapper_of"] for row in result["findings"]] == [None]
+    assert result["scope_health"]["ida"]["evaluated_sites"] == 1

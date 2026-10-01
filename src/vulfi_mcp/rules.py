@@ -23,6 +23,7 @@ from typing import Final, TypedDict
 
 from vulfi_mcp.ida_runtime import (
     MAX_COMPREHENSION_ITERATIONS,
+    MAX_EXPRESSION_DEPTH,
     MAX_EXPRESSION_LENGTH,
     MAX_EXPRESSION_NODES,
     ExpressionError,
@@ -225,11 +226,13 @@ def rule_template() -> dict[str, object]:
             "limits": {
                 "expression": (
                     f"One expression per branch, at most {MAX_EXPRESSION_LENGTH}"
-                    f" characters and {MAX_EXPRESSION_NODES} syntax nodes; oversized"
+                    f" characters, {MAX_EXPRESSION_NODES} syntax nodes and"
+                    f" {MAX_EXPRESSION_DEPTH} levels of nesting; oversized"
                     " or unsupported syntax is rejected with a rule-indexed error."
                 ),
                 "iteration": (
-                    "Comprehensions, any(), and range() iterate at most"
+                    "Comprehensions, any(), range(), and every 'in' or 'not in'"
+                    " membership scan share one counter and may touch at most"
                     f" {MAX_COMPREHENSION_ITERATIONS} elements per branch; an"
                     " over-budget expression is rejected, never silently false."
                 ),

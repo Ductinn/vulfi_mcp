@@ -31,14 +31,18 @@ from ida_mcp.mcp import serve_stdio, tool
 
 from vulfi_mcp.contracts import FindingsPage, JsonValue, ScanResult, TriageResult
 from vulfi_mcp.ida_adapter import (
+    NO_DATABASE_REASON,
     ensure_managed_idb,
+    existing_managed_idb,
     findings_ida,
     scan_ida,
     triage_ida,
+    unscanned_findings_page,
 )
 from vulfi_mcp.ida_runtime import (
     CUSTOM_SCOPE_PREFIX,
     DEFAULT_SCOPE,
+    UnknownFindingError,
     validate_page,
     validate_rationale,
     validate_scan_name,
@@ -204,21 +208,23 @@ def vulfi_findings(
     limit: Annotated[int, "Rows to return; 1 to 200."] = 100,
 ) -> FindingsPage:
     """Read the VulFi findings already stored for a target: no rule is
-    evaluated and no stored row is rewritten. Returns one page of rows across
-    every scope of the IDA backend in one stable order (address space, then
-    location, then finding ID), together with the target's triage counts, how
-    many rows a later partial scan did not observe again, and which stores
-    answered — a store that is absent is reported unavailable, never as zero
-    rows. Reading a target that was never scanned is not cheap: the rows live
-    in the target's managed IDA database, so the first call for such a target
-    analyzes the binary in full before returning an empty page. Once that
-    database exists this is a read, and cheaper than vulfi_scan.
+    evaluated, no stored row is rewritten, and no database is analyzed or
+    created. Returns one page of rows across every scope of the IDA backend in
+    one stable order (address space, then location, then finding ID), together
+    with the target's triage counts, how many rows a later partial scan did not
+    observe again, and which stores answered — a store that is absent is
+    reported unavailable, never as zero rows. A target no vulfi_scan has ever
+    run against has no managed database and therefore no store: that is
+    reported as an unavailable IDA store with a reason, not as a target
+    without findings. Only vulfi_scan creates a database.
     """
     _require_no_external_store(binary_path, "vulfi_findings")
-    # Refused before a database can exist, so an out-of-range page never
-    # analyzes a binary just to say no.
+    # Refused before a database is even looked for, so an out-of-range page
+    # never costs a workspace lookup to say no.
     validate_page(offset, limit)
-    idb_path = ensure_managed_idb(path)
+    idb_path = existing_managed_idb(path)
+    if idb_path is None:
+        return unscanned_findings_page(path, offset, limit)
     return findings_ida(idb_path, offset, limit, path=path)
 
 
@@ -254,8 +260,11 @@ def vulfi_triage(
     opened, and a refused update writes nothing at all. An accepted one is
     committed to the managed IDB and survives reopening it; it returns the
     finding exactly as the store committed it, its assessment revision, and the
-    target's triage counts. Assessments in this build are unlinked: they update
-    the IDA row's own authority and nothing else.
+    target's triage counts. Assessing a target no vulfi_scan has run against is
+    refused outright: there is no store, so there is no id it could hold, and
+    no database is analyzed or created to establish that. Assessments in this
+    build are unlinked: they update the IDA row's own authority and nothing
+    else.
     """
     _require_no_external_store(binary_path, "vulfi_triage")
     # Refused before a database can exist, for the same reason vulfi_findings
@@ -264,7 +273,12 @@ def vulfi_triage(
         raise ValueError("finding_id must be a non-empty string")
     validate_status(status)
     validate_rationale(rationale)
-    idb_path = ensure_managed_idb(path)
+    idb_path = existing_managed_idb(path)
+    if idb_path is None:
+        raise UnknownFindingError(
+            f"no stored finding carries the id {finding_id!r}:"
+            f" {NO_DATABASE_REASON}. Nothing was written"
+        )
     return triage_ida(idb_path, finding_id, status, rationale, path=path)
 
 

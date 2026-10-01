@@ -56,6 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - the worker never imports the package.
 
 __all__ = [
     "MAX_COMPREHENSION_ITERATIONS",
+    "MAX_EXPRESSION_DEPTH",
     "MAX_EXPRESSION_LENGTH",
     "MAX_EXPRESSION_NODES",
     "MAX_PAGE_LIMIT",
@@ -109,6 +110,12 @@ MAX_EXPRESSION_LENGTH: Final = 2000
 #: Largest accepted syntax tree, in interpreted nodes. The largest stock
 #: expression uses 66 of them.
 MAX_EXPRESSION_NODES: Final = 500
+#: Deepest accepted nesting, in interpreted nodes from the branch's root. The
+#: deepest stock expression nests 9 of them. The character and node budgets do
+#: not bound this: ``'not ' * 498 + 'True'`` is inside both and would recurse
+#: the interpreter past Python's own frame limit, which aborts a scan instead
+#: of refusing a rule.
+MAX_EXPRESSION_DEPTH: Final = 50
 #: Most elements one branch may touch: every ``range()`` it builds, every item a
 #: comprehension or ``any()`` iterates, and every element an ``in`` scan
 #: compares are charged to this one budget.
@@ -616,13 +623,36 @@ def _infer_kind(node: ast.expr, bound: dict[str, str]) -> str:
 class _Validator:
     """Walks one parsed branch and rejects everything outside the whitelist."""
 
-    __slots__ = ("_nodes",)
+    __slots__ = ("_depth", "_nodes")
 
     def __init__(self) -> None:
         self._nodes = 0
+        self._depth = 0
 
     def check(self, node: ast.AST, bound: dict[str, str]) -> None:
+        """One node and everything under it, inside every size budget.
+
+        Depth is charged here rather than in :class:`_Interpreter` because the
+        interpreter recurses once, sometimes twice, per nested node: a branch
+        deep enough to exhaust Python's frame limit must be refused while it is
+        still JSON, before any database has been created or opened.
+        """
         self._count()
+        self._depth += 1
+        if self._depth > MAX_EXPRESSION_DEPTH:
+            raise ExpressionBudgetError(
+                # No `_source(node)` here: unparsing an over-deep subtree is
+                # itself recursive, so the refusal would raise the very error
+                # it exists to prevent.
+                f"expression is over the {MAX_EXPRESSION_DEPTH} nesting"
+                " level budget"
+            )
+        try:
+            self._walk(node, bound)
+        finally:
+            self._depth -= 1
+
+    def _walk(self, node: ast.AST, bound: dict[str, str]) -> None:
         if isinstance(node, ast.Expression):
             self.check(node.body, bound)
         elif isinstance(node, ast.BoolOp):
@@ -1319,7 +1349,7 @@ class _Scanner:
         for index in range(self._api.get_import_module_qty()):
             self._api.enum_import_names(index, collect)
 
-    def _apply_prototype(self, ea: int, name: str) -> bool:
+    def _apply_prototype(self, ea: int, name: str, rule_named: bool) -> bool:
         """Type a rule-named function VulFi ships a prototype for, once.
 
         Upstream applied a prototype to every function it recognized, up
@@ -1330,8 +1360,15 @@ class _Scanner:
         is the only write this operation makes, it happens in the managed
         database alone, and every application is reported back as
         ``applied_prototypes``.
+
+        ``rule_named`` is what makes "rule-named" true rather than assumed. A
+        wrapper site would otherwise offer the pinned prototype to the
+        *wrapper*, which the rule never named: a local function whose name
+        happens to collide with one of the pinned keys would be typed as the
+        library function it shares a name with, and every fact later extracted
+        from calls to it would be read through the wrong prototype.
         """
-        if not name or ea in self._typed:
+        if not rule_named or not name or ea in self._typed:
             return False
         self._typed.add(ea)
         prototype = self._prototypes.get(name.lower())
@@ -1378,6 +1415,15 @@ class _Scanner:
         sites: list[dict[str, object]] = []
         notes: list[str] = []
         truncated = False
+        if rule["wrappers"] and not self._hexrays:
+            # `_wrapper_sites` needs a ctree and has none, so half of what this
+            # rule asked for cannot run. Said here, the rule reads `unsupported`
+            # and the scan `partial`; left unsaid, "no wrapper was found" and
+            # "wrapper discovery never ran" would be the same answer.
+            notes.append(
+                "wrapper discovery needs the decompiler, which this scan did"
+                " not use, so only direct call sites were examined"
+            )
         seen: set[tuple[int, str]] = set()
         for ea in self._functions:
             if truncated:
@@ -1539,7 +1585,15 @@ class _Scanner:
         wrapped: int = 0,
         wrapper_of: str | None = None,
     ) -> dict[str, object]:
-        params, reason, expected = self._arguments(address, callee_name, callee_ea)
+        params, reason, expected = self._arguments(
+            address,
+            callee_name,
+            callee_ea,
+            # A wrapper site types the wrapper, and the rule named the function
+            # the wrapper calls, not the wrapper. Only a direct site is about a
+            # callee a rule asked for by name.
+            rule_named=wrapper_of is None,
+        )
         return {
             "address": hex(address),
             "relative_address": self._relative(address),
@@ -1558,7 +1612,7 @@ class _Scanner:
         }
 
     def _arguments(
-        self, call_ea: int, callee_name: str, callee_ea: int
+        self, call_ea: int, callee_name: str, callee_ea: int, *, rule_named: bool
     ) -> tuple[list[dict[str, object]] | None, str | None, int | None]:
         """This call's arguments, or exactly why they could not be recovered.
 
@@ -1566,14 +1620,14 @@ class _Scanner:
         the callee offered its pinned VulFi prototype, and only then is the
         recovery retried — once. That is the whole of the ``SetType`` trigger:
         a prototype is applied when, and only when, the arguments could not
-        otherwise be recovered.
+        otherwise be recovered for a callee this rule named.
         """
         params, reason, expected = self._recover_arguments(
             call_ea, callee_name, callee_ea
         )
         if params is not None:
             return params, reason, expected
-        if not self._apply_prototype(callee_ea, callee_name):
+        if not self._apply_prototype(callee_ea, callee_name, rule_named):
             return None, reason, expected
         retried, retry_reason, expected = self._recover_arguments(
             call_ea, callee_name, callee_ea

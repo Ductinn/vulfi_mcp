@@ -12,6 +12,7 @@ import pytest
 from vulfi_mcp import ida_runtime, rules
 from vulfi_mcp.ida_runtime import (
     MAX_COMPREHENSION_ITERATIONS,
+    MAX_EXPRESSION_DEPTH,
     MAX_EXPRESSION_LENGTH,
     MAX_EXPRESSION_NODES,
     UNAVAILABLE,
@@ -307,6 +308,7 @@ def test_bad_predicate_arguments_are_a_failure_not_missing_evidence() -> None:
 def test_expression_budgets_are_pinned() -> None:
     assert MAX_EXPRESSION_LENGTH == 2000
     assert MAX_EXPRESSION_NODES == 500
+    assert MAX_EXPRESSION_DEPTH == 50
     assert MAX_COMPREHENSION_ITERATIONS == 1000
 
     with pytest.raises(ExpressionBudgetError, match="character"):
@@ -353,6 +355,45 @@ def test_membership_scans_and_range_builds_are_charged_to_the_budget() -> None:
     validate_expression(hostile["mark_if"]["High"])
     with pytest.raises(ExpressionBudgetError, match="iterat"):
         evaluate_rule(hostile, make_context(Param()))
+
+
+def test_deep_nesting_is_refused_while_the_rule_is_still_json() -> None:
+    # The reviewer's shape: 1996 characters and exactly 500 nodes, so the
+    # character and node budgets both accept it, while `_Interpreter` recurses
+    # once per `not` and would exhaust Python's frame limit. A `RecursionError`
+    # is a `RuntimeError`, which neither the unsupported nor the failed path
+    # catches, so an accepted expression of this shape aborts the whole scan
+    # *after* it has created or opened the managed database.
+    deep = "not " * 498 + "True"
+    assert len(deep) < MAX_EXPRESSION_LENGTH
+
+    with pytest.raises(ExpressionBudgetError, match="nesting"):
+        validate_expression(deep)
+    # The refusal a scan actually reports: rule-indexed, before any database.
+    with pytest.raises(ValueError, match=r"rules\[0\]: mark_if\['High'\]"):
+        rules.validate_rules([make_rule(High=deep)])
+    # And evaluation refuses it as a budget error, never as a RecursionError.
+    with pytest.raises(ExpressionBudgetError, match="nesting"):
+        evaluate_rule(make_rule(High=deep), make_context(Param()))
+
+    # The budget is the only thing that rejects it: one level shallower than
+    # the limit still evaluates.
+    accepted = make_rule(High="not " * (MAX_EXPRESSION_DEPTH - 2) + "True")
+    assert evaluate_rule(accepted, make_context(Param())) == "High"
+
+
+def test_deep_nesting_survives_every_shape_the_validator_recurses_through() -> None:
+    # Depth is charged per nested node, whatever the node is: a branch that
+    # hides its nesting in calls, indexing or lists is the same recursion.
+    for over, under in (
+        ("param[0].string_value()" + ".lower()" * 60, "param[0].string_value()"),
+        ("[" * 60 + "1" + "]" * 60, "[[[1]]]"),
+        ("param" + "[0]" * 60, "param[0]"),
+        ("1 + " * 60 + "1", "1 + 1 + 1"),
+    ):
+        with pytest.raises(ExpressionBudgetError, match="nesting"):
+            validate_expression(over)
+        validate_expression(under)
 
 
 def test_negative_param_index_is_a_malformed_rule_not_missing_evidence() -> None:

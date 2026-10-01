@@ -8,6 +8,12 @@ from typing import Any
 
 import pytest
 
+from vulfi_mcp.ida_runtime import (
+    MAX_COMPREHENSION_ITERATIONS,
+    MAX_EXPRESSION_DEPTH,
+    MAX_EXPRESSION_LENGTH,
+    MAX_EXPRESSION_NODES,
+)
 from vulfi_mcp.rules import (
     canonical_rule_digest,
     load_stock_rules,
@@ -180,6 +186,27 @@ def test_rule_template_example_roundtrips() -> None:
     assert "eval" in notes
     assert "unsupported" in notes and "partial" in notes
     assert "info" in notes
+
+
+def test_published_limits_name_every_budget_an_expression_can_be_refused_by() -> None:
+    # An agent authors inside these numbers, so a budget the interpreter
+    # charges and the template omits is a refusal the author was never told
+    # about: `in`/`not in` scans share the iteration counter, and nesting depth
+    # is bounded as well as length and node count.
+    limits = rule_template()["expression_language"]["limits"]
+    published = " ".join(limits.values())
+
+    for enforced in (
+        MAX_EXPRESSION_LENGTH,
+        MAX_EXPRESSION_NODES,
+        MAX_EXPRESSION_DEPTH,
+        MAX_COMPREHENSION_ITERATIONS,
+    ):
+        assert str(enforced) in published, f"{enforced} is enforced but unpublished"
+
+    charged = limits["iteration"]
+    for construct in ("any()", "range()", "not in"):
+        assert construct in charged, f"{construct} is charged but unpublished"
 
 
 def test_packaged_data_is_importable_from_the_installed_package() -> None:

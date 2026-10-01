@@ -84,13 +84,16 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only.
 
 __all__ = [
     "DATA_DIR_ENV",
+    "NO_DATABASE_REASON",
     "ManagedDatabaseError",
     "data_dir",
     "ensure_managed_idb",
+    "existing_managed_idb",
     "findings_ida",
     "invoke_ida",
     "scan_ida",
     "triage_ida",
+    "unscanned_findings_page",
 ]
 
 #: Operator configuration for the managed workspace root. Plan 2 reads the same
@@ -192,6 +195,15 @@ _CATALOG_REASON: Final = (
     " IDA findings in the managed IDB only"
 )
 
+#: Why the IDA store reports ``available: false`` for a target nothing has
+#: scanned. A read may not analyze a binary into existence, so this is what
+#: "there is no store" looks like — never an empty one.
+NO_DATABASE_REASON: Final = (
+    "this target has no managed IDA database yet, and only vulfi_scan creates"
+    " one: there is no store to answer from, which is not the same as a target"
+    " with no findings"
+)
+
 
 class ManagedDatabaseError(RuntimeError):
     """The managed workspace could not produce, or keep, a usable IDB."""
@@ -238,6 +250,27 @@ def ensure_managed_idb(path: str) -> str:
     if is_database:
         return _clone_idb(source, managed, workspace)
     return _analyze_binary(source, managed, workspace)
+
+
+def existing_managed_idb(path: str) -> str | None:
+    """The managed IDB for ``path``, or ``None`` when there is not one yet.
+
+    The same deterministic resolution :func:`ensure_managed_idb` performs, and
+    nothing else: no analysis, no clone, no staging directory, no deletion. A
+    read answers from the database a scan already made, so it asks this and
+    reports its store unavailable when the answer is ``None`` — creating a
+    database to page rows out of would turn a read into minutes of analysis
+    and permanent on-disk state, and would answer "no findings" where the
+    truth is "nothing has scanned this target".
+    """
+    source = _canonical_source(path)
+    if source.suffix.lower() in IDB_SUFFIXES:
+        # Same gate as `ensure_managed_idb`, for the same reason: a live IDB's
+        # bytes are not its saved bytes, so the workspace key would be read
+        # off a moving file.
+        _require_released(source)
+    managed = _workspace(source) / _managed_name(source)
+    return str(managed) if managed.is_file() else None
 
 
 def invoke_ida(
@@ -345,6 +378,37 @@ def findings_ida(
         "store_health": _store_health(stored),
         "sync_state": SYNC_STATE,
         "warnings": [_CATALOG_WARNING],
+    }
+
+
+def unscanned_findings_page(
+    path: str, offset: int = 0, limit: int = DEFAULT_PAGE_LIMIT
+) -> FindingsPage:
+    """The honest page for a target no scan has ever produced a database for.
+
+    Zero rows, and both stores reported unavailable with a reason: the IDA one
+    because this target has no managed database, the catalog one because it
+    arrives with Plan 3. ``target_total_complete`` is false, so no caller can
+    read this as "this target has no findings". No database is opened, and
+    none is created.
+    """
+    offset, limit = validate_page(offset, limit)
+    return {
+        "path": path,
+        # There is no managed database to name, and naming one that does not
+        # exist would read as a database this call just made.
+        "idb_path": "",
+        "offset": offset,
+        "limit": limit,
+        "findings": [],
+        "page_total": 0,
+        "target_total": 0,
+        "target_total_complete": False,
+        "stale_total": 0,
+        "status_counts": {},
+        "store_health": _unavailable_store_health(NO_DATABASE_REASON),
+        "sync_state": SYNC_STATE,
+        "warnings": [NO_DATABASE_REASON, _CATALOG_WARNING],
     }
 
 
@@ -1232,6 +1296,23 @@ def _store_health(stored: dict[str, Any]) -> dict[str, object]:
             "record_bytes": stored.get("record_bytes"),
             "stale_total": stored.get("stale_total"),
             "scopes": stored.get("scopes") or [],
+        },
+        "catalog": {"available": False, "reason": _CATALOG_REASON},
+    }
+
+
+def _unavailable_store_health(reason: str) -> dict[str, object]:
+    """Neither store answered, and each says why.
+
+    The IDA entry carries no counts at all. A store that is not there has no
+    rows, no digest and no scopes, and publishing zeroes for them is the one
+    shape this contract exists to rule out.
+    """
+    return {
+        BACKEND: {
+            "available": False,
+            "reason": reason,
+            "netnode": ida_runtime.NETNODE_NAME,
         },
         "catalog": {"available": False, "reason": _CATALOG_REASON},
     }
