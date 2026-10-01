@@ -396,6 +396,20 @@ def test_deep_nesting_survives_every_shape_the_validator_recurses_through() -> N
         validate_expression(under)
 
 
+def test_receiver_inference_is_bounded_like_the_rest_of_validation() -> None:
+    # `_check_call` infers the receiver's kind *before* `check` descends into
+    # it, so that recursion runs ahead of the node-depth budget and needs its
+    # own copy of it. Without one this raised a bare RecursionError out of
+    # validation, where the rule template promises a rule-indexed refusal.
+    deep_receiver = "param" + "[0]" * 655 + ".is_constant()"
+    assert len(deep_receiver) < MAX_EXPRESSION_LENGTH
+
+    with pytest.raises(ExpressionBudgetError, match="nesting"):
+        validate_expression(deep_receiver)
+    with pytest.raises(ValueError, match=r"rules\[0\]: mark_if\['High'\]"):
+        rules.validate_rules([make_rule(High=deep_receiver)])
+
+
 def test_negative_param_index_is_a_malformed_rule_not_missing_evidence() -> None:
     recovered = make_context(Param(constant=False), Param(constant=True))
 

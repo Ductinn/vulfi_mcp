@@ -555,9 +555,9 @@ def _compile(expression: str) -> ast.Expression:
     return tree
 
 
-def _element_kind(node: ast.expr, bound: dict[str, str]) -> str:
+def _element_kind(node: ast.expr, bound: dict[str, str], depth: int = 0) -> str:
     """Static kind of one element of ``node``, or ``_UNKNOWN``."""
-    return _ELEMENT_KINDS.get(_infer_kind(node, bound), _UNKNOWN)
+    return _ELEMENT_KINDS.get(_infer_kind(node, bound, depth), _UNKNOWN)
 
 
 def _list_kind(element: str) -> str:
@@ -565,13 +565,25 @@ def _list_kind(element: str) -> str:
     return _LIST_KINDS.get(element, _LIST)
 
 
-def _infer_kind(node: ast.expr, bound: dict[str, str]) -> str:
+def _infer_kind(node: ast.expr, bound: dict[str, str], depth: int = 0) -> str:
     """Infer what kind of value an expression produces, without any facts.
 
     Receivers in this language are a closed set, so an unmistakable kind lets
     :class:`_Validator` reject a method call on the wrong receiver before any
     IDB is opened. Anything not inferable is ``_UNKNOWN`` and stays permissive.
+
+    This recursion runs *before* :meth:`_Validator.check` descends into the
+    receiver, so it carries its own copy of the nesting budget: without one, a
+    deeply nested receiver raises a bare ``RecursionError`` out of validation,
+    where every other refusal is a rule-indexed :class:`ExpressionError`.
     """
+    if depth > MAX_EXPRESSION_DEPTH:
+        # The same refusal `_Validator.check` raises, and for the same reason
+        # it quotes no source: unparsing an over-deep subtree recurses too.
+        raise ExpressionBudgetError(
+            f"expression is over the {MAX_EXPRESSION_DEPTH} nesting level budget"
+        )
+    depth += 1
     if isinstance(node, ast.Constant):
         value = node.value
         if isinstance(value, bool):
@@ -592,16 +604,18 @@ def _infer_kind(node: ast.expr, bound: dict[str, str]) -> str:
             return _CALL
         return bound.get(node.id, _UNKNOWN)
     if isinstance(node, ast.Subscript):
-        return _element_kind(node.value, bound)
+        return _element_kind(node.value, bound, depth)
     if isinstance(node, ast.List):
-        kinds = {_infer_kind(element, bound) for element in node.elts}
+        kinds = {_infer_kind(element, bound, depth) for element in node.elts}
         return _list_kind(kinds.pop()) if len(kinds) == 1 else _LIST
     if isinstance(node, ast.ListComp):
         inner = dict(bound)
         for generator in node.generators:
             if isinstance(generator.target, ast.Name):
-                inner[generator.target.id] = _element_kind(generator.iter, bound)
-        return _list_kind(_infer_kind(node.elt, inner))
+                inner[generator.target.id] = _element_kind(
+                    generator.iter, bound, depth
+                )
+        return _list_kind(_infer_kind(node.elt, inner, depth))
     if isinstance(node, (ast.BoolOp, ast.Compare)):
         return _BOOL
     if isinstance(node, ast.UnaryOp):
@@ -613,7 +627,9 @@ def _infer_kind(node: ast.expr, bound: dict[str, str]) -> str:
         if isinstance(func, ast.Name):
             return _BUILTIN_RESULTS.get(func.id, _UNKNOWN)
         if isinstance(func, ast.Attribute):
-            table = _METHODS.get(_RECEIVER_TYPES.get(_infer_kind(func.value, bound)))
+            table = _METHODS.get(
+                _RECEIVER_TYPES.get(_infer_kind(func.value, bound, depth))
+            )
             if table is not None and func.attr in table:
                 return table[func.attr].result
             return _METHOD_RESULTS.get(func.attr, _UNKNOWN)
