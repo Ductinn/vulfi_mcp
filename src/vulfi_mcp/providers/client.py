@@ -207,6 +207,73 @@ def tool_fingerprint(tool: types.Tool) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+#: The schema's **own** size budget, in two dimensions, and deliberately not
+#: ``max_response_bytes`` — that is a bound on one answer, and using a response
+#: budget as a schema budget is what let the ninth instance of this bug through.
+#:
+#: The cost of a provider's schema is not a property of the schema. It is the
+#: **product** of the schema's size and the size of every answer it is later run
+#: against, paid once by the provider at ``tools/list`` and collected on every
+#: call afterwards. A 1.06 MB schema — depth 4, no reference, no refused or
+#: costly keyword, inside the old 4 MiB response budget — took 9.0 s merely to
+#: *vet*, with this event loop blocked for ~99% of it, and then 20.1 s to answer
+#: one call carrying **398 bytes**: about 50 ms of blocked loop per byte of
+#: answer, against ~1 µs/byte for an honest schema. No word added to either
+#: keyword set reaches that, because the cost belongs to no keyword.
+#:
+#: Both numbers are derived from the providers rather than chosen, so that a
+#: later reader can see what they protect instead of rounding them. Measured
+#: across every schema both installed backends advertise — radare2-mcp 1.8.8's
+#: 42 input schemas and GhidraMCP 6.0.0's 222 input plus 222 output schemas,
+#: 486 in all — the largest is **953 bytes** (``search_functions_enhanced``)
+#: and **52 nodes** (the same one); radare2-mcp's largest is 896 bytes and 20
+#: nodes. The limits below are roughly **8.6×** and **9.8×** those observed
+#: maxima. If a real provider ever needs more, raise them against a fresh
+#: measurement and re-measure the worst case below — do not relax them because
+#: a number looks small.
+#:
+#: What the budget admits is the actual security property, and it is measured
+#: rather than inferred. The most expensive shape these two limits allow is 245
+#: ``allOf`` branches in 8,166 bytes: **67.5 ms to vet**, and **~290 µs per byte
+#: of answer** at call time (115 ms for the same 398-byte answer that cost
+#: 20.1 s before). That is an amplification of ~290× over an honest schema's
+#: ~1 µs/byte, down from ~5×10⁴ — bounded, not eliminated. The answer dimension
+#: still has no ceiling, because bounding it would mean not calling
+#: ``ClientSession.call_tool``; a very large answer against a legal-but-hostile
+#: schema is the residue, and it is in the report rather than hidden here.
+MAX_SCHEMA_BYTES: Final = 8 * 1024
+
+#: Nodes the schema walk may visit before it stops. Counted during the walk it
+#: already performs, so it costs nothing, and checked *before* each node rather
+#: than after the walk completes.
+MAX_SCHEMA_NODES: Final = 512
+
+#: Keywords refused for what they **cost**, which is a different question from
+#: the one :data:`_SHARED_KINDS` answers and must stay one.
+#:
+#: The position classification asks *"does this keyword hold a subschema?"*.
+#: This set asks *"can this keyword's evaluation cost more than the bytes it is
+#: given?"*. For seven rounds this module treated the second as a consequence
+#: of the first, and ``uniqueItems`` is where they part company: it holds no
+#: subschema — ``instance`` is the *correct* position class for it — and
+#: ``jsonschema``'s ``uniq`` still falls back to an O(n²) deep comparison
+#: whenever the array's items are unorderable, which the provider chooses.
+#: A 72-byte output schema measured 0.74 s on an 11 KB answer, 12.2 s on 50 KB
+#: and 52.5 s on 103 KB, every call succeeding, after every budget this server
+#: applies.
+#:
+#: Populated by measurement, not by guesswork: every keyword classified
+#: ``instance``, in every dialect, swept against the worst instance a provider
+#: could choose. ``uniqueItems`` was the only one whose cost is both
+#: super-linear and unbounded by anything else. ``maximum`` and
+#: ``exclusiveMaximum`` are super-linear in an integer's digits — 36 ms at
+#: 64,000 digits, quadratic — but CPython's own ``sys.get_int_max_str_digits``
+#: of 4,300 means ``json`` refuses to parse a longer one at all, capping them
+#: at 0.18 ms; ``enum``, ``const``, ``required`` and the rest measured linear.
+#: The sweep and those ceilings are pinned in ``tests/test_provider_security.py``
+#: so the set keeps its evidence and a change of ceiling is visible.
+_COSTLY_KEYWORDS: Final[frozenset[str]] = frozenset({"uniqueItems"})
+
 #: JSON Schema keywords a provider's schema may not contain, input or output
 #: alike. There are two different reasons in this one set, and the second is
 #: the important one:
@@ -240,32 +307,6 @@ def tool_fingerprint(tool: types.Tool) -> str:
 #: set started governing output schemas, which are run against a provider's own
 #: answer.) ``format`` is not here because no format checker is installed,
 #: which is what makes it inert rather than a second regular-expression engine.
-#: Keywords refused for what they **cost**, which is a different question from
-#: the one :data:`_SHARED_KINDS` answers and must stay one.
-#:
-#: The position classification asks *"does this keyword hold a subschema?"*.
-#: This set asks *"can this keyword's evaluation cost more than the bytes it is
-#: given?"*. For seven rounds this module treated the second as a consequence
-#: of the first, and ``uniqueItems`` is where they part company: it holds no
-#: subschema — ``instance`` is the *correct* position class for it — and
-#: ``jsonschema``'s ``uniq`` still falls back to an O(n²) deep comparison
-#: whenever the array's items are unorderable, which the provider chooses.
-#: A 72-byte output schema measured 0.74 s on an 11 KB answer, 12.2 s on 50 KB
-#: and 52.5 s on 103 KB, every call succeeding, after every budget this server
-#: applies.
-#:
-#: Populated by measurement, not by guesswork: every keyword classified
-#: ``instance``, in every dialect, swept against the worst instance a provider
-#: could choose. ``uniqueItems`` was the only one whose cost is both
-#: super-linear and unbounded by anything else. ``maximum`` and
-#: ``exclusiveMaximum`` are super-linear in an integer's digits — 36 ms at
-#: 64,000 digits, quadratic — but CPython's own ``sys.get_int_max_str_digits``
-#: of 4,300 means ``json`` refuses to parse a longer one at all, capping them
-#: at 0.18 ms; ``enum``, ``const``, ``required`` and the rest measured linear.
-#: The sweep and those ceilings are pinned in ``tests/test_provider_security.py``
-#: so the set keeps its evidence and a change of ceiling is visible.
-_COSTLY_KEYWORDS: Final[frozenset[str]] = frozenset({"uniqueItems"})
-
 _REFUSED_KEYWORDS: Final[frozenset[str]] = frozenset(
     {
         "$defs",
@@ -772,10 +813,13 @@ def _unusable_schema(
         encoded = json.dumps(schema, ensure_ascii=False).encode("utf-8")
     except (TypeError, ValueError) as error:
         return _quote(f"its {what} schema is not JSON ({error})")
-    if len(encoded) > limits.max_response_bytes:
+    if len(encoded) > MAX_SCHEMA_BYTES:
+        # Checked before the walk, not after: the walk is itself linear in
+        # schema size, and the version that measured a schema with a response
+        # budget blocked this loop for nine seconds before deciding anything.
         return (
             f"its {what} schema is {len(encoded)} bytes, over the"
-            f" {limits.max_response_bytes} byte response budget"
+            f" {MAX_SCHEMA_BYTES} byte schema budget"
         )
     if _too_deep(schema, limits.max_response_depth):
         return (
@@ -910,12 +954,29 @@ def _walk_schema(schema: Mapping[str, Any], what: str) -> _Finding:
     refused: set[str] = set()
     unclassified: set[str] = set()
     costly: set[str] = set()
+    visited = 0
     root = _validator_for(schema, default=jsonschema.validators._LATEST_VERSION)
     if root not in SUPPORTED_DIALECTS:
         return _Finding([], [], [], _unsupported(root, schema.get("$schema"), what))
     stack: list[tuple[object, type[Any]]] = [(schema, root)]
     first = True
     while stack:
+        visited += 1
+        if visited > MAX_SCHEMA_NODES:
+            # Stopping here rather than after the walk completes is the point:
+            # the counter costs nothing because the walk visits these nodes
+            # anyway, and it is what keeps a schema that is small in bytes but
+            # vast in evaluated positions from being measured by running it.
+            return _Finding(
+                [],
+                [],
+                [],
+                f"its {what} schema has more than {MAX_SCHEMA_NODES} nodes,"
+                " over the schema budget; the cost of evaluating a schema is"
+                " the product of its size and the size of every answer it is"
+                " later run against, so size is bounded here rather than"
+                " discovered at call time",
+            )
         item, validator = stack.pop()
         if isinstance(item, list):
             stack.extend((child, validator) for child in item)

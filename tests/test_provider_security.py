@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
+from mcp import types
 import pytest
 
 from vulfi_mcp.catalog import get_catalog, open_catalog
@@ -1412,37 +1413,176 @@ def test_a_schema_that_holds_no_subschema_can_still_cost_unbounded(
     )
 
 
+def test_a_schema_gets_its_own_size_budget_in_two_dimensions(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """The cost that belongs to no keyword: schema size times answer size.
+
+    1.06 MB of `allOf`, depth 4, no reference, nothing in either keyword set,
+    and inside the 4 MiB *response* budget that was standing in for a schema
+    budget. Measured before the fix: **9.0 s to vet**, with this event loop
+    blocked for ~99% of it, and then a call that **succeeded** after 20.1 s
+    against a five-second timeout — for an answer of 398 bytes. Both halves are
+    timed here, because both were the defect.
+    """
+    config = configure(
+        _config_text(
+            variant="vast_output",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def exercise() -> tuple[str, float, float]:
+        opened = time.monotonic()
+        async with provider_session(
+            config, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            pinned = time.monotonic() - opened
+            started = time.monotonic()
+            with pytest.raises(CapabilityUnavailableError) as refused:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            return str(refused.value), pinned, time.monotonic() - started
+
+    reason, pinned, called = _run(exercise())
+    assert "output schema" in reason
+    assert "schema budget" in reason
+    # Decided without walking a megabyte, and the call never ran it.
+    assert pinned < 3.0, f"pinning blocked for {pinned:.1f}s"
+    assert called < 1.0, f"the call ran the schema ({called:.1f}s)"
+
+
+def test_the_schema_budget_is_derived_from_the_real_providers() -> None:
+    """Both limits, and the worst case they admit, kept where a change is visible.
+
+    The numbers are measured rather than chosen: across all 486 schemas the two
+    installed providers advertise, the largest is 953 bytes and 52 nodes, and
+    the limits are ~8.6x and ~9.8x that. What matters is not the budget but
+    what the budget admits, so that is asserted too.
+    """
+    assert client.MAX_SCHEMA_BYTES == 8 * 1024
+    assert client.MAX_SCHEMA_NODES == 512
+    assert client.MAX_SCHEMA_BYTES / 953 > 8.0
+    assert client.MAX_SCHEMA_NODES / 52 > 9.0
+
+    def branches(count: int) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "xs": {
+                    "type": "array",
+                    "items": {
+                        "allOf": [
+                            {"type": ["integer", "string"]} for _ in range(count)
+                        ]
+                    },
+                }
+            },
+        }
+
+    limits = ProviderLimits()
+    refused = client._unusable_schema(
+        branches(32000), limits, require_properties=True
+    )
+    assert refused is not None and "schema budget" in refused
+
+    worst = branches(245)
+    assert len(json.dumps(worst).encode()) < client.MAX_SCHEMA_BYTES
+    assert (
+        client._unusable_schema(worst, limits, require_properties=True) is None
+    ), "the worst case measured below must be one the budget admits"
+
+    # What that worst case costs per byte of answer: the security property, not
+    # the budget. ~290 us/byte measured, against ~1 us/byte for an honest
+    # schema and ~50 ms/byte for the megabyte one.
+    validator = jsonschema.Draft202012Validator(worst)
+    answer = {"xs": list(range(100))}
+    started = time.monotonic()
+    for _ in validator.iter_errors(answer):
+        break
+    per_byte = (time.monotonic() - started) / len(json.dumps(answer).encode())
+    assert per_byte < 3e-3, f"{per_byte * 1e6:.0f} us/byte"
+
+
+class _Unorderable:
+    """An item `jsonschema`'s `uniq` cannot sort or hash, counting comparisons.
+
+    Unorderable is what a provider chooses by returning objects rather than
+    scalars, and it is what forces `uniq` off its sorted and hashed fast paths
+    onto the pairwise fallback. Counting `__eq__` makes the fallback's cost
+    observable without a clock.
+    """
+
+    calls = 0
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        return isinstance(other, _Unorderable) and self.index == other.index
+
+
 def test_the_cost_set_is_what_measurement_says_it_is() -> None:
     """The evidence behind `_COSTLY_KEYWORDS`, kept where a change is visible.
 
-    Two things are pinned. First, that `uniqueItems` really is quadratic — if a
-    future `jsonschema` makes `uniq` linear this fails and the entry can be
-    reconsidered on evidence rather than removed on a hunch. Second, the
-    *ceiling* that keeps `maximum`/`exclusiveMaximum` out of the set: they are
-    super-linear in an integer's digits (36 ms at 64,000), but CPython refuses
-    to parse an integer literal longer than `sys.get_int_max_str_digits`, so a
-    provider cannot deliver one. Raise that limit and this test fails, which is
-    exactly when the decision should be revisited.
+    Two things are pinned, and neither by a wall clock — the first version of
+    this test asserted on a timing ratio and failed on a loaded machine because
+    the smaller measurement carried the validator's first-use setup.
+
+    First, that `uniqueItems` really is quadratic, counted exactly: `uniq`'s
+    pairwise fallback performs n(n-1)/2 comparisons, so doubling the answer
+    quadruples the work. If a future `jsonschema` makes `uniq` linear this
+    fails and the entry gets reconsidered on evidence.
+
+    Second, the ceiling that keeps `maximum`/`exclusiveMaximum` *out* of the
+    set. They are super-linear in an integer's digits (36 ms at 64,000), but a
+    provider cannot deliver one that long — and the limit that stops it is
+    **pydantic-core's**, not CPython's, because pydantic-core is what parses a
+    provider's frame. Raising `sys.get_int_max_str_digits` does not open the
+    hole; a future pydantic-core raising its own limit would, and that is what
+    this pins.
     """
-    validator = jsonschema.Draft202012Validator({"type": "array", "uniqueItems": True})
+    validator = jsonschema.Draft202012Validator(
+        {"type": "array", "uniqueItems": True}
+    )
 
-    def cost(n: int) -> float:
-        items = [{"i": index} for index in range(n)]
-        started = time.monotonic()
-        for _ in validator.iter_errors(items):
+    def comparisons(count: int) -> int:
+        _Unorderable.calls = 0
+        for _ in validator.iter_errors([_Unorderable(i) for i in range(count)]):
             break
-        return time.monotonic() - started
+        return _Unorderable.calls
 
-    small, large = cost(500), cost(1000)
-    assert small > 0.0
-    # Doubling the answer roughly quadruples the work; linear would be ~2.
-    assert large / small > 3.0, (small, large)
+    small, large = comparisons(50), comparisons(100)
+    assert small == 50 * 49 // 2, small
+    assert large == 100 * 99 // 2, large
+    assert large > 3.9 * small  # quadratic; linear would be ~2x
 
-    assert sys.get_int_max_str_digits() == 4300
-    with pytest.raises(ValueError, match="4300 digits"):
-        json.loads("9" * 4301)
+    # The real ceiling: pydantic-core, measured with CPython's own limit raised
+    # out of the way so the test cannot pass for the wrong reason.
+    original = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(100_000)
+    try:
+        too_long = '{"content": [], "structuredContent": {"n": %s}}' % ("9" * 4301)
+        with pytest.raises(Exception):
+            types.CallToolResult.model_validate_json(too_long)
+        longest = '{"content": [], "structuredContent": {"n": %s}}' % ("9" * 4300)
+        parsed = types.CallToolResult.model_validate_json(longest)
+    finally:
+        sys.set_int_max_str_digits(original)
 
-    biggest = json.loads("9" * 4300)
+    biggest = parsed.structured_content["n"]
     numeric = jsonschema.Draft202012Validator({"maximum": 1})
     started = time.monotonic()
     for _ in range(100):
@@ -2022,6 +2162,26 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
                 "type": "object",
                 "properties": {"xs": {"type": "array", "uniqueItems": True}},
             }
+        if variant == "vast_output":
+            # 1.06 MB, depth 4, no reference, no refused keyword, no costly
+            # keyword, and inside the 4 MiB *response* budget that was doing
+            # duty as a schema budget. The cost is the product of this size and
+            # the size of every answer it is later run against, which is why no
+            # keyword set reaches it.
+            beta["outputSchema"] = {
+                "type": "object",
+                "properties": {
+                    "xs": {
+                        "type": "array",
+                        "items": {
+                            "allOf": [
+                                {"type": ["integer", "string"]}
+                                for _ in range(32000)
+                            ]
+                        },
+                    }
+                },
+            }
         tools.insert(1, beta)
     if variant == "injection":
         tools.append(
@@ -2091,6 +2251,12 @@ def _server_call(
             return {
                 "content": [{"type": "text", "text": "ok"}],
                 "structuredContent": {"xs": [{"i": i} for i in range(4000)]},
+                "isError": False,
+            }
+        if variant == "vast_output":
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"xs": list(range(100))},
                 "isError": False,
             }
         text = (
