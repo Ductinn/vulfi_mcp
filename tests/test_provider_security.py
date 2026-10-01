@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import pytest
 
 from vulfi_mcp.catalog import get_catalog, open_catalog
@@ -50,14 +51,17 @@ from vulfi_mcp.providers import (
     ProviderError,
     ProviderEvidenceError,
     ProviderIdentityError,
+    ProviderLimits,
     ProviderResponseError,
     ProviderSession,
     ProviderUnavailableError,
+    UNCLASSIFIED_KEYWORDS,
     checked_call,
     load_provider_config,
     provider_session,
     rule_contexts,
 )
+from vulfi_mcp.providers import client
 
 # --------------------------------------------------------------------------
 # The hostile server, as this suite talks to it
@@ -883,6 +887,119 @@ def test_a_reference_in_a_provider_schema_is_refused(
     assert elapsed < 2.0, f"the schema was evaluated anyway ({elapsed:.1f}s)"
 
 
+def test_a_draft07_dependencies_subschema_is_walked(
+    configure: Callable[[str], dict[str, ProviderConfig]],
+    binary: Path,
+    server_log: Path,
+    sentinel: Path,
+) -> None:
+    """`dependencies` is a schema position, and a walk that forgets one is a hole.
+
+    This is the shape that reopened the whole class once already: 200 bytes of
+    draft-07, `check_schema` clean, every size and depth bound satisfied, and a
+    catastrophic `pattern` sitting where a hand-written position table did not
+    look. Asserted on the refusal, not on timing — the timing is what the
+    refusal exists to prevent.
+    """
+    refused = configure(
+        _config_text(
+            variant="dependencies_pattern",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def unusable() -> str:
+        async with provider_session(
+            refused, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            with pytest.raises(CapabilityUnavailableError) as stopped:
+                await checked_call(
+                    session,
+                    "beta_text",
+                    {"address": "0x1000"},
+                    session.fingerprint("beta_text"),
+                )
+            return str(stopped.value)
+
+    reason = _run(unusable())
+    assert "pattern" in reason
+    assert "beta_text" in reason
+
+    # The other draft-07 spelling holds property names, not schemas, and must
+    # still work: failing closed is right, failing wide is not.
+    allowed = configure(
+        _config_text(
+            variant="dependencies_array",
+            local=binary,
+            remote=binary,
+            server_log=server_log,
+            sentinel=sentinel,
+        )
+    )["r2"]
+
+    async def usable() -> dict[str, object]:
+        async with provider_session(
+            allowed, str(binary), allowlist=ALLOWLIST
+        ) as session:
+            return await checked_call(
+                session,
+                "beta_text",
+                {"address": "0x1000"},
+                session.fingerprint("beta_text"),
+            )
+
+    assert "mov eax, 1" in " ".join(_run(usable())["text"])
+
+
+def test_every_keyword_a_validator_evaluates_is_classified() -> None:
+    """The position tables are a blocklist too, so they are checked, not trusted.
+
+    The first blocklist went stale and reopened a hole; the tables that replaced
+    it did the same thing one round later, by forgetting draft-07
+    ``dependencies``. So the tables are compared against what the installed
+    library actually evaluates: a new draft, or a library upgrade that adds a
+    keyword, fails here rather than becoming a position nobody walks.
+    """
+    assert UNCLASSIFIED_KEYWORDS == frozenset(), sorted(UNCLASSIFIED_KEYWORDS)
+
+    classified = (
+        client._ONE_SUBSCHEMA
+        | client._SUBSCHEMA_LIST
+        | client._NAMED_SUBSCHEMAS
+        | client._INSTANCE_KEYWORDS
+        | client._REFUSED_KEYWORDS
+    )
+    for name in (
+        "Draft4Validator",
+        "Draft6Validator",
+        "Draft7Validator",
+        "Draft201909Validator",
+        "Draft202012Validator",
+    ):
+        validator = getattr(jsonschema, name, None)
+        if validator is None:  # pragma: no cover - older library
+            continue
+        missing = sorted(set(validator.VALIDATORS) - classified)
+        assert missing == [], f"{name} evaluates unclassified keyword(s) {missing}"
+
+    # And an unclassified keyword, if one ever appears, is a refusal rather
+    # than something the walk steps over.
+    pretend = {"type": "object", "properties": {}, "someFutureKeyword": {}}
+    monkeyed = frozenset({"someFutureKeyword"})
+    original = client.UNCLASSIFIED_KEYWORDS
+    client.UNCLASSIFIED_KEYWORDS = monkeyed  # type: ignore[misc]
+    try:
+        reason = client._unusable_schema(pretend, ProviderLimits())
+    finally:
+        client.UNCLASSIFIED_KEYWORDS = original  # type: ignore[misc]
+    assert reason is not None
+    assert "someFutureKeyword" in reason
+    assert "has not classified" in reason
+
+
 def test_a_vendor_annotation_is_not_mistaken_for_a_subschema(
     configure: Callable[[str], dict[str, ProviderConfig]],
     binary: Path,
@@ -1225,30 +1342,36 @@ def test_an_unsupported_evidence_record_carries_a_reason() -> None:
 
 
 @pytest.mark.parametrize(
-    "contexts",
+    "overrides",
     [
-        [{"params": [{"constant": "X" * 40000}], "call": {}}],
-        [{"params": [{"size_bytes": "X" * 40000}], "call": {}}],
-        [{"params": [{"X" * 40000: True}], "call": {}}],
-        [{"params": [], "call": {}, "X" * 40000: True}],
+        {"contexts": [{"params": [{"constant": "X" * 40000}], "call": {}}]},
+        {"contexts": [{"params": [{"size_bytes": "X" * 40000}], "call": {}}]},
+        {"contexts": [{"params": [{"X" * 40000: True}], "call": {}}]},
+        {"contexts": [{"params": [], "call": {}, "X" * 40000: True}]},
+        # The envelope itself, which the first capping pass missed.
+        {"X" * 40000: True},
+        {"backend": "X" * 40000},
+        {"state": "X" * 40000},
+        {"rule_index": "X" * 40000},
     ],
 )
 def test_refusing_evidence_does_not_repeat_the_provider_back(
-    contexts: list[object],
+    overrides: dict[str, object],
 ) -> None:
     # Task 4 puts this reason in front of an agent, so the same bound the call
     # and session paths got applies here: a provider that sends 40,000
     # characters of anything gets 40,000 characters of nothing back.
-    evidence: RuleEvidence = {
+    evidence: dict[str, object] = {
         "backend": "ghidra",
         "rule_index": 0,
-        "contexts": contexts,  # type: ignore[typeddict-item]
+        "contexts": [],
         "ranges": [],
         "state": "evaluated",
         "reason": None,
     }
+    evidence.update(overrides)
     with pytest.raises(ProviderEvidenceError) as refused:
-        rule_contexts(evidence)
+        rule_contexts(evidence)  # type: ignore[arg-type]
     assert len(str(refused.value)) < 900, len(str(refused.value))
     assert "X" * 1000 not in str(refused.value)
 
@@ -1332,6 +1455,29 @@ def _server_tools(variant: str, sentinel: str) -> list[dict[str, object]]:
             "properties": {"address": {"anyOf": [{"$ref": "#/$defs/d0"}]}},
             "required": ["address"],
             "$defs": defs,
+        }
+    if variant == "dependencies_pattern":
+        # Draft-07 `dependencies`, whose values Draft4/6/7Validator evaluates
+        # as subschemas. 200 bytes, flat, check_schema clean — and it hides a
+        # catastrophic regex where a walk that does not know the keyword never
+        # looks.
+        beta_schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"address": {"type": "string"}},
+            "dependencies": {
+                "address": {"properties": {"address": {"pattern": "(a+)+$"}}}
+            },
+        }
+    if variant == "dependencies_array":
+        # The other draft-07 spelling: a list of property names, not a schema.
+        # It holds no keywords, and refusing it would cost a legitimate tool.
+        beta_schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"address": {"type": "string"}, "mode": {"type": "string"}},
+            "required": ["address"],
+            "dependencies": {"mode": ["address"]},
         }
     if variant == "annotated":
         # A vendor annotation, not a subschema: nothing here is a keyword.

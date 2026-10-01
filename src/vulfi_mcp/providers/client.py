@@ -90,6 +90,7 @@ __all__ = [
     "ProviderResponseError",
     "ProviderSession",
     "ProviderUnavailableError",
+    "UNCLASSIFIED_KEYWORDS",
     "checked_call",
     "provider_session",
     "rule_contexts",
@@ -669,6 +670,14 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
             f" {limits.max_response_depth} level depth budget"
         )
     found = _refused_keywords(schema)
+    unclassified = [name for name in found if name in UNCLASSIFIED_KEYWORDS]
+    if unclassified:
+        return (
+            f"its input schema uses {unclassified}, which the installed"
+            " JSON Schema library evaluates but this server has not classified"
+            " as a schema position; a keyword whose shape is unknown is refused"
+            " rather than walked past, because what it can reach is unknown too"
+        )
     if found:
         return (
             f"its input schema uses {found}, which this server will not"
@@ -721,8 +730,83 @@ _SUBSCHEMA_LIST: Final[frozenset[str]] = frozenset(
 #: names are data and only the values below them are schemas. Without this, a
 #: tool with an argument honestly called ``pattern`` would be refused for using
 #: the ``pattern`` keyword it never used.
+#:
+#: ``dependencies`` is the draft-07 spelling, and its values are *either* a
+#: subschema or a list of property names; the walk descends into the first and
+#: steps over the second, because a list of names holds no keywords. Leaving it
+#: out is how the first version of these tables reopened the very class they
+#: exist to close — ``Draft4/6/7Validator`` evaluates those subschemas in full,
+#: so a 200-byte draft-07 schema hid a catastrophic ``pattern`` where nothing
+#: looked.
 _NAMED_SUBSCHEMAS: Final[frozenset[str]] = frozenset(
-    {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+    {
+        "$defs",
+        "definitions",
+        "dependencies",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+
+#: Keywords whose value contains no subschema anywhere: assertions about the
+#: instance itself. Listed so the completeness check below can tell "this
+#: keyword needs no walking" from "nobody has decided what this keyword is".
+_INSTANCE_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "const",
+        "dependentRequired",
+        "enum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "required",
+        "type",
+        "uniqueItems",
+    }
+)
+
+#: Every keyword any installed draft actually evaluates, read from the library
+#: rather than typed out here. The four tables above are a *second* blocklist,
+#: and the first one failed precisely because a hand-written list went stale;
+#: this is what stops that happening twice.
+_SCHEMA_KEYWORDS: Final[frozenset[str]] = frozenset().union(
+    *(
+        frozenset(validator.VALIDATORS)
+        for validator in (
+            getattr(jsonschema, name, None)
+            for name in (
+                "Draft4Validator",
+                "Draft6Validator",
+                "Draft7Validator",
+                "Draft201909Validator",
+                "Draft202012Validator",
+            )
+        )
+        if validator is not None
+    )
+)
+
+#: Keywords a validator evaluates that this module has not placed in any of the
+#: tables above — empty for the pinned ``jsonschema``, and asserted empty by the
+#: suite so a library upgrade that adds one is a test failure rather than a
+#: silent hole. If one ever appears at run time, a schema using it is refused:
+#: not knowing a keyword's shape means not knowing what it can reach.
+UNCLASSIFIED_KEYWORDS: Final[frozenset[str]] = _SCHEMA_KEYWORDS - (
+    _ONE_SUBSCHEMA
+    | _SUBSCHEMA_LIST
+    | _NAMED_SUBSCHEMAS
+    | _INSTANCE_KEYWORDS
+    | _REFUSED_KEYWORDS
 )
 
 
@@ -746,23 +830,26 @@ def _too_deep(value: object, limit: int) -> bool:
 
 
 def _refused_keywords(schema: object) -> list[str]:
-    """Which :data:`_REFUSED_KEYWORDS` this schema actually uses.
+    """Which refused or unclassified keywords this schema actually uses.
 
     Only true schema positions are walked — the three tables above are the
     whole vocabulary this descends through. A dict under an unrecognised key is
     an annotation, not a subschema: a provider that tags its tools with
     ``"x-meta": {"pattern": ...}`` has not used the ``pattern`` keyword, and
-    refusing it would cost a legitimate tool for nothing.
+    refusing it would cost a legitimate tool for nothing. A keyword a validator
+    *does* evaluate but this module has not classified is reported too, because
+    a position nobody has placed is a position nobody has checked.
 
     Iterative, for the reason :func:`_too_deep` is.
     """
     found: set[str] = set()
+    wanted = _REFUSED_KEYWORDS | UNCLASSIFIED_KEYWORDS
     stack: list[object] = [schema]
     while stack:
         item = stack.pop()
         if not isinstance(item, dict):
             continue
-        found |= set(item) & _REFUSED_KEYWORDS
+        found |= set(item) & wanted
         for key, value in item.items():
             if key in _NAMED_SUBSCHEMAS and isinstance(value, dict):
                 stack.extend(value.values())
@@ -1144,22 +1231,24 @@ def _check_evidence_shape(evidence: object) -> None:
     if missing or unknown:
         raise ProviderEvidenceError(
             f"evidence must have exactly {sorted(_EVIDENCE_KEYS)};"
-            f" missing {missing}, unknown {unknown}"
+            f" missing {missing}, unknown {_quote(repr(unknown))}"
         )
     backend = evidence["backend"]
     if backend not in PROVIDER_BACKENDS and backend != "ida":
         raise ProviderEvidenceError(
-            f"backend must name a backend this server knows, got {backend!r}"
+            f"backend must name a backend this server knows, got"
+            f" {_quote(repr(backend))}"
         )
     state = evidence["state"]
     if state not in _EVIDENCE_STATES:
         raise ProviderEvidenceError(
-            f"state must be one of {sorted(_EVIDENCE_STATES)}, got {state!r}"
+            f"state must be one of {sorted(_EVIDENCE_STATES)}, got"
+            f" {_quote(repr(state))}"
         )
     index = evidence["rule_index"]
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise ProviderEvidenceError(
-            f"rule_index must be an integer >= 0, got {index!r}"
+            f"rule_index must be an integer >= 0, got {_quote(repr(index))}"
         )
     if not isinstance(evidence["ranges"], list):
         raise ProviderEvidenceError(
