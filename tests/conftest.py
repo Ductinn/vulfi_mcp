@@ -161,7 +161,6 @@ def _missing_ghidra_prerequisite() -> str | None:
     return None
 
 
-
 @pytest.fixture
 def managed_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the managed workspace at ``tmp_path`` for the duration of a test."""

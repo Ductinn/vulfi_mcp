@@ -265,6 +265,11 @@ STRING_PAGE: Final = 200
 MAX_XREF_PAGES: Final = 16
 #: Rows one ``get_xrefs_to`` page asks for.
 XREF_PAGE: Final = 200
+#: Pages of ``list_segments`` one session reads, and the rows per page. Every
+#: pass's coverage denominator comes out of this listing, so it is paged
+#: rather than capped.
+MAX_SEGMENT_PAGES: Final = 16
+SEGMENT_PAGE: Final = 512
 #: Call sites one rule's evidence covers.
 MAX_RULE_CALL_SITES: Final = 128
 #: Steps taken while deciding what defines one varnode.
@@ -540,24 +545,37 @@ def _managed_root(sha256: str) -> Path:
 
 
 def _load_record(sha256: str) -> dict[str, Any]:
-    """What this adapter remembers about one binary's managed project."""
+    """What this adapter remembers about one binary's managed project.
+
+    Every key it writes is read back. ``project`` in particular: it is the
+    only witness that a managed project exists when the workspace is mapped
+    somewhere this host cannot see, and a loader that dropped it turned the
+    second half of the create-project guard into dead code that the next
+    ``_store_record`` then erased from disk.
+    """
+    empty: dict[str, Any] = {
+        "binary_sha256": sha256,
+        "revision": 0,
+        "defined": [],
+        "project": None,
+    }
     path = _managed_root(sha256) / "record.json"
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"binary_sha256": sha256, "revision": 0, "defined": []}
+        return empty
     if not isinstance(stored, dict):
-        return {"binary_sha256": sha256, "revision": 0, "defined": []}
+        return empty
     revision = stored.get("revision")
     defined = stored.get("defined")
+    project = stored.get("project")
     return {
         "binary_sha256": sha256,
         "revision": revision if isinstance(revision, int) and revision >= 0 else 0,
-        "defined": [
-            item for item in defined if isinstance(item, int) and item >= 0
-        ]
+        "defined": [item for item in defined if isinstance(item, int) and item >= 0]
         if isinstance(defined, list)
         else [],
+        "project": project if isinstance(project, str) and project else None,
     }
 
 
@@ -596,7 +614,20 @@ def _project(config: ProviderConfig, sha256: str) -> tuple[str, str]:
 
 
 async def _call(session: ProviderSession, tool: str, **arguments: Any) -> str:
-    """One allowlisted call, returned as the text the provider produced."""
+    """One allowlisted call, as text, or a failure — never as nothing.
+
+    **This is the only place a reply is judged to have succeeded**, and every
+    reply passes through it, the JSON ones and the plain-text ones alike. The
+    bridge answers a refused operation with ``isError`` false and an error
+    document in the body, so a parser downstream that is handed that body
+    reads no rows out of it and returns an empty list — and "the program moved
+    out from under us" becomes "we looked and there was nothing", which is the
+    one inversion this adapter exists to prevent.
+
+    The invariant is flat and lives here rather than in each parser: *a read
+    that did not succeed never becomes an empty collection.* ``_call_json``
+    only has to parse what this already accepted.
+    """
     pinned = PINNED_SCHEMAS.get(tool)
     if not pinned:
         raise GhidraUnavailableError(
@@ -606,26 +637,45 @@ async def _call(session: ProviderSession, tool: str, **arguments: Any) -> str:
     reply = await checked_call(session, tool, dict(arguments), pinned)
     structured = reply.get("structured")
     if isinstance(structured, dict) and isinstance(structured.get("result"), str):
-        return structured["result"]
-    text = reply.get("text")
-    if isinstance(text, list) and all(isinstance(item, str) for item in text):
-        return "\n".join(text)
-    raise ProviderUnavailableError(
-        f"the ghidra provider's {tool!r} reply carried neither a result string"
-        " nor text blocks, so there is nothing in it to read"
-    )
+        text = structured["result"]
+    else:
+        blocks = reply.get("text")
+        if not isinstance(blocks, list) or not all(
+            isinstance(item, str) for item in blocks
+        ):
+            raise ProviderUnavailableError(
+                f"the ghidra provider's {tool!r} reply carried neither a result"
+                " string nor text blocks, so there is nothing in it to read"
+            )
+        text = "\n".join(blocks)
+    _refuse_failures(tool, text)
+    return text
+
+
+def _refuse_failures(tool: str, text: str) -> None:
+    """Raise when ``text`` is this provider's way of spelling a failure."""
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return
+    try:
+        document = json.loads(stripped)
+    except ValueError:
+        return
+    if not isinstance(document, dict):
+        return
+    failure = document.get("error")
+    if failure is None and document.get("success") is not False:
+        return
+    described = f"the ghidra provider refused {tool!r}: {failure or document}"
+    if _is_contention(str(failure or document)):
+        raise ProviderBusyError(described)
+    raise ProviderUnavailableError(described)
 
 
 async def _call_json(
     session: ProviderSession, tool: str, **arguments: Any
 ) -> dict[str, Any]:
-    """One call whose reply is a JSON object, with its failures made failures.
-
-    The bridge answers a refused operation with ``isError`` false and an
-    ``error`` document in the text. Treating that as an empty success is how a
-    provider silently turns "I refused" into "there is nothing there", so it
-    is turned back into a failure here.
-    """
+    """One call whose reply is a JSON object, already known to have succeeded."""
     raw = await _call(session, tool, **arguments)
     try:
         document = json.loads(raw)
@@ -639,34 +689,33 @@ async def _call_json(
             f"the ghidra provider's {tool!r} reply is a"
             f" {type(document).__name__}, not an object"
         )
-    failure = document.get("error")
-    if failure is not None or document.get("success") is False:
-        described = f"the ghidra provider refused {tool!r}: {failure or document}"
-        if _is_contention(str(failure or document)):
-            raise ProviderBusyError(described)
-        raise ProviderUnavailableError(described)
     return document
 
 
-#: What this provider says when something else is using it. Matched as prose
-#: on purpose, and only ever to decide *whether this adapter may proceed* —
-#: never to establish a fact. The difference matters: a shared JVM whose
-#: current program moved under us has to be reported as unavailable rather
-#: than written down as a rule that failed or a pass that found nothing.
-_CONTENTION: Final[tuple[str, ...]] = (
-    "no program loaded",
-    "no program is loaded",
-    "timed out",
-    "file is closed",
-    "closedexception",
-    "is being analyzed",
-    "another analysis",
+#: The family of things this provider says when it has no program to answer
+#: about, or when something else is using it. A *family*, deliberately spelled
+#: as one pattern rather than a list of literals: the server source carries a
+#: dozen wordings of "no program", and a set that has to enumerate them is a
+#: set that is one wording out of date. It is only ever a hint about *how* to
+#: report a failure this adapter has already refused to treat as a result —
+#: whether the provider is busy (skip) or broken (fail). Whether a foreign
+#: program is loaded is asked of :func:`_foreign_programs`, not of prose.
+_CONTENTION: Final = re.compile(
+    # "no program(s)" — but not "the project has no program files", which is
+    # this provider's way of saying a program is not in a project yet, and is
+    # an ordinary branch rather than contention.
+    r"no programs?\b(?! files)"
+    r"|program (?:is )?not (?:loaded|open)"
+    r"|not currently open"
+    r"|timed out|timeout"
+    r"|file is closed|closedexception"
+    r"|is being analy[sz]ed|another analysis",
+    re.IGNORECASE,
 )
 
 
 def _is_contention(message: str) -> bool:
-    lowered = message.lower()
-    return any(marker in lowered for marker in _CONTENTION)
+    return _CONTENTION.search(message) is not None
 
 
 # --------------------------------------------------------------------------
@@ -677,7 +726,15 @@ def _is_contention(message: str) -> bool:
 class _Program:
     """One open program, and everything about it this session measured."""
 
-    __slots__ = ("base", "mutated", "name", "project", "remote", "segments")
+    __slots__ = (
+        "base",
+        "mutated",
+        "name",
+        "project",
+        "remote",
+        "segment_cap",
+        "segments",
+    )
 
     def __init__(
         self,
@@ -687,6 +744,7 @@ class _Program:
         remote: str,
         base: int,
         segments: list[dict[str, Any]],
+        segment_cap: str | None,
         mutated: bool,
     ) -> None:
         self.name = name
@@ -694,6 +752,10 @@ class _Program:
         self.remote = remote
         self.base = base
         self.segments = segments
+        #: Why the block listing is incomplete, when it is. Every pass's
+        #: coverage is measured over ``segments``, so a pass that ran against a
+        #: cut-short listing may not report ``complete``.
+        self.segment_cap = segment_cap
         #: Whether this session has written anything to the open program.
         self.mutated = mutated
 
@@ -703,12 +765,29 @@ async def _open_program(
 ) -> _Program:
     """Open the managed project and the program in it, analysing it once.
 
-    The project is opened before it is created, and it is created **only**
+    Two refusals come before anything that could destroy somebody else's work,
+    and the order is the point.
+
+    First, **a foreign program is refused before the project is touched at
+    all**. A failed ``open_project`` closes whatever program the JVM was
+    holding, so a check that runs after it has nothing left to see: this
+    adapter would have evicted another client's program and then reported a
+    clean run. The question is asked of the provider's state —
+    ``list_open_programs`` says how many and which — never of its prose.
+
+    Second, the project is opened before it is created, and created **only**
     when nothing says one is already there: ``create_project`` on a name that
     already exists empties it, so treating every ``open_project`` failure as
     "it does not exist yet" would turn a stale lock or a transient refusal
     into the loss of every earlier revision.
     """
+    foreign = await _foreign_programs(session)
+    if foreign:
+        raise ProviderBusyError(
+            f"the ghidra provider is holding {foreign} open, which this session"
+            " did not open and may not close or evict; it works against"
+            f" exactly one program and this target is {session.remote_path}"
+        )
     parent, name = _project(config, session.binary_sha256)
     path = f"{parent}/{name}.gpr"
     record = _load_record(session.binary_sha256)
@@ -746,13 +825,14 @@ async def _open_program(
         # result rests on, so the revision this session reports has to move.
         await _call_json(session, "run_analysis")
         analysed = True
-    segments = await _segments(session)
+    segments, segment_cap = await _segments(session)
     return _Program(
         name=title,
         project=name,
         remote=program,
         base=base,
         segments=segments,
+        segment_cap=segment_cap,
         mutated=analysed,
     )
 
@@ -760,17 +840,51 @@ async def _open_program(
 def _existing_project(sha256: str, name: str, record: Mapping[str, Any]) -> str | None:
     """Why this adapter believes a managed project is already there, or ``None``.
 
-    Two independent witnesses, because either one can be absent: the project
-    directory on this host (when the workspace really is this host's, which it
-    is whenever the operator mapped it to itself) and this adapter's own
-    record of having created it.
+    Two independent witnesses, because either one can be absent. The project
+    directory *on this host* answers whenever the operator mapped the managed
+    workspace to itself, which is the ordinary co-located case — but
+    :func:`_project` translates that root through the operator's binary map,
+    so for a genuinely remote workspace the ``.gpr`` never exists here. The
+    second witness covers exactly that case: this adapter's own record of
+    having created the project, which :func:`_load_record` carries forward
+    precisely so this check can fire when the filesystem cannot answer.
     """
     local = _managed_root(sha256)
     if (local / f"{name}.gpr").exists() or (local / f"{name}.rep").is_dir():
         return f"{local / f'{name}.gpr'} is on this host"
     if record.get("project") == name:
-        return "this server's own record says it created that project already"
+        return (
+            "this server's own record of this binary says it created that"
+            " project already"
+        )
     return None
+
+
+async def _foreign_programs(session: ProviderSession) -> list[str]:
+    """Every program this provider holds that is not the operator's target.
+
+    Asked of the provider's state rather than of its prose, and asked before
+    anything that could evict one. ``list_open_programs`` is the only typed
+    answer to "whose JVM is this right now", and it is the primary signal for
+    every busy refusal below.
+    """
+    open_now = await _call_json(session, "list_open_programs")
+    programs = open_now.get("programs")
+    if not isinstance(programs, list):
+        raise ProviderUnavailableError(
+            "the ghidra provider's open-program listing is not a list, so"
+            " there is no way to tell whose program it is holding"
+        )
+    held: list[str] = []
+    for entry in programs:
+        if not isinstance(entry, dict):
+            raise ProviderUnavailableError(
+                "the ghidra provider's open-program listing holds an entry"
+                " that is not an object"
+            )
+        if entry.get("executable_path") != session.remote_path:
+            held.append(str(entry.get("executable_path") or entry.get("name")))
+    return held
 
 
 async def _load(session: ProviderSession) -> str:
@@ -785,28 +899,28 @@ async def _load(session: ProviderSession) -> str:
     """
     remote = session.remote_path
     stem = Path(remote).name
-    open_now = await _call_json(session, "list_open_programs")
-    programs = open_now.get("programs")
-    foreign: list[str] = []
-    mine: str | None = None
-    for entry in programs if isinstance(programs, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("executable_path") == remote and mine is None:
-            mine = str(entry.get("path") or f"/{stem}")
-            continue
-        foreign.append(str(entry.get("executable_path") or entry.get("name")))
+    foreign = await _foreign_programs(session)
     if foreign:
         raise ProviderBusyError(
             f"the ghidra provider is holding {foreign} open, which this"
             f" session did not open and may not close; it works against"
             f" exactly one program and this target is {remote}"
         )
+    open_now = await _call_json(session, "list_open_programs")
+    programs = open_now.get("programs")
+    mine: str | None = None
+    for entry in programs if isinstance(programs, list) else []:
+        if isinstance(entry, dict) and entry.get("executable_path") == remote:
+            mine = str(entry.get("path") or f"/{stem}")
+            break
     if mine is not None:
         return mine
     try:
         loaded = await _call_json(session, "load_program_from_project", path=f"/{stem}")
-    except ProviderUnavailableError:
+    except ProviderError:
+        # Not in the project yet — the ordinary first-run branch. A provider
+        # that is really unusable fails again on the import below, loudly and
+        # with its own words, rather than being guessed at from this one.
         loaded = await _call_json(session, "load_program", file=remote)
     path = loaded.get("path")
     return str(path) if isinstance(path, str) else f"/{stem}"
@@ -898,7 +1012,7 @@ def _hex(address: int) -> str:
     return f"0x{address:x}"
 
 
-async def _segments(session: ProviderSession) -> list[dict[str, Any]]:
+async def _segments(session: ProviderSession) -> tuple[list[dict[str, Any]], str | None]:
     """Every memory block with a numeric address, as half-open ranges.
 
     Ghidra's listing is inclusive at both ends and spells an overlay block
@@ -906,18 +1020,34 @@ async def _segments(session: ProviderSession) -> list[dict[str, Any]]:
     address space. Those are left out here and named in a warning by the pass
     that wanted them, rather than being folded into an address that is not
     theirs.
+
+    Paged, and the second return value says when the paging ran out. This one
+    matters more than the other bounded reads: **every pass computes its
+    coverage over these blocks**, so a listing silently cut short shrinks the
+    denominator and lets a pass report ``complete`` over blocks it never saw.
     """
     blocks: list[dict[str, Any]] = []
-    for line in (await _call(session, "list_segments", limit=512)).splitlines():
-        match = _SEGMENT_LINE.match(line.strip())
-        if match is None:
-            continue
-        start = _address(match["start"])
-        end = _address(match["end"])
-        if start is None or end is None or end < start:
-            continue
-        blocks.append({"name": match["name"], "start": start, "end": end + 1})
-    return blocks
+    for page in range(MAX_SEGMENT_PAGES):
+        text = await _call(
+            session, "list_segments", limit=SEGMENT_PAGE, offset=page * SEGMENT_PAGE
+        )
+        lines = [line for line in text.splitlines() if line.strip()]
+        for line in lines:
+            match = _SEGMENT_LINE.match(line.strip())
+            if match is None:
+                continue
+            start = _address(match["start"])
+            end = _address(match["end"])
+            if start is None or end is None or end < start:
+                continue
+            blocks.append({"name": match["name"], "start": start, "end": end + 1})
+        if len(lines) < SEGMENT_PAGE:
+            return blocks, None
+    return blocks, (
+        f"the provider's memory-block listing did not end within"
+        f" {MAX_SEGMENT_PAGES * SEGMENT_PAGE} blocks, so every coverage below"
+        " is measured over part of the image rather than over all of it"
+    )
 
 
 async def _functions(session: ProviderSession) -> list[dict[str, Any]]:
@@ -983,7 +1113,7 @@ async def _extents(
     ordered = sorted(entries)
     spans: dict[int, int] = {}
     measured: set[int] = set()
-    budget = ordered[:MAX_FUNCTION_EXTENTS]
+    budget = set(ordered[:MAX_FUNCTION_EXTENTS])
     for index, entry in enumerate(ordered):
         if entry in budget:
             flow: dict[str, Any] | None
@@ -1683,6 +1813,13 @@ def _pass_result(
         coverage = "complete"
     else:
         coverage = "partial"
+    if program.segment_cap is not None:
+        # The ranges below are every block this session could see, and it could
+        # not see them all. A pass cannot be complete over a denominator that
+        # was itself cut short.
+        warnings = [program.segment_cap, *warnings]
+        if coverage == "complete":
+            coverage = "partial"
     return {
         "pass": name,
         "backend": BACKEND,
@@ -2362,10 +2499,11 @@ async def _apply_layout(
             }
             for field in fields
         ]
-    except KeyError:
+    except KeyError as missing:
         report["reason"] = (
-            "this layout has a field whose width this provider has no plain"
-            f" type for; the widths it does are {sorted(_FIELD_TYPES)}"
+            f"this layout has a field this adapter cannot spell for the"
+            f" provider ({missing}); a field needs an offset, a name, and one"
+            f" of the widths {sorted(_FIELD_TYPES)}"
         )
         return
     answer = await _call(

@@ -34,12 +34,16 @@ import os
 import shutil
 import struct
 import subprocess
+import tempfile
 import time
+import urllib.request
 from collections.abc import Awaitable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import pytest
+from _pytest.outcomes import Failed
 from conftest import (
     FIXTURES,
     GHIDRA_START_HINT,
@@ -66,9 +70,16 @@ CC_FLAGS = ("-O0", "-fno-builtin", "-fno-inline", "-fPIE", "-pie")
 
 ALL_PASSES = ("strings", "functions", "structures", "pointer_tables")
 
-#: Where the exclusive lock on the shared provider lives. Beside the bridge,
-#: so every checkout driving the same server contends on the same file.
-PROVIDER_LOCK = Path(ghidra_bridge()).parent.parent / "vulfi-provider.lock"
+#: Where the exclusive lock on the shared provider lives. Keyed on the
+#: *endpoint*, because that is what identifies the JVM: two checkouts with
+#: different ``VULFI_GHIDRA_BRIDGE`` values pointed at one server must contend
+#: on one file, and keying it on the bridge executable meant they did not.
+#: It is in the system temporary directory so every user of that server can
+#: name it from the URL alone, which is the only coordinate they all share.
+PROVIDER_LOCK = Path(tempfile.gettempdir()) / "vulfi-ghidra-{}-{}.lock".format(
+    urlsplit(ghidra_url()).hostname or "127.0.0.1",
+    urlsplit(ghidra_url()).port or 80,
+)
 
 #: How long to wait for another process to let go of that server.
 LOCK_TIMEOUT = 300.0
@@ -882,3 +893,154 @@ def test_the_adapter_allowlist_is_a_constant_no_caller_can_widen() -> None:
         if "script" in name or "command" in name or "eval" in name
     }
     assert set(json.loads(json.dumps(sorted(ALLOWLIST)))) == set(ALLOWLIST)
+
+
+class _RefusingSession:
+    """A session stand-in whose every reply is the provider's own refusal."""
+
+    backend = BACKEND
+    binary_sha256 = "0" * 64
+    remote_path = "/srv/samples/vulfi_fallback"
+
+    def __init__(self, body: str) -> None:
+        self.body = body
+        self.asked: list[str] = []
+
+
+@pytest.fixture
+def refusing(monkeypatch: pytest.MonkeyPatch):
+    """Make every allowlisted call answer one body, as the live bridge does."""
+
+    def build(body: str) -> _RefusingSession:
+        from vulfi_mcp.providers import ghidra
+
+        session = _RefusingSession(body)
+
+        async def answer(
+            held: Any, tool: str, arguments: dict[str, object], fingerprint: str
+        ) -> dict[str, object]:
+            held.asked.append(tool)
+            return {"tool": tool, "structured": {"result": body}, "text": [body]}
+
+        monkeypatch.setattr(ghidra, "checked_call", answer)
+        return session
+
+    return build
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":"No program loaded."}',
+        '{"error":"No programs are currently open"}',
+        '{"error":"Analysis failed: ghidra.util.exception.ClosedException:'
+        ' File is closed"}',
+        '{"error":"timed out"}',
+        '{"success":false,"error":"Program is not open"}',
+    ],
+)
+def test_a_read_that_did_not_succeed_is_never_an_empty_collection(
+    refusing: Any, body: str
+) -> None:
+    """Every parser, text and JSON alike, refuses rather than returning nothing.
+
+    The live server answers ``list_functions``, ``get_xrefs_to``,
+    ``list_strings`` and ``list_segments`` with a JSON error body when its
+    program has moved. Those four return plain text, and classifying failures
+    only in the JSON helper left them handing that body to a line parser that
+    read no rows out of it — ``[]``, ``([], None)``, ``(set(), None)``,
+    ``[]``. A program that moved mid-run was recorded as "we looked and there
+    was nothing", which is the inversion this adapter exists to prevent.
+    """
+    from vulfi_mcp.providers import ghidra
+
+    session = refusing(body)
+    reads = (
+        ghidra._functions(session),
+        ghidra._segments(session),
+        ghidra._defined_strings(session),
+        ghidra._xrefs(session, 0x101000),
+        ghidra._function_pcode(session, 0x101000),
+        ghidra._read(session, 0x101000, 16),
+    )
+    for read in reads:
+        with pytest.raises(ghidra.ProviderBusyError):
+            asyncio.run(read)
+
+
+def test_a_refusal_that_is_not_contention_still_refuses(refusing: Any) -> None:
+    """A failure this adapter cannot call "busy" is still never an empty read."""
+    from vulfi_mcp.providers import ghidra
+
+    session = refusing('{"error":"Address 0x999999 is not in any memory block"}')
+    with pytest.raises(ghidra.ProviderUnavailableError) as refused:
+        asyncio.run(ghidra._functions(session))
+    assert not isinstance(refused.value, ghidra.ProviderBusyError)
+
+
+def test_a_successful_text_reply_is_still_text(refusing: Any) -> None:
+    """The boundary refuses failures without eating the ordinary answers."""
+    from vulfi_mcp.providers import ghidra
+
+    session = refusing("main at 00101320\nFUN_00101390 at 00101390\n")
+    assert asyncio.run(ghidra._functions(session)) == [
+        {"entry": 0x101320, "name": "main"},
+        {"entry": 0x101390, "name": "FUN_00101390"},
+    ]
+    # A JSON body with no error is a success too, and is not mistaken for one.
+    session = refusing('{"programs":[],"count":0,"current_program":""}')
+    assert asyncio.run(ghidra._foreign_programs(session)) == []
+
+
+@pytest.mark.requires_ghidra
+def test_a_foreign_program_is_refused_before_anything_can_evict_it(
+    compiled_fallback: Path, ghidra_config: Path, managed_data_dir: Path
+) -> None:
+    """The suite does not survive other work on the JVM by taking the JVM.
+
+    A *failed* ``open_project`` closes whatever program the server was
+    holding, so the check that used to run after it had nothing left to see:
+    another client's program was evicted and the run reported clean. The
+    refusal now happens first, and is asked of ``list_open_programs`` rather
+    than of any error prose.
+    """
+    foreign = Path(shutil.which("ls") or "/bin/ls").resolve()
+    _load_foreign(foreign)
+    try:
+        with pytest.raises(Failed) as refused:
+            live(
+                prepare_ghidra(str(compiled_fallback), ("functions",))
+            )
+        assert str(foreign) in str(refused.value), refused.value
+        # And it is still there: nothing was evicted to make room.
+        assert _open_executables() == [str(foreign)], _open_executables()
+    finally:
+        _close_foreign()
+
+
+def _request(path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{ghidra_url()}/{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(
+        url, data=data, method="POST" if data else "GET"
+    )
+    if data:
+        request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=120) as handle:
+        return json.loads(handle.read().decode())
+
+
+def _open_executables() -> list[str]:
+    return [
+        str(row.get("executable_path"))
+        for row in _request("list_open_programs").get("programs", [])
+    ]
+
+
+def _load_foreign(binary: Path) -> None:
+    _request("load_program", {"file": str(binary)})
+
+
+def _close_foreign() -> None:
+    for row in _request("list_open_programs").get("programs", []):
+        _request("close_program", {"name": row.get("name")})
