@@ -1,9 +1,10 @@
 """Preparation passes over a managed IDA analysis.
 
 Before a scan can say anything trustworthy about a target, the analysis it
-reads has to contain the functions and the strings that are really there.
-This module is the host side of that work: it checks a request, hands it to
-the one worker operation that does it, and returns what came back.
+reads has to contain the functions, the strings, the object layouts and the
+pointer tables that are really there. This module is the host side of that
+work: it checks a request, hands it to the one worker operation that does
+it, and returns what came back.
 
 Three things are deliberately *not* here.
 
@@ -47,7 +48,10 @@ __all__ = [
 #: The passes this build runs, in the order dependencies require. ``strings``
 #: recovers raw mapped bytes on its own, but the buffers that exist only in
 #: instructions need ``functions`` to have run first, and a request that
-#: leaves ``functions`` out is told which stage that cost it.
+#: leaves ``functions`` out is told which stage that cost it. ``structures``
+#: and ``pointer_tables`` read the analysis as they find it, and run last
+#: because a function the first pass recovers is one whose operands and
+#: whose entry they can then see.
 PASSES: Final[tuple[str, ...]] = PREPARE_PASSES
 
 #: The ceilings one run may spend. A request may lower any of these and

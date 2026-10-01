@@ -131,17 +131,6 @@ def test_an_unknown_pass_is_refused_by_name(tmp_path: Path) -> None:
     assert not (tmp_path / "nothing.i64").exists()
 
 
-def test_a_pass_this_build_does_not_implement_is_not_silently_dropped(
-    tmp_path: Path,
-) -> None:
-    # `structures` is a real pass in the design and arrives with Plan 2's
-    # Task 3. Accepting it now and running `functions` instead would report a
-    # coverage this build never produced.
-    with pytest.raises(PreparationError) as refused:
-        run_ida_passes(str(tmp_path / "nothing.i64"), ("structures",))
-    assert "structures" in str(refused.value)
-
-
 def test_an_empty_pass_list_is_refused(tmp_path: Path) -> None:
     with pytest.raises(PreparationError):
         run_ida_passes(str(tmp_path / "nothing.i64"), ())

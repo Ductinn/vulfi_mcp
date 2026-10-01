@@ -3405,7 +3405,7 @@ def _store_findings(
 # ---------------------------------------------------------------------------
 # Preparation operation: what one IDA database can recover before a scan.
 #
-# Two passes live here. ``functions`` looks at the executable bytes no
+# Four passes live here. ``functions`` looks at the executable bytes no
 # function owns and at the addresses something references, decodes what it
 # finds, and defines a function only where a call, a jump, a relocated
 # pointer or an ELF symbol says the address is an entry point and the decode
@@ -3413,7 +3413,13 @@ def _store_findings(
 # ``strings`` reads mapped bytes directly — never IDA's string list — and
 # decodes bounded ASCII and both UTF-16 byte orders, then walks the
 # instructions of the functions the first pass left behind and recovers the
-# buffers they assemble out of immediate operands.
+# buffers they assemble out of immediate operands. ``structures`` reads the
+# sized operands that really touch one named data object and defines a
+# layout only where every access at an offset agrees on its width and the
+# offsets tile the object. ``pointer_tables`` reads the loader's own
+# relocation records at pointer-width aligned slots, follows each stored
+# value into the image, and defines a table only where a relocation backs
+# every slot of a run and every target lands somewhere mapped.
 #
 # Three rules shape every line below.
 #
@@ -3432,17 +3438,24 @@ def _store_findings(
 # silent truncation anywhere in this section.
 #
 # **The original bytes are not ours.** Everything here writes to the managed
-# database the worker already has open, through IDA's own ``add_func`` and
-# ``create_strlit``, and the adapter saves it once at the end of the lease
-# behind the rescue copy ``_save_session`` takes. There is no second save
-# route, and no path from here to the operator's binary or supplied IDB.
+# database the worker already has open, through IDA's own ``add_func``,
+# ``create_strlit`` and ``apply_tinfo``, and the adapter saves it once at the
+# end of the lease behind the rescue copy ``_save_session`` takes. There is
+# no second save route, and no path from here to the operator's binary or
+# supplied IDB.
 # ---------------------------------------------------------------------------
 
-#: The preparation passes this build runs, in dependency order. The design
-#: defines ``structures`` and ``pointer_tables`` as well; Plan 2's Task 3
-#: implements them, and until it does they are refused by name rather than
-#: reported as a coverage this build never produced.
-PREPARE_PASSES: Final[tuple[str, ...]] = ("functions", "strings")
+#: The preparation passes this build runs, in dependency order. ``strings``
+#: needs ``functions`` for its instruction stage; the two data passes read
+#: the analysis as they find it and stand on their own, and run last because
+#: a function the first pass recovers is a function whose operands and whose
+#: entry the last two can then see.
+PREPARE_PASSES: Final[tuple[str, ...]] = (
+    "functions",
+    "strings",
+    "structures",
+    "pointer_tables",
+)
 
 #: Ceilings on one preparation run. A payload may lower a bound, never raise
 #: one, and a pass that hits a bound says which addresses it never reached.
@@ -3515,6 +3528,37 @@ _X86: Final = "metapc"
 #: The frame-pointer register of that processor, in both bitnesses.
 _FRAME_POINTER: Final = 5
 
+#: Fields one object needs before its layout is a structure rather than a
+#: variable. One offset accessed at one width is a typed global, and calling
+#: that a structure would bury the objects that really have a layout.
+MIN_STRUCTURE_FIELDS: Final = 2
+#: Bytes of one data object this pass will examine. An object larger than
+#: this is named in a warning rather than walked: the cost of reading every
+#: referenced byte of a multi-megabyte array is charged to a run that has
+#: other ranges to get to.
+MAX_STRUCTURE_BYTES: Final = 4096
+#: Instructions quoted as the use sites of one field. The counts of reads
+#: and of writes are always exact; this bounds only how many are quoted.
+MAX_QUOTED_USE_SITES: Final = 8
+#: Prefix of every type this pass creates. The name carries the address the
+#: layout was proven at and nothing else: a name that guessed at what the
+#: object is for would be an inference this pass has no evidence for, and
+#: the design keeps those as proposals.
+_STRUCTURE_TYPE_PREFIX: Final = "vulfi_prep_struct_"
+#: Widths a field may have. A sized operand of any other width is evidence
+#: about bytes, not about a field this build can spell as a type.
+_FIELD_WIDTHS: Final = (1, 2, 4, 8)
+#: What ``tinfo_t.get_size`` answers for a type with no size of its own.
+_UNKNOWN_TYPE_SIZE: Final = 0xFFFF_FFFF_FFFF_FFFF
+
+#: Consecutive relocated slots one run needs before it is called a table.
+#: One relocated pointer is a pointer, not a table, and the ones that form
+#: no run are counted into a warning rather than reported one by one.
+MIN_POINTER_TABLE_ENTRIES: Final = 2
+#: Entries quoted in one table candidate's evidence. ``entry_count`` is
+#: always the whole run.
+MAX_QUOTED_TABLE_ENTRIES: Final = 64
+
 #: Confidences this build publishes. They order candidates for review; none
 #: of them is proof, and ``applied`` is the only claim that the database
 #: changed.
@@ -3576,9 +3620,9 @@ class _PrepareBudget:
 def validate_prepare_passes(value: object) -> tuple[str, ...]:
     """The passes to run, in dependency order, or exactly what is wrong.
 
-    ``None`` means every pass this build implements. A name the design
-    defines but this build does not run is refused by name: accepting it and
-    running something else would report a coverage nothing produced.
+    ``None`` means all four of them. A name outside that set is refused by
+    name: accepting it and running something else would report a coverage
+    nothing produced.
     """
     if value is None:
         return PREPARE_PASSES
@@ -3690,6 +3734,7 @@ class _Preparation:
 
     def __init__(self, payload: dict[str, object]) -> None:
         import ida_bytes
+        import ida_fixup
         import ida_funcs
         import ida_ida
         import ida_idp
@@ -3697,18 +3742,21 @@ class _Preparation:
         import ida_nalt
         import ida_name
         import ida_segment
+        import ida_typeinf
         import ida_ua
         import ida_xref
         import idaapi
         import idautils
 
         self._bytes = ida_bytes
+        self._fixup = ida_fixup
         self._funcs = ida_funcs
         self._idp = ida_idp
         self._loader = ida_loader
         self._nalt = ida_nalt
         self._names = ida_name
         self._segment = ida_segment
+        self._types = ida_typeinf
         self._ua = ida_ua
         self._xref = ida_xref
         self._api = idaapi
@@ -3720,6 +3768,19 @@ class _Preparation:
         self._processor = ida_ida.inf_get_procname()
         self._bits = 64 if ida_ida.inf_is_64bit() else 32
         self._image_base = idaapi.get_imagebase()
+        #: Width and byte order of one pointer in this image, as the
+        #: database itself reports them. Every table below is read with
+        #: these two and reports them with its evidence, because "these
+        #: bytes are a pointer" is a claim about both.
+        self._pointer_width = self._bits // 8
+        self._endianness = "big" if ida_ida.inf_is_be() else "little"
+        #: The loader's own relocation kinds, by the code a fixup carries,
+        #: so a cited relocation is named rather than numbered.
+        self._fixup_names = {
+            getattr(ida_fixup, name): name
+            for name in dir(ida_fixup)
+            if name.startswith("FIXUP_")
+        }
         #: The IDA string type each encoding is defined with, where there is
         #: one. IDA 9.4 registers UTF-8, UTF-16LE and UTF-32LE and no
         #: big-endian UTF-16, so a UTF-16BE run is reported and not defined.
@@ -3755,17 +3816,24 @@ class _Preparation:
         #: How far along the segment being scanned a recovered run already
         #: reaches, so a run read across a read step is reported once.
         self._claimed = 0
+        #: Objects whose extent is past :data:`MAX_STRUCTURE_BYTES`, and
+        #: relocated pointers that formed no run at all, counted rather than
+        #: reported one by one for the same reason padding slots are.
+        self._oversized_objects = 0
+        self._lone_pointers = 0
 
     # -- entry point ------------------------------------------------------
 
     def run(self) -> dict[str, object]:
         record, _ = _read_record()
         preparation = record["preparation"]
-        results: list[dict[str, object]] = []
-        for name in self._passes:
-            results.append(
-                self._functions_pass() if name == "functions" else self._strings_pass()
-            )
+        runners = {
+            "functions": self._functions_pass,
+            "strings": self._strings_pass,
+            "structures": self._structures_pass,
+            "pointer_tables": self._pointer_tables_pass,
+        }
+        results = [runners[name]() for name in self._passes]
         revision = preparation.get("revision") or 0
         if self._applied:
             # The managed artifact changed, so the revision these results
@@ -4900,6 +4968,926 @@ class _Preparation:
                 },
             }
         )
+
+    # -- the structures pass ------------------------------------------------
+
+    def _structures_pass(self) -> dict[str, object]:
+        """Describe what the accesses prove about one object, and no more.
+
+        The evidence is IDA's own read and write cross-references: an
+        instruction that touches one byte of a named data object with a
+        sized operand. An address being *taken* — ``dr_O``, an ``lea`` —
+        says nothing about how many bytes anything reads through it and is
+        not counted. A layout is defined only where every access at an
+        offset agrees on its width, the offsets are naturally aligned, they
+        do not overlap, and together they tile the object from its first
+        byte to its last. Anything else is uncertain packing, which the
+        design keeps as a proposal.
+        """
+        first_candidate = len(self._candidates)
+        first_applied = len(self._applied)
+        self._oversized_objects = 0
+        ranges: list[dict[str, Any]] = []
+        stopped: str | None = None
+        for segment in self._segments():
+            if segment["executable"]:
+                continue
+            if stopped is not None:
+                ranges.append(self._unreached(segment, "instructions", stopped))
+                continue
+            entry = self._range(segment, "instructions")
+            self._cursor = segment["start"]
+            try:
+                self._sweep_objects(segment, entry)
+            except _PrepareBudgetError as exhausted:
+                stopped = str(exhausted)
+                self._stop_here(entry, segment, stopped)
+            ranges.append(entry)
+        warnings = [
+            "this pass describes the objects whose use sites this analysis"
+            " records; an object nothing is seen to touch leaves no evidence"
+            " here, and its absence from this inventory is not a finding"
+        ]
+        if self._oversized_objects:
+            warnings.append(
+                f"{self._oversized_objects} named objects reach further than"
+                f" {MAX_STRUCTURE_BYTES} bytes and were not walked; their"
+                " layouts are not described either way"
+            )
+        if stopped is not None:
+            warnings.append(stopped)
+            self._warn(f"the structures pass stopped early: {stopped}")
+        return self._pass_result(
+            "structures",
+            ranges,
+            self._applied[first_applied:],
+            [row["candidate_id"] for row in self._candidates[first_candidate:]],
+            warnings,
+        )
+
+    def _sweep_objects(self, segment: dict[str, Any], entry: dict[str, Any]) -> None:
+        """Examine every named object in one data segment, in address order."""
+        bases = self._named_heads(segment)
+        skipped: list[dict[str, int]] = []
+        for index, base in enumerate(bases):
+            self._cursor = base
+            end = bases[index + 1] if index + 1 < len(bases) else segment["end"]
+            if end - base > MAX_STRUCTURE_BYTES:
+                self._oversized_objects += 1
+                skipped.append({"start": base, "end": end})
+                continue
+            accesses = self._object_accesses(base, end)
+            if len(accesses) < MIN_STRUCTURE_FIELDS:
+                # One offset, or none, is a variable. Calling that a
+                # structure would bury the objects that have a layout.
+                continue
+            self._budget.charge("candidates")
+            self._record(self._structure_candidate(segment, base, end, accesses))
+        if skipped:
+            entry["coverage"] = "partial"
+            entry["unvisited"] = skipped
+            entry["reason"] = (
+                f"{len(skipped)} objects in {segment['name']} reach further"
+                f" than {MAX_STRUCTURE_BYTES} bytes, so their accesses were"
+                " not collected and their layouts are not described"
+            )
+
+    def _named_heads(self, segment: dict[str, Any]) -> list[int]:
+        """Every named address in ``segment``, which is where objects begin.
+
+        The next name is also where this object stops: two names cannot
+        describe one object, so a field is never inferred across one.
+        """
+        found: list[int] = []
+        address = segment["start"]
+        if address < segment["end"] and self._bytes.has_name(
+            self._bytes.get_flags(address)
+        ):
+            found.append(address)
+        while address < segment["end"]:
+            self._budget.charge("seeds")
+            address = self._bytes.next_that(
+                address, segment["end"], self._bytes.has_name
+            )
+            if address == self._api.BADADDR or address >= segment["end"]:
+                break
+            found.append(address)
+        return found
+
+    def _object_accesses(
+        self, base: int, end: int
+    ) -> dict[int, dict[str, Any]]:
+        """Every sized read or write of one byte of this object, by offset."""
+        found: dict[int, dict[str, Any]] = {}
+        address = base
+        while address < end:
+            self._cursor = address
+            if self._bytes.has_xref(self._bytes.get_flags(address)):
+                self._collect_accesses(address, base, found)
+            self._budget.charge("seeds")
+            address = self._bytes.next_that(address, end, self._bytes.has_xref)
+            if address == self._api.BADADDR or address >= end:
+                break
+        return found
+
+    def _collect_accesses(
+        self, address: int, base: int, found: dict[int, dict[str, Any]]
+    ) -> None:
+        """Fold every sized access to ``address`` into its offset's evidence."""
+        instruction = self._ua.insn_t()
+        for xref in self._utils.XrefsTo(address):
+            if xref.type not in (self._xref.dr_R, self._xref.dr_W):
+                continue
+            self._budget.charge("instructions")
+            if self._ua.decode_insn(instruction, xref.frm) <= 0:
+                continue
+            for operand in instruction.ops:
+                if operand.type == self._ua.o_void:
+                    break
+                if operand.type != self._ua.o_mem or operand.addr != address:
+                    continue
+                access = "write" if xref.type == self._xref.dr_W else "read"
+                width = self._ua.get_dtype_size(operand.dtype)
+                entry = found.setdefault(
+                    address - base,
+                    {"sizes": {}, "reads": 0, "writes": 0, "use_sites": []},
+                )
+                entry["sizes"][width] = entry["sizes"].get(width, 0) + 1
+                entry["reads" if access == "read" else "writes"] += 1
+                if len(entry["use_sites"]) < MAX_QUOTED_USE_SITES:
+                    entry["use_sites"].append(
+                        {
+                            "address": xref.frm,
+                            "mnemonic": instruction.get_canon_mnem(),
+                            "text": self._disassembly(xref.frm),
+                            "access": access,
+                            "size": width,
+                        }
+                    )
+
+    def _structure_candidate(
+        self,
+        segment: dict[str, Any],
+        base: int,
+        end: int,
+        accesses: dict[int, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Describe, and where every access agrees define, one object layout."""
+        conflicts = self._offset_conflicts(base, accesses)
+        fields = [
+            (offset, next(iter(accesses[offset]["sizes"])))
+            for offset in sorted(accesses)
+            if not any(entry["offset"] == offset for entry in conflicts)
+        ]
+        layout = None if conflicts else self._layout_refusal(fields, end - base)
+        shape, stride = self._shape(fields)
+        name = f"{_STRUCTURE_TYPE_PREFIX}{base:08x}"
+        existing = self._existing_type(base)
+        state = "candidate"
+        reason = self._structure_refusal(base, existing, conflicts, layout)
+        if reason is None:
+            held = self._field_conflicts(base, fields)
+            if held:
+                reason = (
+                    "the managed database already defines "
+                    + "; ".join(held)
+                    + ", and this pass replaces nothing that is already there"
+                )
+            else:
+                failure = self._define_structure(base, fields, shape, name)
+                if failure is None:
+                    state = "applied"
+                else:
+                    reason = failure
+        return {
+            "candidate_id": f"ida:structure:{base:08x}",
+            "kind": "structure",
+            "backend": BACKEND_NAME,
+            "address_space": ADDRESS_SPACE_IMAGE,
+            "address": base,
+            "confidence": _LIKELY if conflicts or layout else _CONFIDENT,
+            "state": state,
+            "reason": reason,
+            "evidence": {
+                "stage": "instructions",
+                "method": (
+                    "sized operands recorded as read and write cross-references"
+                    " to the bytes of one named object"
+                ),
+                "object": base,
+                "object_end": end,
+                "object_size": end - base,
+                "object_name": self._names.get_name(base) or None,
+                "segment": segment["name"],
+                "shape": shape,
+                "stride": stride,
+                "type_name": name if shape == "struct" else None,
+                "field_count": len(fields),
+                "fields": [
+                    {
+                        "offset": offset,
+                        "size": width,
+                        "name": f"field_{offset:x}",
+                        "reads": accesses[offset]["reads"],
+                        "writes": accesses[offset]["writes"],
+                        "use_sites": accesses[offset]["use_sites"],
+                    }
+                    for offset, width in fields
+                ],
+                "use_site_count": sum(
+                    entry["reads"] + entry["writes"] for entry in accesses.values()
+                ),
+                "conflicts": conflicts,
+                "packing": layout,
+                "existing_type": existing,
+            },
+        }
+
+    def _offset_conflicts(
+        self, base: int, accesses: dict[int, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Offsets the accesses themselves disagree about."""
+        found: list[dict[str, Any]] = []
+        for offset in sorted(accesses):
+            sizes = sorted(accesses[offset]["sizes"])
+            if len(sizes) > 1:
+                widths = " and ".join(f"{size}" for size in sizes)
+                found.append(
+                    {
+                        "offset": offset,
+                        "sizes": sizes,
+                        "reason": (
+                            f"{base + offset:#x} is read or written {widths}"
+                            " bytes wide by different instructions, and one"
+                            " field cannot be both widths"
+                        ),
+                    }
+                )
+            elif sizes[0] not in _FIELD_WIDTHS:
+                found.append(
+                    {
+                        "offset": offset,
+                        "sizes": sizes,
+                        "reason": (
+                            f"{base + offset:#x} is touched {sizes[0]} bytes"
+                            " wide, which is not a width this build spells as"
+                            " a field"
+                        ),
+                    }
+                )
+        return found
+
+    @staticmethod
+    def _layout_refusal(
+        fields: list[tuple[int, int]], size: int
+    ) -> str | None:
+        """Why these offsets are not a layout, or ``None`` when they are."""
+        if not fields:
+            return "no offset of this object is accessed at one agreed width"
+        reach = 0
+        for offset, width in fields:
+            if offset % width:
+                return (
+                    f"offset {offset} is not a multiple of its own {width}-byte"
+                    " width, so the layout this would define is one no"
+                    " compiler produced"
+                )
+            if offset < reach:
+                return (
+                    f"offset {offset} starts inside the {reach - offset} bytes"
+                    " the previous field already covers, which is a union"
+                    " overlap rather than a field"
+                )
+            if offset > reach:
+                return (
+                    f"nothing is seen to touch the {offset - reach} bytes at"
+                    f" offset {reach}, so how this object is packed there is"
+                    " not established"
+                )
+            reach = offset + width
+        if reach != size:
+            return (
+                f"the accesses cover {reach} of this object's {size} bytes, so"
+                " the rest of it is unaccounted for"
+            )
+        return None
+
+    @staticmethod
+    def _shape(fields: list[tuple[int, int]]) -> tuple[str, int | None]:
+        """``array`` with its stride when the fields are one repeated width.
+
+        Offsets alone cannot tell an array of ``n`` elements from a record
+        of ``n`` identical fields — they lay the same bytes out the same
+        way — so the uniform case is spelled as the stride it demonstrably
+        is, and the per-field evidence is reported either way. Neither
+        spelling claims to know what the object is *for*; that inference is
+        a proposal, not something this pass writes into the database.
+        """
+        if len(fields) < MIN_STRUCTURE_FIELDS:
+            return "struct", None
+        width = fields[0][1]
+        if all(
+            size == width and offset == index * width
+            for index, (offset, size) in enumerate(fields)
+        ):
+            return "array", width
+        return "struct", None
+
+    def _structure_refusal(
+        self,
+        base: int,
+        existing: dict[str, Any] | None,
+        conflicts: list[dict[str, Any]],
+        layout: str | None,
+    ) -> str | None:
+        """Why this object is only described, or ``None`` to go and define it."""
+        if existing is not None:
+            return (
+                f"{base:#x} already carries the type {existing['name']}, which"
+                " this pass reports and never replaces; what the accesses"
+                " prove is in this candidate's evidence instead"
+            )
+        if conflicts:
+            return "; ".join(entry["reason"] for entry in conflicts)
+        return layout
+
+    def _existing_type(self, address: int) -> dict[str, Any] | None:
+        """The type the database already holds at ``address``, read back out."""
+        held = self._types.tinfo_t()
+        if not self._nalt.get_tinfo(held, address):
+            return None
+        fields: list[dict[str, Any]] = []
+        details = self._types.udt_type_data_t()
+        if held.is_udt() and held.get_udt_details(details):
+            shape = "struct"
+            fields = [
+                {
+                    "name": member.name,
+                    "offset": member.offset // 8,
+                    "size": member.size // 8,
+                }
+                for member in details
+            ]
+        elif held.is_array():
+            shape = "array"
+            width = held.get_array_element().get_size()
+            fields = [
+                {"name": f"element_{index}", "offset": index * width, "size": width}
+                for index in range(held.get_array_nelems())
+            ]
+        else:
+            shape = "scalar"
+        size = held.get_size()
+        return {
+            "name": str(held),
+            # ``tinfo_t.get_size`` answers ``BADSIZE`` for a type with no
+            # size of its own — an imported function's prototype, say — and
+            # publishing that as a number no reader could use would be worse
+            # than saying it is not known.
+            "size": None if size == _UNKNOWN_TYPE_SIZE else size,
+            "shape": shape,
+            "fields": fields,
+        }
+
+    def _field_conflicts(
+        self, base: int, fields: list[tuple[int, int]]
+    ) -> list[str]:
+        """Definitions already in the database that these fields would replace."""
+        found: list[str] = []
+        for offset, width in fields:
+            address = base + offset
+            held = self._existing_type(address)
+            if held is not None:
+                found.append(f"the type {held['name']} at {address:#x}")
+                continue
+            flags = self._bytes.get_flags(address)
+            if self._bytes.is_head(flags) and not self._bytes.is_unknown(flags):
+                size = self._bytes.get_item_size(address)
+                if size != width:
+                    found.append(
+                        f"an item of {size} bytes at {address:#x}, where the"
+                        f" accesses prove a field of {width}"
+                    )
+                    continue
+            inside = next(
+                (
+                    step
+                    for step in range(address + 1, address + width)
+                    if self._bytes.is_head(self._bytes.get_flags(step))
+                ),
+                None,
+            )
+            if inside is not None:
+                found.append(
+                    f"an item starting at {inside:#x}, inside the {width}-byte"
+                    f" field at {address:#x}"
+                )
+        return found
+
+    def _member_type(self, width: int) -> Any:
+        """An unsigned integer of ``width`` bytes: a size, not a meaning."""
+        member = self._types.tinfo_t()
+        member.create_simple_type(
+            {
+                1: self._types.BTF_UINT8,
+                2: self._types.BTF_UINT16,
+                4: self._types.BTF_UINT32,
+                8: self._types.BTF_UINT64,
+            }[width]
+        )
+        return member
+
+    def _define_structure(
+        self, base: int, fields: list[tuple[int, int]], shape: str, name: str
+    ) -> str | None:
+        """Apply the proven layout, or say why IDA would not. ``None`` is done."""
+        try:
+            if shape == "array":
+                layout = self._types.tinfo_t()
+                if not layout.create_array(
+                    self._member_type(fields[0][1]), len(fields)
+                ):
+                    return (
+                        f"IDA refused to build an array of {len(fields)} by"
+                        f" {fields[0][1]} bytes for {base:#x}"
+                    )
+            else:
+                table = self._types.get_idati()
+                # ``tinfo_t.get_named_type`` is the lookup that answers
+                # "is this name a type": the module-level ``get_named_type``
+                # needs ``NTF_TYPE`` and returns ``None`` for a registered
+                # type without it, which is a guard that never fires.
+                if self._types.tinfo_t().get_named_type(table, name):
+                    return (
+                        f"this database already holds a type called {name},"
+                        " which this pass reports and never replaces"
+                    )
+                record = self._types.udt_type_data_t()
+                record.is_union = False
+                for offset, width in fields:
+                    member = self._types.udm_t()
+                    member.name = f"field_{offset:x}"
+                    member.offset = offset * 8
+                    member.size = width * 8
+                    member.type = self._member_type(width)
+                    record.push_back(member)
+                layout = self._types.tinfo_t()
+                if not layout.create_udt(record):
+                    return f"IDA refused to build a structure for {base:#x}"
+                code = layout.set_named_type(table, name)
+                if code != 0:
+                    return (
+                        f"IDA refused to register the type {name} for"
+                        f" {base:#x}: tinfo code {code}"
+                    )
+            applied = bool(
+                self._types.apply_tinfo(
+                    base, layout, self._types.TINFO_DEFINITE
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+            return (
+                f"IDA refused to type {base:#x}:"
+                f" {type(error).__name__}: {error}"
+            )
+        if not applied:
+            return f"IDA refused to apply a layout at {base:#x}"
+        return None
+
+    # -- the pointer tables pass --------------------------------------------
+
+    def _pointer_tables_pass(self) -> dict[str, object]:
+        """Read the loader's relocations, and define only what they back.
+
+        A slot is a pointer because a relocation record says the loader
+        writes an address into it, not because the integer there happens to
+        land somewhere mapped. Runs of consecutive relocated slots are
+        tables; runs of aligned integers that merely look like pointers are
+        reported with that reason and are never defined.
+        """
+        first_candidate = len(self._candidates)
+        first_applied = len(self._applied)
+        self._lone_pointers = 0
+        ranges: list[dict[str, Any]] = []
+        stopped: str | None = None
+        for segment in self._segments():
+            if segment["executable"]:
+                continue
+            if stopped is not None:
+                ranges.append(self._unreached(segment, "raw_bytes", stopped))
+                continue
+            entry = self._range(segment, "raw_bytes")
+            self._cursor = segment["start"]
+            try:
+                self._sweep_slots(segment, entry)
+            except _PrepareBudgetError as exhausted:
+                stopped = str(exhausted)
+                self._stop_here(entry, segment, stopped)
+            ranges.append(entry)
+        warnings = [
+            "this pass is an inventory of the tables the relocation records"
+            f" and the {self._pointer_width}-byte aligned mapped bytes"
+            " justify; it is not a claim that every pointer in this image"
+            " was enumerated"
+        ]
+        if self._lone_pointers:
+            warnings.append(
+                f"{self._lone_pointers} relocated pointers stand alone rather"
+                " than in a run, and one pointer is not a table; they are"
+                " counted here rather than reported one by one"
+            )
+        if stopped is not None:
+            warnings.append(stopped)
+            self._warn(f"the pointer_tables pass stopped early: {stopped}")
+        return self._pass_result(
+            "pointer_tables",
+            ranges,
+            self._applied[first_applied:],
+            [row["candidate_id"] for row in self._candidates[first_candidate:]],
+            warnings,
+        )
+
+    def _sweep_slots(self, segment: dict[str, Any], entry: dict[str, Any]) -> None:
+        """Walk one data segment's aligned slots, and name the bytes between."""
+        width = self._pointer_width
+        start = segment["start"]
+        end = segment["end"]
+        # A segment too short to reach its own first boundary has no slots
+        # at all, and the gap that says so must stay inside the segment.
+        first = min((start + width - 1) & ~(width - 1), end)
+        whole = (end - first) // width
+        limit = first + whole * width
+        gaps: list[dict[str, int]] = []
+        reasons: list[str] = []
+        if first > start:
+            gaps.append({"start": start, "end": first})
+            reasons.append(
+                f"{segment['name']} begins at {start:#x}, which is not a"
+                f" {width}-byte boundary, so no whole pointer can be read"
+                f" before {first:#x}"
+            )
+        run: list[dict[str, Any]] = []
+        kind = ""
+        address = first
+        while address < limit:
+            self._cursor = address
+            self._budget.charge("seeds")
+            self._budget.charge("bytes", width)
+            raw = self._bytes.get_bytes(address, width)
+            if raw is None or len(raw) < width:
+                self._flush_run(segment, run, kind)
+                entry["coverage"] = (
+                    "unavailable" if address == first else "partial"
+                )
+                entry["reason"] = (
+                    f"{segment['name']} holds no bytes in the image from"
+                    f" {address:#x}, so no pointer can be read out of it"
+                )
+                entry["unvisited"] = [*gaps, {"start": address, "end": end}]
+                return
+            reasons.extend(
+                self._misaligned(segment, address + 1, address + width)
+            )
+            slot = self._slot(address, raw)
+            following = (
+                "relocated"
+                if slot["relocated"]
+                else ("integer" if self._pointer_shaped(slot) else "")
+            )
+            if following != kind or not following:
+                self._flush_run(segment, run, kind)
+                run = []
+                kind = following
+            if following:
+                run.append(slot)
+            address += width
+        self._flush_run(segment, run, kind)
+        if limit < end:
+            gaps.append({"start": limit, "end": end})
+            reasons.append(
+                f"the {end - limit} bytes at {limit:#x} are less than one"
+                f" {width}-byte pointer, so the end of {segment['name']} is"
+                " not a slot this pass can read"
+            )
+        reasons.extend(self._misaligned(segment, start, first))
+        reasons.extend(self._misaligned(segment, limit, end))
+        if gaps or reasons:
+            entry["coverage"] = "partial"
+            entry["unvisited"] = gaps
+            entry["reason"] = "; ".join(reasons)
+
+    def _misaligned(
+        self, segment: dict[str, Any], start: int, end: int
+    ) -> list[str]:
+        """Report every relocation in ``[start, end)``, which no slot covers.
+
+        These are the bytes an aligned grid steps over: the head of a
+        segment that does not begin on a boundary, the tail too short to
+        hold a pointer, and the inside of a slot whose own first byte is not
+        relocated. A relocation there is still a relocation, and dropping it
+        would lose it with no address and no reason.
+        """
+        reasons: list[str] = []
+        for address in self._relocations_between(start, end):
+            self._budget.charge("candidates")
+            self._record(self._misaligned_candidate(segment, address))
+            reasons.append(
+                f"a relocation at {address:#x} lies outside every whole"
+                f" {self._pointer_width}-byte slot of {segment['name']}"
+            )
+        return reasons
+
+    def _relocations_between(self, start: int, end: int) -> list[int]:
+        """Every address in ``[start, end)`` the loader relocates."""
+        if start >= end or not self._fixup.contains_fixups(start, end - start):
+            return []
+        return [
+            address
+            for address in range(start, end)
+            if self._fixup.exists_fixup(address)
+        ]
+
+    def _misaligned_candidate(
+        self, segment: dict[str, Any], address: int
+    ) -> dict[str, Any]:
+        """One relocated pointer no aligned slot of this segment can contain.
+
+        Two different things land here and they are not reported as one.
+        An address off the pointer grid cannot start a slot; an address on
+        the grid with fewer than a pointer's worth of segment left after it
+        cannot finish one.
+        """
+        width = self._pointer_width
+        raw = self._bytes.get_bytes(address, width) or b""
+        slot = self._slot(address, raw)
+        if address % width:
+            classification = "misaligned_pointer"
+            reason = (
+                f"the relocated pointer at {address:#x} is aligned to"
+                f" {_alignment(address)} bytes, not to the {width} a slot of"
+                " this table grid would need, so it is reported where it is"
+                " and no table is defined around it"
+            )
+        else:
+            classification = "truncated_pointer"
+            reason = (
+                f"{segment['name']} ends {segment['end'] - address} bytes"
+                f" after the relocation at {address:#x}, which is less than"
+                f" the {width} one pointer takes, so it is reported where it"
+                " is and no table is defined around it"
+            )
+        return {
+            "candidate_id": f"ida:pointer_table:{address:08x}",
+            "kind": "pointer_table",
+            "backend": BACKEND_NAME,
+            "address_space": ADDRESS_SPACE_IMAGE,
+            "address": address,
+            "confidence": _LIKELY,
+            "state": "candidate",
+            "reason": reason,
+            "evidence": {
+                "stage": "raw_bytes",
+                "method": "a relocation record read where no whole slot is",
+                "start": address,
+                "end": address + len(raw),
+                "segment": segment["name"],
+                "classification": classification,
+                "pointer_width": width,
+                "endianness": self._endianness,
+                "stride": None,
+                "alignment": _alignment(address),
+                "entry_count": 1,
+                "entries": [slot],
+                "existing_type": self._existing_type(address),
+                **_quoted(raw),
+            },
+        }
+
+    def _slot(self, address: int, raw: bytes) -> dict[str, Any]:
+        """One pointer-width slot, read with this image's width and order."""
+        data = self._fixup.fixup_data_t()
+        relocated = bool(self._fixup.get_fixup(data, address))
+        value = (
+            int.from_bytes(raw, self._endianness)
+            if len(raw) == self._pointer_width
+            else None
+        )
+        target = None if value is None else self._segment.getseg(value)
+        function = None if value is None else self._funcs.get_func(value)
+        return {
+            "address": address,
+            "value": value,
+            "relocated": relocated,
+            "relocation": (
+                self._fixup_names.get(data.get_type(), f"fixup {data.get_type()}")
+                if relocated
+                else None
+            ),
+            "relocation_target": data.off if relocated else None,
+            "target_segment": (
+                None if target is None else self._segment.get_segm_name(target)
+            ),
+            "target_executable": (
+                None
+                if target is None
+                else bool(target.perm & self._segment.SEGPERM_EXEC)
+            ),
+            "target_is_function_entry": (
+                function is not None and function.start_ea == value
+            ),
+            "target_function": None if function is None else function.start_ea,
+        }
+
+    def _pointer_shaped(self, slot: dict[str, Any]) -> bool:
+        """Whether an unrelocated slot is even shaped like a pointer.
+
+        A zero, a value outside the image, or a value that lands on nothing
+        this analysis identifies is an integer with no claim on it. What is
+        left is the hard case this pass exists to refuse: a mapped address
+        that the analysis already knows as the start of something.
+        """
+        value = slot["value"]
+        if not value or slot["target_segment"] is None:
+            return False
+        if slot["target_is_function_entry"]:
+            return True
+        flags = self._bytes.get_flags(value)
+        return bool(self._bytes.is_head(flags) and not self._bytes.is_unknown(flags))
+
+    def _flush_run(
+        self, segment: dict[str, Any], run: list[dict[str, Any]], kind: str
+    ) -> None:
+        """Close one run of slots: a table, a counted pointer, or nothing."""
+        if not run or not kind:
+            return
+        if kind == "relocated" and len(run) < MIN_POINTER_TABLE_ENTRIES:
+            self._lone_pointers += len(run)
+            return
+        if kind == "integer" and not self._incidental_run(run):
+            return
+        self._budget.charge("candidates")
+        self._record(self._table_candidate(segment, run, kind))
+
+    @staticmethod
+    def _incidental_run(run: list[dict[str, Any]]) -> bool:
+        """Whether these unrelocated slots are worth reporting at all.
+
+        Only a run that would be indistinguishable from a table but for the
+        missing relocation: long enough, every value different, and every
+        target on one side of the code/data line. Anything looser is noise
+        that would bury the candidates a reviewer is here for.
+        """
+        if len(run) < MIN_POINTER_TABLE_ENTRIES:
+            return False
+        values = [slot["value"] for slot in run]
+        if len(set(values)) != len(values):
+            return False
+        return len({slot["target_executable"] for slot in run}) == 1
+
+    def _table_candidate(
+        self, segment: dict[str, Any], run: list[dict[str, Any]], kind: str
+    ) -> dict[str, Any]:
+        """Describe, and where relocations back all of it define, one table."""
+        width = self._pointer_width
+        start = run[0]["address"]
+        end = run[-1]["address"] + width
+        classification = self._classify(run, kind)
+        existing = self._existing_type(start)
+        raw = self._bytes.get_bytes(start, end - start) or b""
+        state = "candidate"
+        reason = self._table_refusal(start, run, classification, existing)
+        if reason is None:
+            slots = [(index * width, width) for index in range(len(run))]
+            held = self._field_conflicts(start, slots)
+            if held:
+                reason = (
+                    "the managed database already defines "
+                    + "; ".join(held)
+                    + ", and this pass replaces nothing that is already there"
+                )
+            else:
+                failure = self._define_table(start, len(run))
+                if failure is None:
+                    state = "applied"
+                else:
+                    reason = failure
+        return {
+            "candidate_id": f"ida:pointer_table:{start:08x}",
+            "kind": "pointer_table",
+            "backend": BACKEND_NAME,
+            "address_space": ADDRESS_SPACE_IMAGE,
+            "address": start,
+            "confidence": _CONFIDENT if kind == "relocated" else _WEAK,
+            "state": state,
+            "reason": reason,
+            "evidence": {
+                "stage": "raw_bytes",
+                "method": (
+                    "consecutive aligned slots, each with a relocation record"
+                    if kind == "relocated"
+                    else "consecutive aligned integers with no relocation record"
+                ),
+                "start": start,
+                "end": end,
+                "segment": segment["name"],
+                "classification": classification,
+                "pointer_width": width,
+                "endianness": self._endianness,
+                "stride": width,
+                "alignment": _alignment(start),
+                "entry_count": len(run),
+                "entries": run[:MAX_QUOTED_TABLE_ENTRIES],
+                "existing_type": existing,
+                **_quoted(raw),
+            },
+        }
+
+    @staticmethod
+    def _classify(run: list[dict[str, Any]], kind: str) -> str:
+        """What this run of slots is, as far as its targets establish."""
+        if kind != "relocated":
+            return "unrelocated_integers"
+        if any(slot["target_segment"] is None for slot in run):
+            return "unmapped_targets"
+        executable = {slot["target_executable"] for slot in run}
+        if executable == {True}:
+            if all(slot["target_is_function_entry"] for slot in run):
+                return "function_pointer_table"
+            return "jump_table"
+        if executable == {False}:
+            return "data_pointer_array"
+        return "mixed_targets"
+
+    def _table_refusal(
+        self,
+        start: int,
+        run: list[dict[str, Any]],
+        classification: str,
+        existing: dict[str, Any] | None,
+    ) -> str | None:
+        """Why this run is only described, or ``None`` to go and define it."""
+        if existing is not None:
+            return (
+                f"{start:#x} already carries the type {existing['name']}, which"
+                " this pass reports and never replaces"
+            )
+        if classification == "unrelocated_integers":
+            return (
+                f"no relocation record backs any of these {len(run)} slots, so"
+                " they are aligned integers that look like pointers; they are"
+                " reported with their values and nothing is defined over them"
+            )
+        if classification == "jump_table":
+            inside = [
+                slot for slot in run if not slot["target_is_function_entry"]
+            ]
+            where = ", ".join(f"{slot['value']:#x}" for slot in inside)
+            return (
+                f"{where} {'are' if len(inside) > 1 else 'is'} inside code"
+                " rather than at a function entry, so this run is as likely a"
+                " jump table as a table of function pointers and the entries"
+                " stay candidates"
+            )
+        if classification == "mixed_targets":
+            return (
+                "these slots point into both code and data, so what one"
+                " element of this table is cannot be said from the targets"
+            )
+        if classification == "unmapped_targets":
+            unmapped = [slot for slot in run if slot["target_segment"] is None]
+            where = ", ".join(f"{slot['value']:#x}" for slot in unmapped)
+            return (
+                f"{where} {'land' if len(unmapped) > 1 else 'lands'} in no"
+                " mapped segment of this image, so these bytes are not a"
+                " table of pointers into it"
+            )
+        return None
+
+    def _define_table(self, start: int, count: int) -> str | None:
+        """Type the run as an array of pointers, or say why IDA would not."""
+        try:
+            element = self._types.tinfo_t()
+            void = self._types.tinfo_t()
+            void.create_simple_type(self._types.BTF_VOID)
+            if not element.create_ptr(void):
+                return f"IDA refused to build a pointer type for {start:#x}"
+            table = self._types.tinfo_t()
+            if not table.create_array(element, count):
+                return (
+                    f"IDA refused to build an array of {count} pointers for"
+                    f" {start:#x}"
+                )
+            applied = bool(
+                self._types.apply_tinfo(start, table, self._types.TINFO_DEFINITE)
+            )
+        except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
+            return (
+                f"IDA refused to type the table at {start:#x}:"
+                f" {type(error).__name__}: {error}"
+            )
+        if not applied:
+            return f"IDA refused to apply a pointer table at {start:#x}"
+        return None
 
 
 def _run_preparation(payload: dict[str, object]) -> dict[str, object]:

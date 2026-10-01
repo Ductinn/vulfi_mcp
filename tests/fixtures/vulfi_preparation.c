@@ -33,6 +33,36 @@
  *
  *   vulfi_stack_string  A buffer written one immediate at a time, so its
  *                       bytes exist only in the instructions that build it.
+ *
+ *   vulfi_consistent_record
+ *                       A global object every access reaches at the same
+ *                       offset with the same width, so a layout can be
+ *                       proven from the instructions that use it.
+ *
+ *   vulfi_conflicting_record
+ *                       The same object read four bytes wide and eight bytes
+ *                       wide at offset zero. A layout cannot be both, so the
+ *                       disagreement is reported and nothing is defined.
+ *
+ *   vulfi_stride_table  Four accesses at one width, eight bytes apart: an
+ *                       array stride rather than a set of distinct fields.
+ *
+ *   .vulfi_fnptrs       Three relocated pointers, every target a function
+ *                       entry: a pointer table with a relocation record
+ *                       behind every slot.
+ *
+ *   .vulfi_ints         The same width and the same alignment as the table
+ *                       above, and — with this image loaded at zero — every
+ *                       value a 16-byte-aligned address in its own code,
+ *                       starting with `_init`. They are assembled out of
+ *                       plain integers, so no relocation record exists. IDA
+ *                       marks these as offsets on its own; preparation must
+ *                       still refuse to define a table over them.
+ *
+ *   .vulfi_ragged       One relocated pointer at a four-byte offset inside a
+ *                       section whose length is not a whole number of
+ *                       pointers: bad alignment and a truncated tail, both
+ *                       of which have to be named rather than skipped.
  */
 
 #include <stdio.h>
@@ -129,6 +159,105 @@ void vulfi_stack_string(void)
 
     puts(marker);
 }
+
+/* ----------------------------------------------------------------------
+ * Global objects whose layout exists only in the instructions that use
+ * them. Every access below is a direct, sized operand, so IDA records a
+ * read or a write cross-reference at the exact byte it touches.
+ * ------------------------------------------------------------------- */
+struct vulfi_record {
+    int  count;   /* +0,  4 bytes */
+    int  limit;   /* +4,  4 bytes */
+    long total;   /* +8,  8 bytes */
+};
+
+union vulfi_overlapped {
+    struct vulfi_record record;
+    long whole;   /* +0, 8 bytes: overlaps count and limit */
+};
+
+struct vulfi_record vulfi_consistent_record;
+union vulfi_overlapped vulfi_conflicting_record;
+long vulfi_stride_table[4];
+
+int vulfi_record_read(void)
+{
+    return vulfi_consistent_record.count + vulfi_consistent_record.limit;
+}
+
+long vulfi_record_total(void)
+{
+    return vulfi_consistent_record.total;
+}
+
+void vulfi_record_write(int value)
+{
+    vulfi_consistent_record.count = value;
+    vulfi_consistent_record.limit = value + 1;
+    vulfi_consistent_record.total = value + 2;
+}
+
+int vulfi_conflicting_narrow(void)
+{
+    return vulfi_conflicting_record.record.count
+         + vulfi_conflicting_record.record.limit;
+}
+
+long vulfi_conflicting_wide(void)
+{
+    return vulfi_conflicting_record.whole
+         + vulfi_conflicting_record.record.total;
+}
+
+long vulfi_stride_sum(void)
+{
+    return vulfi_stride_table[0] + vulfi_stride_table[1]
+         + vulfi_stride_table[2] + vulfi_stride_table[3];
+}
+
+/* ----------------------------------------------------------------------
+ * Three pointer-shaped ranges that differ only in what backs them.
+ * ------------------------------------------------------------------- */
+
+/* Every slot carries an R_X86_64_RELATIVE relocation and every target is a
+ * function entry. */
+__asm__(
+    ".section .vulfi_fnptrs,\"aw\",@progbits\n"
+    ".balign 8\n"
+    ".globl vulfi_function_table\n"
+    "vulfi_function_table:\n"
+    "  .quad vulfi_record_read\n"
+    "  .quad vulfi_record_total\n"
+    "  .quad vulfi_record_write\n"
+    ".previous\n");
+
+/* The same width and the same alignment as the table above, and with this
+ * image loaded at zero every value is a 16-byte-aligned address in its own
+ * code: `_init` at 0x1000, then PLT stubs. Nothing relocates them, because
+ * they are plain integers, which is the only thing that sets this range
+ * apart from the one above. */
+__asm__(
+    ".section .vulfi_ints,\"aw\",@progbits\n"
+    ".balign 8\n"
+    ".globl vulfi_integer_table\n"
+    "vulfi_integer_table:\n"
+    "  .quad 0x1000\n"
+    "  .quad 0x1020\n"
+    "  .quad 0x1030\n"
+    "  .quad 0x1040\n"
+    ".previous\n");
+
+/* A relocated pointer four bytes into an eight-byte grid, and seventeen
+ * bytes of section: the last slot cannot be read whole. */
+__asm__(
+    ".section .vulfi_ragged,\"aw\",@progbits\n"
+    ".balign 16\n"
+    "  .byte 0,0,0,0\n"
+    ".globl vulfi_misaligned_pointer\n"
+    "vulfi_misaligned_pointer:\n"
+    "  .quad vulfi_record_read\n"
+    "  .byte 0,0,0,0,0\n"
+    ".previous\n");
 
 int main(int argc, char **argv)
 {

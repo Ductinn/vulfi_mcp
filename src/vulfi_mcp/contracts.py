@@ -78,9 +78,11 @@ if TYPE_CHECKING:
     #: ``applied`` says the managed artifact changed.
     CandidateState = Literal["candidate", "applied", "rejected"]
 
-    #: The candidate kinds this build produces. Plan 2's later tasks add the
-    #: structure-field and pointer-table kinds with the passes that find them.
-    CandidateKind = Literal["function", "string"]
+    #: The candidate kinds this build produces, one per pass that finds
+    #: them. A structure or a pointer table carries the accesses or the
+    #: relocation records it was inferred from, exactly as the other two
+    #: carry their bytes and their instructions.
+    CandidateKind = Literal["function", "string", "structure", "pointer_table"]
 
     #: How an IDA row and its reviewer-linked external partner stand. Plan 4
     #: creates links; until then every stored row is ``unlinked``, which is not
