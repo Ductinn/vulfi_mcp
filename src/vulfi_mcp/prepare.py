@@ -66,11 +66,15 @@ import asyncio
 import hashlib
 import json
 import shlex
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Final, NamedTuple, TypedDict
 
 from vulfi_mcp.catalog import (
+    ASSOCIATION_ASSERTED,
+    ASSOCIATION_VERIFIED,
     CATALOG_UNAVAILABLE_REASON,
     EXTERNAL_BACKENDS,
     Catalog,
@@ -112,6 +116,7 @@ from vulfi_mcp.ida_adapter import (
 )
 from vulfi_mcp.ida_runtime import (
     MAX_PREPARE_WARNINGS,
+    PROPOSAL_KINDS,
     PREPARE_LIMITS,
     PREPARE_PASSES,
     PRIORITIES,
@@ -163,6 +168,7 @@ __all__ = [
     "check_proposal_against_candidate",
     "ensure_prepared",
     "findings_across_backends",
+    "identity_established",
     "mint_proposal_id",
     "prepare_target",
     "preparation_page",
@@ -242,6 +248,19 @@ _EVIDENCE: Final = "proposal_evidence"
 #: applied against some other backend's analysis as if that were the same
 #: thing.
 WRITABLE_BACKENDS: Final[tuple[str, ...]] = (BACKEND, "ghidra")
+
+#: Which proposal kinds each backend's writer can really apply.
+#:
+#: A backend is not writable in general; it is writable for the changes its
+#: safe writer implements. ``apply_ghidra_review`` applies a function
+#: boundary and a structure layout and nothing else — it answers
+#: ``applied=False`` for the other three — so storing one of those would send
+#: an operator through a human review of a change that could never land,
+#: which is precisely what the submission gate exists to prevent.
+WRITABLE_KINDS: Final[dict[str, tuple[str, ...]]] = {
+    BACKEND: PROPOSAL_KINDS,
+    "ghidra": ("function_boundary", "structure_field"),
+}
 
 #: The candidate kinds each proposed change may be made to. A name can be
 #: given to anything preparation found; the other four are changes to one
@@ -772,7 +791,7 @@ def scan_target(
         *prepared["warnings"],
         *routed.warnings,
     ]
-    return _merge_scan(path, result, routed, prepared, scope)
+    return _merge_scan(path, result, routed, prepared, scope, rules)
 
 
 def _unscanned_ida(
@@ -865,6 +884,15 @@ def _route_rules(
                 if outcome == "unverified":
                     settled = ("unverified", backend, reason)
                     break
+                if outcome == "failed":
+                    # Recorded against this backend's scope *before* the chain
+                    # advances. Left in ``attempts`` alone it would vanish the
+                    # moment the same backend evaluated any other rule, and a
+                    # failure that does not survive its own function is not
+                    # the sticky failure the ruling requires.
+                    asked.setdefault(backend, []).append(index)
+                    states.setdefault(backend, {})[index] = ("failed", reason)
+                    complete[backend] = False
                 continue
             asked.setdefault(backend, []).append(index)
             if evidence is None:  # pragma: no cover - outcome implies evidence
@@ -1044,12 +1072,25 @@ def _evidence_findings(
             f" contexts over {len(sites)} readable ranges, so no verdict here"
             " can be shown to belong to the address it would be stored at",
         )
+    if not sha256:
+        # An external row is identified inside the original binary's SHA-256
+        # namespace. Without that digest there is no namespace to mint one
+        # in, and minting outside it is how one image's rows collide with
+        # another's in a catalog every target shares.
+        return (
+            [],
+            "unsupported",
+            f"the {backend} backend established facts for this rule, and this"
+            " target's original binary digest is not known, so no finding can"
+            " be identified: an external finding belongs to the original"
+            " binary's SHA-256 namespace. Nothing was stored.",
+        )
     digest = canonical_rule_digest(rule)
     space = external_space(backend)
     names = sorted(rule["function_names"])
     rows: list[Finding] = []
     occurrences: dict[int, int] = {}
-    for context, site in zip(contexts, sites, strict=True):
+    for position, (context, site) in enumerate(zip(contexts, sites, strict=True)):
         try:
             priority = evaluate_rule(rule, context)
         except UnavailableEvidenceError as missing:
@@ -1064,8 +1105,14 @@ def _evidence_findings(
         branch = priority if priority in PRIORITIES else None
         rows.append(
             {
+                # The source digest sits in the id because every target
+                # shares one catalog and ``external_findings.finding_id`` is
+                # that catalog's primary key. Without it two binaries with the
+                # same backend, scope, rule, address and occurrence mint the
+                # same id, and the second scan's upsert rewrites the first
+                # target's row with the wrong image's evidence.
                 "id": (
-                    f"{backend}:{scope}:{index}:{digest}"
+                    f"{backend}:{sha256}:{scope}:{index}:{digest}"
                     f":{space}:0x{address:x}:{occurrence}"
                 ),
                 "backend": backend,
@@ -1100,8 +1147,12 @@ def _evidence_findings(
                     "matched_name": names[0] if len(names) == 1 else None,
                     "site_coverage": site.get("coverage"),
                     "site_reason": site.get("reason"),
-                    "facts": evidence["contexts"][len(rows)]
-                    if len(rows) < len(evidence["contexts"])
+                    # The position of *this* site among the paired
+                    # contexts, not the number of findings so far: one clean
+                    # site before a matching one would otherwise shift every
+                    # later finding's evidence onto a different call site.
+                    "facts": evidence["contexts"][position]
+                    if position < len(evidence["contexts"])
                     else None,
                 },
             }
@@ -1202,9 +1253,16 @@ def _merge_scan(
     routed: _RoutedRules,
     prepared: PreparationResult,
     scope: str,
+    rules: tuple[Rule, ...],
 ) -> ScanResult:
     """Commit each external scope, then report both stores as one answer."""
-    scan_id = result["scan_id"] or utc_now()
+    # A timestamp is not an identity: two scans in the same second would
+    # share one, and ``record_external_scan`` would read the first scan's
+    # rows as seen by the second and refuse to retire them. The id is minted
+    # and written back, so the result names the scan the store really holds.
+    if not result["scan_id"]:
+        result["scan_id"] = uuid.uuid4().hex
+    scan_id = str(result["scan_id"])
     stored: dict[str, dict[str, Any]] = {}
     counts: dict[str, dict[str, int]] = {}
     totals: dict[str, Any] = {"by_backend": {}, "total": 0, "stale": 0}
@@ -1229,7 +1287,11 @@ def _merge_scan(
                         coverage=report["coverage"],
                         reason=report["reason"],
                         capability_fingerprint=adapter_fingerprint(backend),
-                        rules=[],
+                        # The validated rule definitions themselves, not a
+                        # count: after a restart a clean or unsupported rule
+                        # with no finding survives only as an ordinal, and an
+                        # ordinal is not a rule anyone can read.
+                        rules=[dict(rule) for rule in rules],
                         rule_coverage=report["rule_coverage"],
                         warnings=[],
                         findings=[
@@ -1244,13 +1306,9 @@ def _merge_scan(
             counts = catalog.external_status_counts()
             totals = catalog.external_totals()
             scopes = catalog.external_scopes()
-            rows = [
-                row
-                for row in catalog.page_external_findings(0, MAX_SCAN_FINDINGS)[
-                    "findings"
-                ]
-                if str(row["source"]) == scope
-            ]
+            rows = catalog.page_external_findings(
+                0, MAX_SCAN_FINDINGS, scope=scope
+            )["findings"]
     for backend, report in sorted(routed.scopes.items()):
         result["scope_health"][backend] = {
             "state": report["state"],
@@ -1488,8 +1546,13 @@ def triage_across_backends(
                 f"no stored finding carries the id {finding_id!r}:"
                 f" {NO_DATABASE_REASON}. Nothing was written"
             )
+        # Identity is settled *before* the write, not reported after it. A
+        # refusal that arrives once the status, rationale and revision have
+        # already changed is not a refusal; it is a mutation with an error
+        # message, and retrying it increments the revision again.
+        joined, catalog_reason = _verified_catalog(path, binary_path)
         result = triage_ida(idb_path, finding_id, status, rationale, path=path)
-        return _completed_triage(path, binary_path, result)
+        return _completed_triage(result, joined, catalog_reason)
     catalog, reason = _verified_catalog(path, binary_path, writable=True)
     if catalog is None:
         raise UnknownFindingError(
@@ -1531,10 +1594,14 @@ def triage_across_backends(
 
 
 def _completed_triage(
-    path: str, binary_path: str | None, result: TriageResult
+    result: TriageResult, catalog: Catalog | None, reason: str | None
 ) -> TriageResult:
-    """One IDA assessment, with the external store's own counts beside it."""
-    catalog, reason = _verified_catalog(path, binary_path)
+    """One IDA assessment, with the external store's own counts beside it.
+
+    The catalog is handed in already opened, because deciding whether the two
+    stores may be joined is an identity question and has to be answered
+    before the assessment is written, not after.
+    """
     if catalog is None:
         result["store_health"] = {
             **result["store_health"],
@@ -1550,6 +1617,23 @@ def _completed_triage(
     result["status_counts"] = _merged_counts(result["status_counts"], counts)
     result["store_health"] = {**result["store_health"], "catalog": health}
     return result
+
+
+def identity_established(catalog: Catalog, *, is_database: bool) -> bool:
+    """Whether this target's original bytes are *proved*, not merely recorded.
+
+    The two cases differ and the difference is the whole of the aggregation
+    gate. When the request named the binary, this process hashed those very
+    bytes while opening the catalog, so the digest is proof. When it named a
+    database, the stored digest is proof only if
+    :meth:`~vulfi_mcp.catalog.Catalog.attach_source` compared bytes for it —
+    :data:`~vulfi_mcp.catalog.ASSOCIATION_ASSERTED` records that a caller
+    presented both identities together and **nobody checked**, and that is
+    exactly the claim that may not become an aggregation.
+    """
+    if catalog.source_sha256 is None:
+        return False
+    return not is_database or catalog.source_association == ASSOCIATION_VERIFIED
 
 
 def _verified_catalog(
@@ -1602,16 +1686,30 @@ def _verified_catalog(
     catalog = get_catalog(path, managed_idb_id)
     if catalog is None:
         return None, CATALOG_UNAVAILABLE_REASON
-    established = catalog.source_sha256 is not None
+    # What counts as established, and why the two cases differ. When ``path``
+    # *is* the binary, this process hashed those very bytes a moment ago in
+    # :func:`~vulfi_mcp.catalog.open_catalog`'s identity step, so the digest
+    # is proof. When ``path`` is a database, the stored digest is only proof
+    # if :meth:`~vulfi_mcp.catalog.Catalog.attach_source` compared bytes for
+    # it — ``ASSOCIATION_ASSERTED`` records that a caller presented both
+    # identities together and **nobody checked**, which is precisely the
+    # claim that may not become an aggregation.
+    established = identity_established(catalog, is_database=is_database)
+    association = catalog.source_association
     catalog.close()
     if not established:
         if binary_path is None:
+            held = (
+                "not established"
+                if association != ASSOCIATION_ASSERTED
+                else "recorded only on a caller's say-so, with nothing"
+                " compared"
+            )
             return None, (
                 f"{path} is a database, and this target's original bytes are"
-                " not established, so its external scopes cannot be"
-                " identified: an external row belongs to the original"
-                " binary's SHA-256 namespace. Supply binary_path to join"
-                " them."
+                f" {held}, so its external scopes cannot be identified: an"
+                " external row belongs to the original binary's SHA-256"
+                " namespace. Supply binary_path to prove them."
             )
         if recorded_sha is None:
             raise UnverifiedBinaryError(
@@ -1825,10 +1923,21 @@ def check_proposal_against_candidate(
         raise PreparationError(
             f"candidate {proposal['candidate_id']!r} was recovered by the"
             f" {backend!r} backend, and this build has no safe way to write a"
-            f" change back to a {backend} analysis: that provider arrives with"
-            " Plan 3. The proposal is refused rather than applied somewhere"
-            " else — nothing was applied, nothing was stored, and no change"
-            " was made on that backend's behalf"
+            f" change back to a {backend} analysis: that provider exposes no"
+            " typed writer whose result outlives the session that made it."
+            " The proposal is refused rather than applied somewhere else —"
+            " nothing was applied, nothing was stored, and no change was made"
+            " on that backend's behalf"
+        )
+    writable = WRITABLE_KINDS[str(backend)]
+    if proposal["kind"] not in writable:
+        raise PreparationError(
+            f"candidate {proposal['candidate_id']!r} was recovered by the"
+            f" {backend!r} backend, whose safe writer applies"
+            f" {', '.join(writable)} and nothing else, so a"
+            f" {proposal['kind']!r} proposal against it could never be"
+            " applied. It is refused here rather than stored and sent through"
+            " a human review that could only ever end in a refusal"
         )
     permitted = _PROPOSAL_CANDIDATES[proposal["kind"]]
     if candidate.get("kind") not in permitted:
@@ -1991,6 +2100,7 @@ def _submit(
             value=body["value"],
             evidence=body["evidence"],
             rationale=body["rationale"],
+            expected_revision=revision,
         )
     except (PreparationError, CatalogError) as refused:
         return _refused(index, body, str(refused))
@@ -2153,6 +2263,45 @@ def _attempt(backend: str, outcome: str, reason: str | None) -> BackendAttempt:
     return {"backend": backend, "outcome": outcome, "reason": reason}
 
 
+#: How a stored pass row says it is a failure rather than a capability
+#: statement. Both are recorded with ``coverage="unavailable"`` — neither
+#: established anything — but "this backend tried and could not finish" and
+#: "this backend cannot do this at all" are different facts, and a reader
+#: after a restart has to be able to tell them apart. The prefix is on the
+#: warning because that is the one free-text field a stored pass has.
+FAILED_ATTEMPT: Final = "failed attempt: "
+
+
+def _failed_pass(name: str, backend: str, reason: str) -> dict[str, Any]:
+    """One pass a backend opened a session for and could not finish.
+
+    Recorded, not merely warned about. The ``failed`` ruling lets the chain
+    advance past a failure precisely because the failure is kept — so it has
+    to survive into the catalog, where a later read and a reused revision
+    both find it, and where it keeps the revision's own coverage off
+    ``complete`` whatever a later backend answered.
+    """
+    return {
+        "pass": name,
+        "backend": backend,
+        "ranges": [],
+        "coverage": "unavailable",
+        "applied_ids": [],
+        "candidate_ids": [],
+        "candidates": [],
+        "warnings": [f"{FAILED_ATTEMPT}{reason}"],
+        "artifact_revision": None,
+    }
+
+
+def _failure_reason(entry: Mapping[str, Any]) -> str | None:
+    """The failure a stored pass row carries, or ``None`` if it carries none."""
+    for warning in _strings(entry.get("warnings")):
+        if warning.startswith(FAILED_ATTEMPT):
+            return warning[len(FAILED_ATTEMPT) :]
+    return None
+
+
 class UnverifiedBinaryError(PreparationError):
     """The bytes a backend would read could not be shown to be these bytes."""
 
@@ -2174,7 +2323,22 @@ def _identity_refusal(backend: str, path: str) -> str | None:
     read is left to the session's own attestation, and
     :class:`~vulfi_mcp.providers.ProviderIdentityError` from there is caught
     by the caller and reported as the same refusal.
+
+    A saved database is refused outright, before any of that. Matching the
+    bytes of an ``.i64`` against a mapped copy of the same ``.i64`` proves
+    the container, not the image it was built from, and neither
+    ``vulfi_prepare`` nor ``vulfi_scan`` takes the original binary to
+    establish it with. Letting it through would open a provider session on a
+    database container and create artefacts against it.
     """
+    if Path(path).suffix.lower() in IDB_SUFFIXES:
+        return (
+            f"{path} is a saved IDA database, not the original binary, and an"
+            f" external backend analyses the image: matching the database"
+            f" container's own bytes would prove the container and not what"
+            f" it was built from, so the {backend} backend was not opened and"
+            " nothing was analysed. Prepare or scan the original binary."
+        )
     try:
         config = load_provider_config().get(backend)
     except Exception as refused:  # noqa: BLE001 - any config fault is a refusal
@@ -2405,20 +2569,19 @@ def _route_passes(
                 attempts[name].append(_attempt(backend, outcome, reason))
                 if outcome == "unverified":
                     stopped[name] = reason
+                elif outcome == "failed":
+                    extra.append((_failed_pass(name, backend, reason), {}))
             continue
         by_name = {str(entry.get("pass")): entry for entry in produced}
         for name in pending:
             entry = by_name.get(name)
             if entry is None:
-                attempts[name].append(
-                    _attempt(
-                        backend,
-                        "failed",
-                        f"the {backend} backend ran and returned no result for"
-                        f" the {name!r} pass, so nothing is known about it"
-                        " from there",
-                    )
+                missing = (
+                    f"the {backend} backend ran and returned no result for the"
+                    f" {name!r} pass, so nothing is known about it from there"
                 )
+                attempts[name].append(_attempt(backend, "failed", missing))
+                extra.append((_failed_pass(name, backend, missing), {}))
                 continue
             if str(entry.get("coverage")) == "unavailable":
                 attempts[name].append(
@@ -2607,8 +2770,19 @@ def _reused_routing(
     backend's result the store already holds for that pass.
     """
     held: dict[str, dict[str, object]] = {}
+    failures: dict[str, list[BackendAttempt]] = {}
     for entry in recorded:
         name = str(entry["pass"])
+        reason = _failure_reason(entry)
+        if reason is not None:
+            # A stored failure is read back as the attempt it was. This is
+            # what "sticky" means: a reused revision carries the failure the
+            # run that made it had, so no restart can turn a chain that broke
+            # into a chain that was clean.
+            failures.setdefault(name, []).append(
+                _attempt(str(entry["backend"]), "failed", reason)
+            )
+            continue
         if str(entry["coverage"]) == "unavailable" and name in held:
             continue
         if name not in held or str(held[name]["coverage"]) == "unavailable":
@@ -2616,8 +2790,9 @@ def _reused_routing(
     rows: list[PassRouting] = []
     for name in requested:
         entry = held.get(name)
+        attempts = failures.get(name, [])
         if entry is None:
-            rows.append(_pass_routing(name, None, [], None))
+            rows.append(_pass_routing(name, None, attempts, None))
             continue
         rows.append(
             {
@@ -2625,7 +2800,7 @@ def _reused_routing(
                 "backend": str(entry["backend"]),
                 "state": "answered",
                 "coverage": str(entry["coverage"]),
-                "attempts": [],
+                "attempts": attempts,
                 "reason": None,
             }
         )
@@ -3155,6 +3330,13 @@ def _coverage(recorded: list[dict[str, object]]) -> str:
     One partial range makes the whole revision partial, which is the ordinary
     outcome on a real image rather than a failure: ``pointer_tables`` reaches
     ranges no relocation covers on almost every binary, and says so.
+
+    A recorded failure is one of those weakest things, and it is counted here
+    rather than only in the routing rows. A backend that opened a session and
+    could not finish leaves a revision this server may not summarise as
+    ``complete``, however well a later backend answered the same pass — which
+    is the second of the three invariants the ``failed`` ruling rests on, and
+    it has to hold for a reused revision too.
     """
     states = {str(entry["coverage"]) for entry in recorded}
     if not states or states == {"unavailable"}:

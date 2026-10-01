@@ -954,8 +954,16 @@ class Catalog:
         value: dict[str, object],
         evidence: dict[str, object],
         rationale: str,
+        expected_revision: int | None = None,
     ) -> dict[str, object]:
         """Store one agent-authored proposal, pending an operator's decision.
+
+        ``expected_revision`` is the artifact revision the proposal's evidence
+        was computed against, stored at submission rather than left for the
+        decision to invent. A reviewer is shown it and passes it back, and the
+        backend's own writer compares against it; a row that carried ``NULL``
+        would make a reviewer following the documented workflow approve
+        against revision zero, which a prepared artifact is already past.
 
         A row is always born ``pending``. There is deliberately no way to
         create a decided one: the whole control this table exists for is that
@@ -991,6 +999,15 @@ class Catalog:
             )
         if not isinstance(rationale, str) or not rationale.strip():
             raise CatalogError("rationale must be a non-empty string")
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise CatalogError(
+                f"expected_revision must be an integer >= 0, got"
+                f" {expected_revision!r}"
+            )
         # One column, one canonical document. The schema this build owns has
         # one place for the proposal's own content, and splitting it across a
         # column the schema does not have is not an option open to this task;
@@ -1021,7 +1038,7 @@ class Catalog:
                     " candidate_id, kind, address_space, address, value,"
                     " rationale, state, expected_revision, decided_at,"
                     " decided_by, decision_reason, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL,"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL,"
                     " NULL, NULL, ?)",
                     (
                         identifier,
@@ -1032,6 +1049,7 @@ class Catalog:
                         address,
                         body,
                         rationale,
+                        expected_revision,
                         now,
                     ),
                 )
@@ -1596,7 +1614,7 @@ class Catalog:
         row = self._connection.execute(
             "SELECT backend, scope, scan_id, scanned_at, state, coverage,"
             " reason, capability_fingerprint, rule_coverage, warnings,"
-            " scope_id FROM external_scopes WHERE target_key = ?"
+            " scope_id, rules FROM external_scopes WHERE target_key = ?"
             " AND backend = ? AND scope = ?",
             (self._target.key, name, scope_name),
         ).fetchone()
@@ -1612,7 +1630,7 @@ class Catalog:
         rows = self._connection.execute(
             "SELECT backend, scope, scan_id, scanned_at, state, coverage,"
             " reason, capability_fingerprint, rule_coverage, warnings,"
-            f" scope_id FROM external_scopes WHERE {' AND '.join(where)}"
+            f" scope_id, rules FROM external_scopes WHERE {' AND '.join(where)}"
             " ORDER BY backend ASC, scope ASC",
             tuple(parameters),
         ).fetchall()
@@ -1626,11 +1644,17 @@ class Catalog:
         says it must: a reviewer-linked pair contributes two rows.
         """
         rows = self._connection.execute(
-            "SELECT s.backend, count(*), sum(f.stale) FROM external_findings f"
-            " JOIN external_scopes s ON s.scope_id = f.scope_id"
+            "SELECT s.backend, count(f.finding_id), sum(f.stale)"
+            " FROM external_scopes s"
+            " LEFT JOIN external_findings f ON f.scope_id = s.scope_id"
             " WHERE s.target_key = ? GROUP BY s.backend ORDER BY s.backend",
             (self._target.key,),
         ).fetchall()
+        # Seeded from the *scopes*, left-joined to their rows, so a backend
+        # that really ran and found nothing is a measured zero rather than an
+        # absence. An inner join would drop it entirely, and the empty
+        # mapping this returns means "no store answered" — the one thing a
+        # backend that demonstrably answered must never be rendered as.
         per_backend = {
             str(row[0]): {"total": int(row[1]), "stale": int(row[2] or 0)}
             for row in rows
@@ -1644,6 +1668,14 @@ class Catalog:
     def external_status_counts(self) -> dict[str, dict[str, int]]:
         """Triage counts over every external row of this target, by backend."""
         counts: dict[str, dict[str, int]] = {}
+        # Every scope this target holds gets a table, whether or not it has a
+        # row in it: a backend that ran and found nothing counts zero, and
+        # zero is not the same answer as "this backend never answered".
+        for row in self._connection.execute(
+            "SELECT DISTINCT backend FROM external_scopes WHERE target_key = ?",
+            (self._target.key,),
+        ):
+            counts[str(row[0])] = {status: 0 for status in TRIAGE_STATUSES}
         for row in self._connection.execute(
             "SELECT s.backend, f.status, count(*) FROM external_findings f"
             " JOIN external_scopes s ON s.scope_id = f.scope_id"
@@ -1657,9 +1689,20 @@ class Catalog:
         return counts
 
     def page_external_findings(
-        self, offset: int = 0, limit: int = 100, *, backend: str | None = None
+        self,
+        offset: int = 0,
+        limit: int = 100,
+        *,
+        backend: str | None = None,
+        scope: str | None = None,
     ) -> dict[str, object]:
-        """One window of this target's external rows, in the design's order."""
+        """One window of this target's external rows, in the design's order.
+
+        ``backend`` and ``scope`` narrow in the query, not afterwards. A
+        caller that filtered a page it had already taken would get rows from
+        other scopes occupying its window and a short answer that disagreed
+        with its own total.
+        """
         try:
             offset, limit = validate_page(offset, limit)
         except OperationError as error:
@@ -1669,6 +1712,9 @@ class Catalog:
         if backend is not None:
             where.append("s.backend = ?")
             parameters.append(_validate_external_backend(backend))
+        if scope is not None:
+            where.append("s.scope = ?")
+            parameters.append(_validate_scope(scope))
         clause = " AND ".join(where)
         total = self._connection.execute(
             "SELECT count(*) FROM external_findings f JOIN external_scopes s"
@@ -1769,6 +1815,11 @@ class Catalog:
             "capability_fingerprint": row[7],
             "rule_coverage": json.loads(row[8]),
             "warnings": json.loads(row[9]),
+            # The rule definitions the scan really ran, read back with
+            # everything else: after a restart a clean or unsupported rule
+            # with no finding survives only here, and an ordinal coverage row
+            # is not a rule anyone can read.
+            "rules": json.loads(row[11]),
             "total": int(counts[0] or 0),
             "stale_total": int(counts[1] or 0),
         }

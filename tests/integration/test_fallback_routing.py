@@ -53,6 +53,7 @@ from vulfi_mcp.prepare import (
     prepare_target,
     preparation_page,
     scan_target,
+    triage_across_backends,
 )
 from vulfi_mcp.rules import Rule, load_stock_rules
 
@@ -693,3 +694,41 @@ def test_provider_pseudocode_without_facts_is_not_clean(
     assert scope["state"] == "evaluated"
     assert scope["coverage"] == "partial"
     assert scope["reason"]
+
+
+@pytest.mark.requires_ida
+def test_an_unverified_binary_refuses_triage_before_it_writes(
+    compiled_calls: Path, tmp_path: Path, managed_data_dir: Path
+) -> None:
+    """Identity is settled before the assessment, not reported after it.
+
+    A refusal that arrives once the status, rationale and revision have
+    already changed is not a refusal; it is a mutation with an error message,
+    and retrying it increments the revision again.
+    """
+    rules = load_stock_rules()
+    scanned = scan_target(str(compiled_calls), rules, "default", backend="ida")
+    rows = [row for row in scanned["findings"] if row["backend"] == "ida"]
+    assert rows, scanned["findings"]
+    finding_id = str(rows[0]["id"])
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_bytes(b"\x7fELF" + b"a different image entirely" * 64)
+    for _ in range(2):
+        with pytest.raises(UnverifiedBinaryError):
+            triage_across_backends(
+                str(compiled_calls),
+                finding_id,
+                "Vulnerable",
+                "this should never be committed",
+                str(unrelated),
+            )
+
+    page = findings_across_backends(str(compiled_calls), None, 0, 200)
+    held = [row for row in page["findings"] if row["id"] == finding_id]
+    assert held, page["findings"]
+    # Nothing was written: not the status, not the rationale, and above all
+    # not the revision, which two refused attempts would have moved twice.
+    assert held[0]["status"] == "Not Checked"
+    assert held[0]["rationale"] == ""
+    assert held[0]["triage_revision"] == 0

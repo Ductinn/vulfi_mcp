@@ -298,12 +298,29 @@ def test_a_candidate_this_build_cannot_write_is_refused_not_faked() -> None:
     assert "nothing was applied" in str(refused.value).lower()
 
 
-def test_a_ghidra_candidate_is_proposable_now_that_it_has_a_safe_writer() -> None:
-    # The other half of the rule above: a backend that *can* write back
-    # safely is not refused, because refusing it would make the operator's
-    # Ghidra approval path unreachable and therefore untestable.
+def test_a_ghidra_candidate_is_proposable_for_the_kinds_its_writer_applies() -> None:
+    # The other half of the rule above, and only that half. A backend is not
+    # writable in general; it is writable for the changes its safe writer
+    # really implements. `apply_ghidra_review` applies a function boundary and
+    # a structure layout, so those are proposable...
     recovered = dict(FUNCTION_CANDIDATE, backend="ghidra")
-    check_proposal_against_candidate(validate_proposal(_proposal()), recovered)
+    boundary = validate_proposal(
+        _proposal(kind="function_boundary", value={"end": 0x401010})
+    )
+    check_proposal_against_candidate(boundary, recovered)
+
+
+def test_a_kind_the_ghidra_writer_cannot_apply_is_refused_at_submission() -> None:
+    # ...and the other three are not. Storing one would send an operator
+    # through a human review of a change that could only ever end in
+    # `applied=False`, which is exactly what the submission gate exists to
+    # prevent.
+    recovered = dict(FUNCTION_CANDIDATE, backend="ghidra")
+    with pytest.raises(PreparationError) as refused:
+        check_proposal_against_candidate(validate_proposal(_proposal()), recovered)
+    assert "'name' proposal" in str(refused.value)
+    assert "could never be applied" in str(refused.value)
+    assert "function_boundary" in str(refused.value)
 
 
 # -- what the catalog does with a decision ----------------------------------

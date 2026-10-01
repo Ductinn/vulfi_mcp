@@ -504,6 +504,7 @@ class ExternalScope(TypedDict):
     reason: str | None
     capability_fingerprint: str | None
     rule_coverage: list[RuleCoverage]
+    rules: list[dict[str, JsonValue]]
     warnings: list[str]
     total: int
     stale_total: int

@@ -18,6 +18,7 @@ stand-in.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import shutil
 import sqlite3
@@ -30,6 +31,8 @@ import pytest
 
 from vulfi_mcp import catalog as catalog_module
 from vulfi_mcp.catalog import (
+    ASSOCIATION_ASSERTED,
+    ASSOCIATION_VERIFIED,
     SCHEMA_VERSION,
     CatalogError,
     CatalogSchemaError,
@@ -41,12 +44,23 @@ from vulfi_mcp.catalog import (
 from vulfi_mcp.prepare import (
     BACKEND_CHAINS,
     PreparationError,
+    _coverage,
+    _evidence_findings,
     _external_scope_report,
+    _failed_pass,
+    _failure_reason,
+    _identity_refusal,
     _merged_counts,
+    _reused_routing,
+    _merge_scan,
     _route_passes,
+    _RoutedRules,
+    identity_established,
     backend_chain,
+    propose_recovery,
     resolve_backend,
 )
+from vulfi_mcp.operator import proposal_briefing
 from vulfi_mcp.rules import load_stock_rules
 
 #: The two external tables exactly as schema version 1 declared them, copied
@@ -86,6 +100,50 @@ V1_EXTERNAL_FINDINGS = """
         UNIQUE (scope_id, rule_id, address_space, address, occurrence)
     )
 """
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _site(address: int, name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "stage": "instructions",
+        "start": address,
+        "end": address + 1,
+        "coverage": "complete",
+        "unvisited": [],
+        "reason": None,
+    }
+
+
+def _one_site_evidence(backend: str) -> dict[str, Any]:
+    """One call site whose constant-ness the first stock rule can judge."""
+    return {
+        "backend": backend,
+        "rule_index": 0,
+        "contexts": [{"params": [{"constant": False}, {"constant": False}]}],
+        "ranges": [_site(0x1000, "handler")],
+        "state": "evaluated",
+        "reason": None,
+    }
+
+
+def _two_site_evidence(backend: str) -> dict[str, Any]:
+    """Two call sites, the first of which matches no branch."""
+    return {
+        "backend": backend,
+        "rule_index": 0,
+        "contexts": [
+            {"params": [{"constant": True}, {"constant": True}]},
+            {"params": [{"constant": False}, {"constant": False}]},
+        ],
+        "ranges": [_site(0x1000, "clean"), _site(0x2000, "matching")],
+        "state": "evaluated",
+        "reason": None,
+    }
+
 
 DIGEST = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
@@ -667,3 +725,407 @@ def test_a_catalog_that_is_not_there_is_unavailable_not_empty(
     assert get_catalog(str(_binary(tmp_path))) is None
     assert not catalog_path().exists()
     assert list(managed_data_dir.rglob("*.sqlite3")) == []
+
+
+# -- fix round 1: the contract clauses the review found open ----------------
+
+
+def test_two_binaries_never_share_an_external_finding_id(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 1. Every target shares one catalog and `external_findings
+    # .finding_id` is that catalog's primary key, so an id that omits the
+    # source digest lets two images with the same backend, scope, rule,
+    # address and occurrence mint the same row — and the second scan's upsert
+    # rewrites the first target's finding with the wrong image's evidence.
+    first = tmp_path / "one" / "subject"
+    second = tmp_path / "two" / "subject"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"\x7fELFimage one")
+    second.write_bytes(b"\x7fELFimage two")
+    rule = load_stock_rules()[0]
+    evidence = _one_site_evidence("ghidra")
+
+    rows_one, state_one, _ = _evidence_findings(
+        "ghidra", "default", rule, 0, evidence, _sha(first)
+    )
+    rows_two, state_two, _ = _evidence_findings(
+        "ghidra", "default", rule, 0, evidence, _sha(second)
+    )
+    assert state_one == state_two == "evaluated"
+    assert rows_one and rows_two
+    assert rows_one[0]["id"] != rows_two[0]["id"]
+    assert _sha(first) in rows_one[0]["id"]
+    assert _sha(second) in rows_two[0]["id"]
+
+    # And the store really keeps them apart, through the primary key.
+    for binary, rows in ((first, rows_one), (second, rows_two)):
+        with open_catalog(str(binary)) as catalog:
+            _record(catalog, "ghidra", "default", "scan-1", findings=rows)
+    for binary, rows in ((first, rows_one), (second, rows_two)):
+        with open_catalog(str(binary)) as catalog:
+            held = catalog.external_finding(rows[0]["id"])
+            assert held is not None, binary
+            assert held["binary_sha256"] == _sha(binary)
+            assert catalog.external_totals()["total"] == 1
+
+
+def test_a_finding_cannot_be_minted_without_the_source_digest(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # The same clause, from the other side: no digest, no namespace, so no
+    # row — rather than a row minted outside the namespace that would collide.
+    rule = load_stock_rules()[0]
+    rows, state, reason = _evidence_findings(
+        "ghidra", "default", rule, 0, _one_site_evidence("ghidra"), None
+    )
+    assert rows == []
+    assert state == "unsupported"
+    assert "SHA-256 namespace" in str(reason)
+
+
+def test_an_asserted_association_is_not_an_established_identity(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 2. `ASSOCIATION_ASSERTED` is the catalog recording that a caller
+    # presented both identities together and nobody compared bytes. That may
+    # not become an aggregation.
+    binary = _binary(tmp_path)
+    with open_catalog(str(binary), "7f3a1c6e9b2d4f508a1c6e9b2d4f5081") as catalog:
+        assert catalog.source_association == ASSOCIATION_ASSERTED
+        assert catalog.source_sha256 is not None
+        # A request that named the binary hashed those very bytes a moment
+        # ago, so for it the digest is proof.
+        assert identity_established(catalog, is_database=False) is True
+        # A database-only request inherits the same unverified digest, and for
+        # it the gate must refuse: nobody compared anything.
+        assert identity_established(catalog, is_database=True) is False
+    with open_catalog(str(binary)) as catalog:
+        catalog.attach_source(
+            str(binary), {"kind": "input_fingerprint", "sha256": _sha(binary)}
+        )
+        assert catalog.source_association == ASSOCIATION_VERIFIED
+        # Once bytes really were compared, the same database-only request may
+        # join — and nothing short of that comparison lets it.
+        assert identity_established(catalog, is_database=True) is True
+
+
+def test_a_saved_database_never_reaches_an_external_session(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding 3. Matching an `.i64`'s bytes against a mapped copy of the same
+    # `.i64` proves the container, not the image it was built from, so the
+    # refusal has to happen before any provider session opens.
+    database = tmp_path / "subject.i64"
+    database.write_bytes(b"IDA2 container bytes")
+    _providers_toml(
+        tmp_path,
+        "\n".join(
+            (
+                "[ghidra]",
+                'transport = "stdio"',
+                'command = "/bin/false"',
+                "args = []",
+                "",
+                "[[ghidra.binaries]]",
+                f'local = "{tmp_path}"',
+                f'remote = "{tmp_path}"',
+                "",
+            )
+        ),
+        monkeypatch,
+    )
+    refusal = _identity_refusal("ghidra", str(database))
+    assert refusal is not None
+    assert "saved IDA database" in refusal
+    assert "nothing was analysed" in refusal
+    routed = _route_passes(str(database), ("ghidra", "r2"), ("strings",))
+    (row,) = routed.routing
+    assert row["state"] == "unverified"
+    assert routed.results == []
+
+
+def test_a_failed_pass_attempt_survives_a_restart_and_vetoes_complete(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Findings 4. The `failed` ruling lets the chain advance only because the
+    # failure is kept. Kept has to mean kept in the store: a later read, and a
+    # reused revision, must both still carry it, and neither may summarise the
+    # revision as complete because a second backend answered the same pass.
+    binary = _binary(tmp_path)
+    answered = {
+        "pass": "strings",
+        "backend": "r2",
+        "ranges": [{"start": 0x1000, "end": 0x2000}],
+        "coverage": "complete",
+        "applied_ids": [],
+        "candidate_ids": [],
+        "candidates": [],
+        "warnings": [],
+        "artifact_revision": None,
+    }
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_pass("prep-fail", _failed_pass("strings", "ghidra", "boom"))
+        catalog.record_pass("prep-fail", answered)
+
+    # A fresh open: nothing in memory, everything off disk.
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        recorded = reopened.pass_results("prep-fail")
+    assert _coverage(recorded) != "complete"
+    assert _coverage(recorded) == "partial"
+    failures = [entry for entry in recorded if _failure_reason(entry) == "boom"]
+    assert len(failures) == 1
+    assert failures[0]["backend"] == "ghidra"
+
+    rows = _reused_routing(("strings",), recorded)
+    (row,) = rows
+    # The pass is answered — by r2 — *and* the failure is reported beside it.
+    assert row["backend"] == "r2"
+    assert row["state"] == "answered"
+    assert [item["outcome"] for item in row["attempts"]] == ["failed"]
+    assert row["attempts"][0]["backend"] == "ghidra"
+    assert row["attempts"][0]["reason"] == "boom"
+
+
+def test_a_failed_rule_is_recorded_against_that_backends_scope() -> None:
+    # Finding 5. Left in transient `attempts` alone, the failure vanished as
+    # soon as the same backend evaluated any other rule.
+    rules = load_stock_rules()
+    states = {0: ("failed", "get_function_pcode drifted"), 1: ("evaluated", None)}
+    report = _external_scope_report("ghidra", rules, [0, 1], states, True, None)
+    assert report["state"] == "evaluated"
+    # A scope holding a failure may never retire a row.
+    assert report["coverage"] == "partial"
+    persisted = {row["rule_index"]: row for row in report["rule_coverage"]}
+    assert persisted[0]["state"] == "failed"
+    assert persisted[0]["reason"] == "get_function_pcode drifted"
+    assert "0" in str(report["reason"]) or "unsupported or failed" in str(
+        report["reason"]
+    )
+
+
+def test_each_finding_carries_its_own_sites_facts(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 9. One clean site before a matching one shifted every later
+    # finding's evidence onto a different call site.
+    rule = load_stock_rules()[0]
+    evidence = _two_site_evidence("ghidra")
+    rows, state, _ = _evidence_findings(
+        "ghidra", "default", rule, 0, evidence, "c" * 64
+    )
+    assert state == "evaluated"
+    # Only the second site matches, so its facts must be the second context's.
+    assert len(rows) == 1
+    assert rows[0]["evidence"]["facts"] is evidence["contexts"][1]
+    assert rows[0]["address"] == "0x2000"
+
+
+def test_a_backend_that_ran_and_found_nothing_is_a_measured_zero(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 12. `{}` is what this code reserves for "no store answered".
+    # A backend that demonstrably answered and held nothing is not that.
+    with open_catalog(str(_binary(tmp_path))) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[])
+        totals = catalog.external_totals()
+        counts = catalog.external_status_counts()
+    assert totals["by_backend"] == {"ghidra": {"total": 0, "stale": 0}}
+    assert counts["ghidra"]["Not Checked"] == 0
+    assert _merged_counts({}, counts) != {}
+    assert _merged_counts({}, counts)["aggregate"]["Not Checked"] == 0
+
+
+def test_a_scope_page_is_filtered_before_it_is_windowed(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 13. Earlier-sorting rows from another scope occupied the window
+    # and the call returned none while `scope_total` said otherwise.
+    binary = _binary(tmp_path)
+    early = _finding("ghidra", "custom:nightly", 0x1000)
+    late = _finding("ghidra", "default", 0x9000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "custom:nightly", "scan-n", findings=[early])
+        _record(catalog, "ghidra", "default", "scan-d", findings=[late])
+        page = catalog.page_external_findings(0, 1, scope="default")
+    assert page["total"] == 1
+    assert [row["id"] for row in page["findings"]] == [late["id"]]
+
+
+def test_review_show_runs_end_to_end_on_a_ghidra_proposal(
+    tmp_path: Path, managed_data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Finding 6. The operator path this task exists to enable raised
+    # `KeyError` on every external proposal, before confirmation and before
+    # `apply_ghidra_review` could ever run. This drives `vulfi-mcp review
+    # list` and `show` through the real CLI entry point on a real stored
+    # Ghidra proposal — no IDA database, because a Ghidra-headed preparation
+    # makes none.
+    from vulfi_mcp.operator import main as review
+
+    binary = _binary(tmp_path, b"\x7fELFghidra review subject")
+    candidate = {
+        "candidate_id": "ghidra-fn-401000",
+        "kind": "function",
+        "backend": "ghidra",
+        "address_space": "image",
+        "address": 0x401000,
+        "evidence": {
+            "slot": {"address": 0x402000, "value": 0x401000},
+            "owner": {"entry": 0x400F00, "end": 0x401000, "measured": True},
+        },
+        "confidence": 0.8,
+        "state": "candidate",
+        "reason": "the provider defines no function at this entry",
+    }
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_analysis(
+            "prep-ghidra",
+            requested_backend="ghidra",
+            artifact_path=str(tmp_path / "project"),
+            capability_fingerprint="adapter-test",
+            revision=7,
+        )
+        catalog.record_pass(
+            "prep-ghidra",
+            {
+                "pass": "functions",
+                "backend": "ghidra",
+                "ranges": [{"start": 0x400000, "end": 0x403000}],
+                "coverage": "partial",
+                "applied_ids": [],
+                "candidate_ids": [candidate["candidate_id"]],
+                "candidates": [candidate],
+                "warnings": [],
+                "artifact_revision": 7,
+            },
+        )
+
+    stored = propose_recovery(
+        str(binary),
+        "prep-ghidra",
+        [
+            {
+                "candidate_id": candidate["candidate_id"],
+                # Only the kinds Ghidra's writer really applies get this far.
+                "kind": "function_boundary",
+                "address_space": "image",
+                "address": 0x401000,
+                "value": {"end": 0x401020},
+                "evidence": {"slot": candidate["evidence"]["slot"]},
+                "rationale": "the slot names this entry and nothing defines it",
+            }
+        ],
+    )
+    assert stored["accepted_total"] == 1, stored["warnings"]
+    submission = stored["proposals"][0]
+    # Finding 8: the revision the proposal was computed against is persisted,
+    # so the briefing can show an operator the number the writer will compare.
+    assert submission["expected_revision"] == 7
+    proposal_id = str(submission["proposal_id"])
+
+    assert review(["list", "--path", str(binary)]) == 0
+    assert review(["show", "--path", str(binary), "--proposal-id", proposal_id]) == 0
+    rendered = capsys.readouterr().out
+    assert proposal_id in rendered
+    assert "at revision 7" in rendered
+    # The fields this command did not read say so, rather than printing a
+    # blank that reads as a fact about the provider's project.
+    assert "(not read from this backend)" in rendered
+    assert "what the candidate recorded when it was found" in rendered
+    assert "slot" in rendered
+
+    briefing = proposal_briefing(str(binary), proposal_id)
+    assert briefing["backend"] == "ghidra"
+    assert briefing["artifact_revision"] == 7
+    assert briefing["reviewable"] is True
+
+
+def test_a_scope_keeps_the_rule_definitions_it_ran(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 11. An ordinal coverage row is not a rule. After a restart the
+    # exact validated definition has to still be there, including for a rule
+    # that was clean or unsupported and left no finding behind.
+    binary = _binary(tmp_path)
+    rules = [dict(rule) for rule in load_stock_rules()[:2]]
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_external_scan(
+            backend="ghidra",
+            scope="default",
+            scan_id="scan-1",
+            scanned_at="2026-10-01T00:00:00Z",
+            state="evaluated",
+            coverage="partial",
+            reason=None,
+            capability_fingerprint="adapter-test",
+            rules=rules,
+            rule_coverage=[],
+            warnings=[],
+            findings=[],
+        )
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        held = reopened.external_scope("ghidra", "default")
+    assert held is not None
+    assert held["rules"] == rules
+    assert held["total"] == 0
+
+
+def test_an_external_only_scan_names_the_id_its_rows_really_carry(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    # Finding 10. The empty IDA scan id was replaced with a one-second
+    # timestamp that was never written back, so two scans in the same second
+    # shared an id — the second read the first's rows as observed and retired
+    # nothing — and the public result named an id no stored row carried.
+    binary = _binary(tmp_path)
+    rules = load_stock_rules()[:1]
+    row = _finding("ghidra", "default", 0x401000)
+    routed = _RoutedRules(
+        routing=[],
+        coverage=[],
+        findings={"ghidra": [row]},
+        scopes={
+            "ghidra": {
+                "state": "evaluated",
+                "coverage": "partial",
+                "reason": None,
+                "rule_coverage": [],
+            }
+        },
+        warnings=[],
+    )
+    prepared = {"managed_idb_id": None, "source_sha256": None}
+    identifiers = []
+    for _ in range(2):
+        result: dict[str, Any] = {
+            "scan_id": "",
+            "scanned_at": "2026-10-01T00:00:00Z",
+            "rule_coverage": [],
+            "findings": [],
+            "scope_total": 0,
+            "target_total": 0,
+            "status_counts": {},
+            "scope_health": {},
+            "store_health": {},
+            "coverage": "complete",
+            "warnings": [],
+        }
+        merged = _merge_scan(str(binary), result, routed, prepared, "default", rules)
+        identifiers.append(str(merged["scan_id"]))
+    assert identifiers[0] and identifiers[0] != identifiers[1]
+
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        held = reopened.external_finding(row["id"])
+        scope = reopened.external_scope("ghidra", "default")
+    assert held is not None
+    # The id the result named is the id the stored row carries.
+    assert held["last_seen_scan_id"] == identifiers[-1]
+    assert scope["scan_id"] == identifiers[-1]

@@ -59,6 +59,7 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
 
@@ -321,7 +322,13 @@ def _external_briefing(
         "artifact_revision": _whole(held.get("expected_revision")),
         "proposal": dict(held),
         "candidate": candidate,
-        "site": (candidate or {}).get("evidence") or {},
+        # Deliberately *not* the IDA site shape with blanks in it: the fields
+        # this command did not read are absent, so the renderer says it did
+        # not read them rather than printing a value that reads as a fact.
+        "site": {
+            "size": body["end"] - body["start"],
+            "recorded_evidence": (candidate or {}).get("evidence") or {},
+        },
         "conflicts": [],
         "effect": _external_effect(backend, body),
         "reviewable": reason is None,
@@ -1345,6 +1352,20 @@ def _render_list(page: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+#: What the briefing prints where the artifact was not read for this field.
+#:
+#: Deliberately not ``(none)``. "This server did not look here" and "there is
+#: nothing here" are different statements to put in front of a reviewer who is
+#: about to approve a write, and only one of them is true of an external
+#: backend whose project this command does not open.
+_UNREAD: Final = "(not read from this backend)"
+
+
+def _site_field(site: Mapping[str, Any], key: str) -> Any:
+    """One field of the site under review, or the mark that it was not read."""
+    return site[key] if key in site else _UNREAD
+
+
 def _render_briefing(briefing: Briefing) -> str:
     proposal = briefing["proposal"]
     site = briefing["site"]
@@ -1352,7 +1373,9 @@ def _render_briefing(briefing: Briefing) -> str:
     # A range outside every mapped segment has no segment name, and an
     # operator reading "in segment None" would be reading a Python repr
     # where a fact about the image belongs.
-    segment = _text(site["segment"]) or "(unmapped)"
+    segment = (
+        _text(site["segment"]) or "(unmapped)" if "segment" in site else _UNREAD
+    )
     lines = [
         f"Proposal {proposal['proposal_id']} — {proposal['kind']}"
         f" ({proposal['state']})",
@@ -1361,8 +1384,8 @@ def _render_briefing(briefing: Briefing) -> str:
         f" at revision {briefing['artifact_revision']}",
         f"  analysis        {proposal['analysis_id']}",
         f"  candidate       {proposal['candidate_id']}",
-        f"  range           {site['start']:#x} .. {site['end']:#x}"
-        f" ({site['size']} bytes) in segment {segment}",
+        f"  range           {_render_address(proposal['address'])}"
+        f" ({_site_field(site, 'size')} bytes) in segment {segment}",
         f"  proposed        {briefing['effect']}",
         f"  value           {value}",
         f"  rationale       {proposal['rationale']}",
@@ -1370,18 +1393,31 @@ def _render_briefing(briefing: Briefing) -> str:
     ]
     for fact, claimed in sorted(proposal["evidence"].items()):
         lines.append(f"      {fact} = {json.dumps(claimed, default=str)}")
-    quoted = str(site["bytes_hex"])[: _QUOTED_BRIEFING_BYTES * 2]
-    lines.extend(
-        [
-            "  what the managed analysis holds here, now",
-            f"      original bytes  {quoted or '(none)'}",
-            f"      bytes sha256    {site['bytes_sha256']}",
-            f"      name            {site['name'] or '(none)'}",
-            f"      function        {_render_function(site['function'])}",
-            f"      type            {_render_type(site['existing_type'])}",
-            f"      defined items   {_render_items(site['items'])}",
-        ]
-    )
+    if "bytes_hex" in site:
+        quoted = str(site["bytes_hex"])[: _QUOTED_BRIEFING_BYTES * 2]
+        lines.extend(
+            [
+                "  what the managed analysis holds here, now",
+                f"      original bytes  {quoted or '(none)'}",
+                f"      bytes sha256    {site['bytes_sha256']}",
+                f"      name            {site['name'] or '(none)'}",
+                f"      function        {_render_function(site['function'])}",
+                f"      type            {_render_type(site['existing_type'])}",
+                f"      defined items   {_render_items(site['items'])}",
+            ]
+        )
+    else:
+        # An external backend's project is not opened by this command, so
+        # there is no "holds here, now" to print. What the catalog recorded
+        # when the candidate was found is shown instead, said as that.
+        lines.append(f"  the managed analysis here was {_UNREAD}")
+        lines.append("  what the candidate recorded when it was found")
+        recorded = site.get("recorded_evidence")
+        if isinstance(recorded, dict) and recorded:
+            for fact, held in sorted(recorded.items()):
+                lines.append(f"      {fact} = {json.dumps(held, default=str)}")
+        else:
+            lines.append("      (none)")
     if briefing["candidate"] is not None:
         candidate = briefing["candidate"]
         lines.append(
@@ -1399,6 +1435,12 @@ def _render_briefing(briefing: Briefing) -> str:
     if briefing["reason"]:
         lines.append(f"  NOT REVIEWABLE  {briefing['reason']}")
     return "\n".join(lines)
+
+
+def _render_address(address: object) -> str:
+    if isinstance(address, int) and not isinstance(address, bool):
+        return f"{address:#x}"
+    return "(no provable address)"
 
 
 def _render_function(function: object) -> str:
