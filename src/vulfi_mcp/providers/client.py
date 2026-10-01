@@ -55,6 +55,7 @@ import re
 import threading
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -90,7 +91,6 @@ __all__ = [
     "ProviderResponseError",
     "ProviderSession",
     "ProviderUnavailableError",
-    "UNCLASSIFIED_KEYWORDS",
     "checked_call",
     "provider_session",
     "rule_contexts",
@@ -441,7 +441,7 @@ async def checked_call(
         session.backend,
         capability,
         arguments,
-        min(SCHEMA_DEADLINE_SECONDS, session._limits.call_timeout_seconds),
+        session._limits.schema_deadline_seconds,
     )
     try:
         result = await session._client.call_tool(
@@ -669,14 +669,19 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
             "its input schema nests deeper than the"
             f" {limits.max_response_depth} level depth budget"
         )
-    found = _refused_keywords(schema)
-    unclassified = [name for name in found if name in UNCLASSIFIED_KEYWORDS]
+    dialect, refusal = _select_dialect(schema)
+    if refusal is not None:
+        return refusal
+    assert dialect is not None
+    found = _refused_keywords(schema, dialect)
+    unclassified = [name for name in found if name in dialect.unclassified]
     if unclassified:
         return (
             f"its input schema uses {unclassified}, which the installed"
-            " JSON Schema library evaluates but this server has not classified"
-            " as a schema position; a keyword whose shape is unknown is refused"
-            " rather than walked past, because what it can reach is unknown too"
+            f" JSON Schema library evaluates for {dialect.name} but this server"
+            " has not classified as a schema position; a keyword whose shape is"
+            " unknown is refused rather than walked past, because what it can"
+            " reach is unknown too"
         )
     if found:
         return (
@@ -702,111 +707,201 @@ def _unusable_schema(schema: dict[str, Any], limits: ProviderLimits) -> str | No
     return None
 
 
-#: Keywords whose value is one subschema.
-_ONE_SUBSCHEMA: Final[frozenset[str]] = frozenset(
-    {
-        "additionalItems",
-        "additionalProperties",
-        "contains",
-        "contentSchema",
-        "else",
-        "if",
-        "items",
-        "not",
-        "propertyNames",
-        "then",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    }
-)
+def _select_dialect(schema: Mapping[str, Any]) -> tuple[_Dialect | None, str | None]:
+    """The draft this schema will be evaluated under, or why it is refused.
 
-#: Keywords whose value is a list of subschemas. ``items`` also appears above:
-#: older drafts spell a tuple of schemas that way, so both forms are walked.
-_SUBSCHEMA_LIST: Final[frozenset[str]] = frozenset(
-    {"allOf", "anyOf", "items", "oneOf", "prefixItems"}
-)
-
-#: Keywords whose value is a table *keyed by names the author chose*, so those
-#: names are data and only the values below them are schemas. Without this, a
-#: tool with an argument honestly called ``pattern`` would be refused for using
-#: the ``pattern`` keyword it never used.
-#:
-#: ``dependencies`` is the draft-07 spelling, and its values are *either* a
-#: subschema or a list of property names; the walk descends into the first and
-#: steps over the second, because a list of names holds no keywords. Leaving it
-#: out is how the first version of these tables reopened the very class they
-#: exist to close — ``Draft4/6/7Validator`` evaluates those subschemas in full,
-#: so a 200-byte draft-07 schema hid a catastrophic ``pattern`` where nothing
-#: looked.
-_NAMED_SUBSCHEMAS: Final[frozenset[str]] = frozenset(
-    {
-        "$defs",
-        "definitions",
-        "dependencies",
-        "dependentSchemas",
-        "patternProperties",
-        "properties",
-    }
-)
-
-#: Keywords whose value contains no subschema anywhere: assertions about the
-#: instance itself. Listed so the completeness check below can tell "this
-#: keyword needs no walking" from "nobody has decided what this keyword is".
-_INSTANCE_KEYWORDS: Final[frozenset[str]] = frozenset(
-    {
-        "const",
-        "dependentRequired",
-        "enum",
-        "exclusiveMaximum",
-        "exclusiveMinimum",
-        "format",
-        "maxItems",
-        "maxLength",
-        "maxProperties",
-        "maximum",
-        "minItems",
-        "minLength",
-        "minProperties",
-        "minimum",
-        "multipleOf",
-        "required",
-        "type",
-        "uniqueItems",
-    }
-)
-
-#: Every keyword any installed draft actually evaluates, read from the library
-#: rather than typed out here. The four tables above are a *second* blocklist,
-#: and the first one failed precisely because a hand-written list went stale;
-#: this is what stops that happening twice.
-_SCHEMA_KEYWORDS: Final[frozenset[str]] = frozenset().union(
-    *(
-        frozenset(validator.VALIDATORS)
-        for validator in (
-            getattr(jsonschema, name, None)
-            for name in (
-                "Draft4Validator",
-                "Draft6Validator",
-                "Draft7Validator",
-                "Draft201909Validator",
-                "Draft202012Validator",
-            )
+    The dialect comes from the schema's own ``$schema``, exactly as
+    :func:`jsonschema.validators.validator_for` reads it — that is the whole
+    point: a provider chooses the vocabulary its schema is evaluated with, so
+    the vocabulary is provider-controlled input like everything else here.
+    """
+    declared = schema.get("$schema")
+    if declared is None:
+        latest = jsonschema.validators._LATEST_VERSION
+        return DIALECTS[latest.__name__], None
+    if not isinstance(declared, str):
+        return None, (
+            f"its input schema declares a {type(declared).__name__} $schema,"
+            " which names no dialect at all"
         )
-        if validator is not None
-    )
-)
+    uri = declared.rstrip("#")
+    if uri not in SUPPORTED_DIALECTS:
+        return None, _quote(
+            f"its input schema declares the {declared!r} dialect, which this"
+            " server does not evaluate: only the drafts it has classified and"
+            f" tested are accepted ({sorted(SUPPORTED_DIALECTS)})"
+        )
+    validator = _META_SCHEMAS.get(uri)
+    if validator is None:  # pragma: no cover - the two sets agree
+        return None, f"its input schema declares the unknown dialect {declared!r}"
+    return DIALECTS[validator.__name__], None
 
-#: Keywords a validator evaluates that this module has not placed in any of the
-#: tables above — empty for the pinned ``jsonschema``, and asserted empty by the
-#: suite so a library upgrade that adds one is a test failure rather than a
-#: silent hole. If one ever appears at run time, a schema using it is refused:
-#: not knowing a keyword's shape means not knowing what it can reach.
-UNCLASSIFIED_KEYWORDS: Final[frozenset[str]] = _SCHEMA_KEYWORDS - (
-    _ONE_SUBSCHEMA
-    | _SUBSCHEMA_LIST
-    | _NAMED_SUBSCHEMAS
-    | _INSTANCE_KEYWORDS
-    | _REFUSED_KEYWORDS
+
+#: How one keyword's value is shaped, and therefore what the walk must do with
+#: it. Three answers only:
+#:
+#: ``"schema"``
+#:     the value is a subschema, or a list of them — both are descended into,
+#:     and a boolean or a string there is simply skipped;
+#: ``"named"``
+#:     the value is a table keyed by *names the schema's author chose*, so those
+#:     names are data and only the values below them are schemas. Without this,
+#:     a tool with an argument honestly called ``pattern`` would be refused for
+#:     a keyword it never used;
+#: ``"instance"``
+#:     the value is an assertion about the instance and holds no subschema.
+#:
+#: Shapes shared by every dialect that has the keyword. Per-dialect differences
+#: go in :data:`_DIALECT_KINDS` below, and that split is the whole point of this
+#: round: a keyword's shape is a property of **(dialect, keyword)**, not of the
+#: name. ``type`` is the proof — an instance assertion from draft-04 onward, and
+#: in draft-03 a union that may contain subschemas.
+_SHARED_KINDS: Final[dict[str, str]] = {
+    "$dynamicRef": "refused",
+    "$recursiveRef": "refused",
+    "$ref": "refused",
+    "additionalItems": "schema",
+    "additionalProperties": "schema",
+    "allOf": "schema",
+    "anyOf": "schema",
+    "const": "instance",
+    "contains": "schema",
+    "contentSchema": "schema",
+    "dependencies": "named",
+    "dependentRequired": "instance",
+    "dependentSchemas": "named",
+    "divisibleBy": "instance",
+    "else": "schema",
+    "enum": "instance",
+    "exclusiveMaximum": "instance",
+    "exclusiveMinimum": "instance",
+    "format": "instance",
+    "if": "schema",
+    "items": "schema",
+    "maxItems": "instance",
+    "maxLength": "instance",
+    "maxProperties": "instance",
+    "maximum": "instance",
+    "minItems": "instance",
+    "minLength": "instance",
+    "minProperties": "instance",
+    "minimum": "instance",
+    "multipleOf": "instance",
+    "not": "schema",
+    "oneOf": "schema",
+    "pattern": "refused",
+    "patternProperties": "refused",
+    "prefixItems": "schema",
+    "properties": "named",
+    "propertyNames": "schema",
+    "required": "instance",
+    "then": "schema",
+    "type": "instance",
+    "unevaluatedItems": "schema",
+    "unevaluatedProperties": "schema",
+    "uniqueItems": "instance",
+}
+
+#: Where one dialect disagrees with :data:`_SHARED_KINDS`.
+#:
+#: Draft-03 is the dialect that proved this table has to exist. ``extends`` and
+#: ``disallow`` descend into subschemas and have no counterpart in later drafts;
+#: ``type`` may be ``["null", {<subschema>}]``. A 182-byte draft-03 schema hid a
+#: catastrophic ``pattern`` under ``extends`` and froze this process's event
+#: loop for 5.12 seconds, because the vocabulary was keyed by name and read from
+#: five hand-typed classes that did not include it.
+_DIALECT_KINDS: Final[dict[str, dict[str, str]]] = {
+    "Draft3Validator": {
+        "disallow": "schema",
+        "extends": "schema",
+        "type": "schema",
+    }
+}
+
+
+@dataclass(frozen=True)
+class _Dialect:
+    """One JSON Schema draft, as this module understands it.
+
+    ``kinds`` maps each keyword the draft's validator evaluates to the shape
+    this module knows it has; ``unclassified`` is the rest — the keywords the
+    library will act on that nothing here has placed.
+    """
+
+    name: str
+    uri: str | None
+    kinds: Mapping[str, str]
+    unclassified: frozenset[str]
+
+
+#: Every dialect :func:`jsonschema.validators.validator_for` can hand back,
+#: read from the registry **that function itself consults**. The previous
+#: version derived from five hand-typed class names and so could not notice the
+#: sixth, draft-03; the test re-typed the same five and could not notice it
+#: either. Nothing here is typed out, so nothing here can disagree with the
+#: selector.
+_META_SCHEMAS: Final[Mapping[str, Any]] = jsonschema.validators._META_SCHEMAS
+
+
+def _dialect(validator: Any, uri: str | None) -> _Dialect:
+    """Classify one validator's whole vocabulary, keyword by keyword."""
+    overrides = _DIALECT_KINDS.get(validator.__name__, {})
+    kinds: dict[str, str] = {}
+    unclassified: set[str] = set()
+    for keyword in validator.VALIDATORS:
+        kind = overrides.get(keyword, _SHARED_KINDS.get(keyword))
+        if kind is None:
+            unclassified.add(keyword)
+        else:
+            kinds[keyword] = kind
+    return _Dialect(
+        name=validator.__name__,
+        uri=uri,
+        kinds=kinds,
+        unclassified=frozenset(unclassified),
+    )
+
+
+#: Every dialect, by validator class name, built from the registry above. The
+#: selector's fallback for a schema that names no ``$schema`` is
+#: ``_LATEST_VERSION``, which the registry already carries; it is added here
+#: only if some future library stops listing it.
+DIALECTS: Final[dict[str, _Dialect]] = {
+    validator.__name__: _dialect(validator, uri)
+    for uri, validator in sorted(_META_SCHEMAS.items())
+}
+
+if jsonschema.validators._LATEST_VERSION.__name__ not in DIALECTS:  # pragma: no cover
+    _latest = jsonschema.validators._LATEST_VERSION
+    DIALECTS[_latest.__name__] = _dialect(_latest, None)
+
+#: ``validator class name -> keywords it evaluates that nothing here classifies``.
+#: Empty for the pinned ``jsonschema``, asserted empty by the suite, and refused
+#: at run time if one ever appears: not knowing a keyword's shape means not
+#: knowing what it can reach.
+UNCLASSIFIED_KEYWORDS: Final[dict[str, frozenset[str]]] = {
+    name: dialect.unclassified for name, dialect in DIALECTS.items()
+}
+
+#: The dialects this server has classified **and tested**, by meta-schema URI.
+#: Draft-03 is deliberately absent: it is now classified correctly, and it is
+#: still refused, because this server has no reason to evaluate a dialect
+#: nobody ships and every round of this review has shown that the classification
+#: is the thing most likely to be wrong. Belt and braces, in that order — the
+#: derivation first, so a refusal is not the only thing standing between a
+#: provider and this process's event loop.
+#:
+#: Both installed backends emit modern schemas: radare2-mcp verified live across
+#: its 32 tools, GhidraMCP cross-checked across its 222. The cost of being wrong
+#: here is a provider refused with a reason naming the dialect.
+SUPPORTED_DIALECTS: Final[frozenset[str]] = frozenset(
+    {
+        "http://json-schema.org/draft-04/schema",
+        "http://json-schema.org/draft-06/schema",
+        "http://json-schema.org/draft-07/schema",
+        "https://json-schema.org/draft/2019-09/schema",
+        "https://json-schema.org/draft/2020-12/schema",
+    }
 )
 
 
@@ -829,33 +924,38 @@ def _too_deep(value: object, limit: int) -> bool:
     return False
 
 
-def _refused_keywords(schema: object) -> list[str]:
-    """Which refused or unclassified keywords this schema actually uses.
+def _refused_keywords(schema: object, dialect: _Dialect) -> list[str]:
+    """Which refused or unclassified keywords this schema uses, in ``dialect``.
 
-    Only true schema positions are walked — the three tables above are the
-    whole vocabulary this descends through. A dict under an unrecognised key is
-    an annotation, not a subschema: a provider that tags its tools with
-    ``"x-meta": {"pattern": ...}`` has not used the ``pattern`` keyword, and
-    refusing it would cost a legitimate tool for nothing. A keyword a validator
-    *does* evaluate but this module has not classified is reported too, because
-    a position nobody has placed is a position nobody has checked.
+    The dialect carries one ``keyword -> kind`` map, so the same name can be
+    walked in one draft and stepped over in another — ``type`` is both. A key
+    the dialect does not evaluate at all is an annotation, not a subschema: a
+    provider that tags its tools with ``"x-meta": {"pattern": …}`` has not used
+    the ``pattern`` keyword, and refusing it would cost a legitimate tool for
+    nothing. A keyword the dialect *does* evaluate but nothing here classifies
+    is reported, because a position nobody has placed is a position nobody has
+    checked.
 
     Iterative, for the reason :func:`_too_deep` is.
     """
     found: set[str] = set()
-    wanted = _REFUSED_KEYWORDS | UNCLASSIFIED_KEYWORDS
     stack: list[object] = [schema]
     while stack:
         item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+            continue
         if not isinstance(item, dict):
             continue
-        found |= set(item) & wanted
         for key, value in item.items():
-            if key in _NAMED_SUBSCHEMAS and isinstance(value, dict):
-                stack.extend(value.values())
-            elif key in _SUBSCHEMA_LIST and isinstance(value, list):
-                stack.extend(value)
-            elif key in _ONE_SUBSCHEMA or key in _SUBSCHEMA_LIST:
+            if key in _REFUSED_KEYWORDS or key in dialect.unclassified:
+                found.add(key)
+                continue
+            kind = dialect.kinds.get(key)
+            if kind == "named":
+                if isinstance(value, dict):
+                    stack.extend(value.values())
+            elif kind == "schema":
                 stack.append(value)
     return sorted(found)
 
@@ -954,14 +1054,6 @@ def _quote(text: str) -> str:
 
 
 # -- arguments and responses ------------------------------------------------
-
-
-#: Wall-clock ceiling on validating one call's arguments. Checking a handful
-#: of adapter-authored scalars against a pinned schema is a matter of
-#: microseconds, so anything near this bound is already pathological; it exists
-#: only as the second layer behind the pin-time refusal above, for a cost shape
-#: nobody has thought of yet.
-SCHEMA_DEADLINE_SECONDS: Final = 5.0
 
 
 async def _check_arguments(

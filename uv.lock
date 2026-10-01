@@ -861,7 +861,7 @@ requires-dist = [
     { name = "ida-mcp", specifier = "==20260924.0.3" },
     { name = "ida-nexus", specifier = "==0.13.0" },
     { name = "idapro", specifier = "==0.0.10" },
-    { name = "jsonschema", specifier = ">=4.26" },
+    { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "mcp", specifier = "==2.2.0" },
 ]
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -41,6 +42,7 @@ from vulfi_mcp.ida_runtime import (
 from vulfi_mcp.providers import (
     CONFIG_FILENAME,
     FORBIDDEN_TOOLS,
+    MIN_SCHEMA_DEADLINE_SECONDS,
     PROVIDER_CONFIG_ENV,
     CapabilityUnavailableError,
     ForbiddenToolError,
@@ -55,7 +57,6 @@ from vulfi_mcp.providers import (
     ProviderResponseError,
     ProviderSession,
     ProviderUnavailableError,
-    UNCLASSIFIED_KEYWORDS,
     checked_call,
     load_provider_config,
     provider_session,
@@ -954,50 +955,151 @@ def test_a_draft07_dependencies_subschema_is_walked(
     assert "mov eax, 1" in " ".join(_run(usable())["text"])
 
 
-def test_every_keyword_a_validator_evaluates_is_classified() -> None:
-    """The position tables are a blocklist too, so they are checked, not trusted.
+def test_every_dialect_the_selector_can_choose_is_classified() -> None:
+    """The classification is checked against the library, never re-typed here.
 
-    The first blocklist went stale and reopened a hole; the tables that replaced
-    it did the same thing one round later, by forgetting draft-07
-    ``dependencies``. So the tables are compared against what the installed
-    library actually evaluates: a new draft, or a library upgrade that adds a
-    keyword, fails here rather than becoming a position nobody walks.
+    Three rounds of this review were the same mistake at a different level: a
+    hand-written list of keywords went stale, the hand-written list of
+    *positions* that replaced it went stale, and then the hand-written list of
+    five validator **classes** the derivation read through turned out to miss
+    the sixth — draft-03 — which `validator_for` will happily select from a
+    provider's own `$schema`. The previous version of this test re-typed those
+    same five names, so the test and the thing under test shared the error and
+    could not see it.
+
+    So this derives its enumeration from the one registry the selector itself
+    consults, and checks the classification per *(dialect, keyword)* — because
+    a keyword's shape is a property of the pair, not of the name: `type` is an
+    instance assertion from draft-04 onward and a union that may contain
+    subschemas in draft-03.
     """
-    assert UNCLASSIFIED_KEYWORDS == frozenset(), sorted(UNCLASSIFIED_KEYWORDS)
+    registry = dict(jsonschema.validators._META_SCHEMAS)
+    assert registry, "the library exposes no meta-schema registry"
 
-    classified = (
-        client._ONE_SUBSCHEMA
-        | client._SUBSCHEMA_LIST
-        | client._NAMED_SUBSCHEMAS
-        | client._INSTANCE_KEYWORDS
-        | client._REFUSED_KEYWORDS
-    )
-    for name in (
-        "Draft4Validator",
-        "Draft6Validator",
-        "Draft7Validator",
-        "Draft201909Validator",
-        "Draft202012Validator",
-    ):
-        validator = getattr(jsonschema, name, None)
-        if validator is None:  # pragma: no cover - older library
-            continue
-        missing = sorted(set(validator.VALIDATORS) - classified)
-        assert missing == [], f"{name} evaluates unclassified keyword(s) {missing}"
+    # Every dialect the selector can hand back is classified here...
+    for validator in registry.values():
+        assert validator.__name__ in client.DIALECTS, validator.__name__
+    assert jsonschema.validators._LATEST_VERSION.__name__ in client.DIALECTS
+
+    # ...and no dialect has a keyword nobody placed.
+    unplaced = {
+        name: sorted(missing)
+        for name, missing in client.UNCLASSIFIED_KEYWORDS.items()
+        if missing
+    }
+    assert unplaced == {}, unplaced
+
+    for validator in registry.values():
+        dialect = client.DIALECTS[validator.__name__]
+        missing = sorted(set(validator.VALIDATORS) - set(dialect.kinds))
+        assert missing == [], f"{validator.__name__} has unplaced {missing}"
+
+    # The pair, not the name: the same keyword, classified differently.
+    assert client.DIALECTS["Draft3Validator"].kinds["type"] == "schema"
+    assert client.DIALECTS["Draft202012Validator"].kinds["type"] == "instance"
 
     # And an unclassified keyword, if one ever appears, is a refusal rather
     # than something the walk steps over.
     pretend = {"type": "object", "properties": {}, "someFutureKeyword": {}}
-    monkeyed = frozenset({"someFutureKeyword"})
-    original = client.UNCLASSIFIED_KEYWORDS
-    client.UNCLASSIFIED_KEYWORDS = monkeyed  # type: ignore[misc]
+    latest = client.DIALECTS[jsonschema.validators._LATEST_VERSION.__name__]
+    future = dataclasses.replace(
+        latest, unclassified=frozenset({"someFutureKeyword"})
+    )
+    original = client.DIALECTS[latest.name]
+    client.DIALECTS[latest.name] = future
     try:
         reason = client._unusable_schema(pretend, ProviderLimits())
     finally:
-        client.UNCLASSIFIED_KEYWORDS = original  # type: ignore[misc]
+        client.DIALECTS[latest.name] = original
     assert reason is not None
     assert "someFutureKeyword" in reason
     assert "has not classified" in reason
+
+
+def test_a_dialect_this_server_has_not_tested_is_refused() -> None:
+    """Belt to the derivation's braces, and the belt names the dialect.
+
+    Draft-03 is classified correctly now — the assertions below prove the walk
+    finds the `pattern` under `extends` — and it is *still* refused, because
+    this server has no reason to evaluate a dialect no provider ships and the
+    classification is the thing this review has shown most likely to be wrong.
+    """
+    hostile = {
+        "$schema": "http://json-schema.org/draft-03/schema#",
+        "type": "object",
+        "properties": {"address": {"type": "string"}},
+        "extends": {"properties": {"address": {"pattern": "(a+)+$"}}},
+    }
+    reason = client._unusable_schema(hostile, ProviderLimits())
+    assert reason is not None
+    assert "draft-03" in reason
+    assert "does not evaluate" in reason
+
+    # Underneath the refusal, the classification holds on its own: these are
+    # the three draft-03 shapes that the name-keyed tables walked straight past.
+    draft3 = client.DIALECTS["Draft3Validator"]
+    assert client._refused_keywords(hostile, draft3) == ["pattern"]
+    assert client._refused_keywords(
+        {"disallow": [{"pattern": "(a+)+$"}]}, draft3
+    ) == ["pattern"]
+    assert client._refused_keywords(
+        {"type": ["null", {"pattern": "(a+)+$"}]}, draft3
+    ) == ["pattern"]
+    # Reference reachability under `extends`, which needed no long argument at
+    # all: 2,014 bytes doubling to 18.4 s on an ordinary `{"address": "0x1000"}`.
+    # The walk stops at the first refused keyword, so `definitions` is enough.
+    assert client._refused_keywords(
+        {"extends": {"definitions": {"d": {"$ref": "#/definitions/d"}}}}, draft3
+    ) == ["definitions"]
+
+    # An unparsable or unknown dialect is refused by name too.
+    for declared in ("https://example.invalid/schema#", 7):
+        refusal = client._unusable_schema(
+            {"$schema": declared, "type": "object", "properties": {}},
+            ProviderLimits(),
+        )
+        assert refusal is not None
+
+
+def test_the_schema_deadline_is_its_own_bound_with_a_floor(
+    configure: Callable[[str], dict[str, ProviderConfig]], binary: Path
+) -> None:
+    """Local CPU and network patience are different numbers, and one has a floor.
+
+    The floor is measured, not guessed: the deadline is awaited through
+    ``call_soon_threadsafe``, so what it bounds is validation time *plus* loop
+    scheduling latency — at 50 ms, 18 of 30 legitimate validations were refused
+    with about 0.9 ms of real work behind them.
+    """
+    mapping = (
+        f"[[r2.binaries]]\nlocal = {json.dumps(str(binary))}\n"
+        f"remote = {json.dumps(str(binary))}\n"
+    )
+    head = (
+        f'[r2]\ntransport = "stdio"\ncommand = {json.dumps(sys.executable)}\n'
+        f"args = []\n"
+    )
+
+    # Tightening network patience must not touch the CPU bound.
+    loaded = configure(
+        head + "[r2.limits]\ncall_timeout_seconds = 2.0\n" + mapping
+    )["r2"]
+    assert loaded.limits.call_timeout_seconds == 2.0
+    assert (
+        loaded.limits.schema_deadline_seconds
+        == ProviderLimits().schema_deadline_seconds
+    )
+
+    with pytest.raises(ProviderConfigError, match="schema_deadline_seconds"):
+        configure(
+            head + "[r2.limits]\nschema_deadline_seconds = 0.05\n" + mapping
+        )
+    assert (
+        configure(head + "[r2.limits]\nschema_deadline_seconds = 1.0\n" + mapping)[
+            "r2"
+        ].limits.schema_deadline_seconds
+        == MIN_SCHEMA_DEADLINE_SECONDS
+    )
 
 
 def test_a_vendor_annotation_is_not_mistaken_for_a_subschema(
@@ -1055,7 +1157,7 @@ def test_validation_that_will_not_finish_becomes_a_refusal(
             remote=binary,
             server_log=server_log,
             sentinel=sentinel,
-            call_timeout=2.0,
+            limits=f"schema_deadline_seconds = {MIN_SCHEMA_DEADLINE_SECONDS}\n",
         )
     )["r2"]
 
@@ -1073,7 +1175,7 @@ def test_validation_that_will_not_finish_becomes_a_refusal(
                 await checked_call(
                     session,
                     "beta_text",
-                    # O(n^2) in pure Python: ~9 s here, so the 2 s deadline
+                    # O(n^2) in pure Python: ~9 s here, so the 1 s deadline
                     # fires well before it finishes. A catastrophic regex would
                     # not work as this test's subject, because `re` holds the
                     # GIL and freezes the loop the deadline runs on — which is
@@ -1095,8 +1197,8 @@ def test_validation_that_will_not_finish_becomes_a_refusal(
 
     reason, elapsed = _run(exercise())
     assert "did not finish validating" in reason
-    assert "2.0 seconds" in reason
-    assert 1.5 < elapsed < 6.0, elapsed
+    assert f"{MIN_SCHEMA_DEADLINE_SECONDS} seconds" in reason
+    assert MIN_SCHEMA_DEADLINE_SECONDS * 0.8 < elapsed < 6.0, elapsed
 
 
 def test_an_unevaluatable_schema_is_a_refusal_not_a_foreign_exception(

@@ -50,8 +50,9 @@ The whole format, with every optional key shown::
     sha256_field = "sha256"
 
     [ghidra.limits]                          # every key optional
-    call_timeout_seconds = 120.0
+    call_timeout_seconds = 120.0             # patience for an answer over the wire
     startup_timeout_seconds = 120.0
+    schema_deadline_seconds = 5.0            # local CPU bound; floor of 1.0
     max_response_bytes = 4194304
     max_response_depth = 24
     max_response_items = 256
@@ -89,6 +90,7 @@ from vulfi_mcp.ida_adapter import data_dir
 
 __all__ = [
     "AttestConfig",
+    "MIN_SCHEMA_DEADLINE_SECONDS",
     "CONFIG_FILENAME",
     "FORBIDDEN_TOOLS",
     "PROVIDER_BACKENDS",
@@ -131,6 +133,12 @@ FORBIDDEN_TOOLS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: The smallest schema-validation deadline an operator may configure. Measured,
+#: not guessed: below roughly this, the bound is dominated by event-loop
+#: scheduling latency rather than by validation, and starts refusing legitimate
+#: schemas that cost under a millisecond of real work.
+MIN_SCHEMA_DEADLINE_SECONDS: Final = 1.0
+
 _TRANSPORTS: Final[frozenset[str]] = frozenset({"stdio", "loopback"})
 
 _BACKEND_KEYS: Final[frozenset[str]] = frozenset(
@@ -152,6 +160,7 @@ _BACKEND_KEYS: Final[frozenset[str]] = frozenset(
 _LIMIT_KEYS: Final[frozenset[str]] = frozenset(
     {
         "call_timeout_seconds",
+        "schema_deadline_seconds",
         "startup_timeout_seconds",
         "max_response_bytes",
         "max_response_depth",
@@ -186,10 +195,27 @@ class ProviderLimits:
     read up to :attr:`max_response_bytes`, parsed no deeper than
     :attr:`max_response_depth`, and waited for no longer than
     :attr:`call_timeout_seconds`.
+
+    :attr:`schema_deadline_seconds` is deliberately **not** derived from
+    :attr:`call_timeout_seconds`, and the two must not be coupled again. The
+    call timeout is patience for a provider's answer to cross the wire; the
+    schema deadline bounds local CPU in this process before anything is sent.
+    Coupling them let an operator who tightened network patience silently
+    tighten a CPU bound they had never reasoned about.
+
+    It also has a floor, enforced at load, and the reason is measured: the
+    deadline is awaited through ``loop.call_soon_threadsafe``, so what it really
+    bounds is **validation time plus event-loop scheduling latency**. With a
+    legitimate 6,806-byte schema and four busy coroutines, an effective 50 ms
+    deadline refused 18 of 30 ordinary validations and 100 ms refused 19 of 30,
+    against about 0.9 ms of real work. Tightening this below
+    :data:`MIN_SCHEMA_DEADLINE_SECONDS` does not make the server safer, it makes
+    it refuse capabilities that work.
     """
 
     call_timeout_seconds: float = 120.0
     startup_timeout_seconds: float = 120.0
+    schema_deadline_seconds: float = 5.0
     max_response_bytes: int = 4 * 1024 * 1024
     max_response_depth: int = 24
     max_response_items: int = 256
@@ -502,6 +528,9 @@ def _limits(value: object, where: str) -> ProviderLimits:
         numbers[key] = _positive_float(
             value.get(key), key, place, getattr(defaults, key)
         )
+    numbers["schema_deadline_seconds"] = _schema_deadline(
+        value.get("schema_deadline_seconds"), place, defaults.schema_deadline_seconds
+    )
     for key in (
         "max_response_bytes",
         "max_response_depth",
@@ -521,6 +550,24 @@ def _positive_float(value: object, key: str, where: str, fallback: float) -> flo
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ProviderConfigError(f"{where}: {key} must be a number > 0, got {value!r}")
     return float(value)
+
+
+def _schema_deadline(value: object, where: str, fallback: float) -> float:
+    """The local-CPU bound, refused below its floor rather than quietly honoured.
+
+    See :class:`ProviderLimits`: this deadline is awaited across the event loop,
+    so a small value measures scheduling latency rather than validation cost and
+    turns working capabilities into refusals.
+    """
+    seconds = _positive_float(value, "schema_deadline_seconds", where, fallback)
+    if seconds < MIN_SCHEMA_DEADLINE_SECONDS:
+        raise ProviderConfigError(
+            f"{where}: schema_deadline_seconds must be at least"
+            f" {MIN_SCHEMA_DEADLINE_SECONDS} seconds, got {seconds}; this bound is"
+            " awaited across the event loop, so a smaller one measures scheduling"
+            " latency rather than schema cost and refuses validations that work"
+        )
+    return seconds
 
 
 def _positive_int(value: object, key: str, where: str, fallback: int) -> int:

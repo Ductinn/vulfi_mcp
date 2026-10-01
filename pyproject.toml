@@ -10,7 +10,7 @@ dependencies = [
     "ida-domain==0.5.1",
     "idapro==0.0.10",
     "mcp==2.2.0",
-    "jsonschema>=4.26",
+    "jsonschema>=4.26,<5",
     "httpx2>=2.13",
 ]
 
