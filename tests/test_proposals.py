@@ -628,3 +628,58 @@ def test_the_stored_proposal_column_is_json_the_next_build_can_read(
     assert held["evidence"] == {"segment": ".vulfi_hidden"}
     assert row[1] == "the decoded instructions end in a return"
     assert row[2] == "pending"
+
+
+# -- each submission is answered with its own site report -------------------
+
+
+def test_two_proposals_over_one_range_each_quote_their_own_effect(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two alternative names for one address are two distinct proposals — the
+    # value is part of the minted id — and the worker reports on each range in
+    # the order it was sent. The range alone cannot tell the two reports
+    # apart, so matching on it would hand both submissions the first report
+    # and the second agent would be told its change renames the address to
+    # the *other* proposal's name.
+    binary = tmp_path / "service"
+    _catalog_with_candidates(binary)
+    with get_catalog(str(binary)) as catalog:
+        managed_idb_id = catalog.managed_idb_id
+
+    first = _proposal(value={"name": "vulfi_first_name"})
+    second = _proposal(value={"name": "vulfi_second_name"})
+
+    def _site(name: str) -> dict[str, Any]:
+        return {
+            "candidate_id": FUNCTION_CANDIDATE["candidate_id"],
+            "kind": "name",
+            "start": 0x401000,
+            "end": 0x401001,
+            "site": {},
+            "conflicts": [],
+            "refusal": None,
+            "effect": f"0x401000 would be named {name}",
+        }
+
+    monkeypatch.setattr(
+        "vulfi_mcp.prepare.existing_managed_idb", lambda path: str(binary) + ".i64"
+    )
+    monkeypatch.setattr(
+        "vulfi_mcp.prepare.invoke_ida",
+        lambda idb_path, operation, payload: {
+            "managed_idb_id": managed_idb_id,
+            "preparation": {"revision": 1},
+            "proposals": [_site("vulfi_first_name"), _site("vulfi_second_name")],
+        },
+    )
+
+    report = propose_recovery(str(binary), ANALYSIS, [first, second])
+
+    assert report["accepted_total"] == 2, report["warnings"]
+    submissions = report["proposals"]
+    assert submissions[0]["value"] == {"name": "vulfi_first_name"}
+    assert submissions[0]["effect"] == "0x401000 would be named vulfi_first_name"
+    assert submissions[1]["value"] == {"name": "vulfi_second_name"}
+    assert submissions[1]["effect"] == "0x401000 would be named vulfi_second_name"
+    assert submissions[0]["proposal_id"] != submissions[1]["proposal_id"]

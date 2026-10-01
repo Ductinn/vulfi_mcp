@@ -4657,7 +4657,18 @@ class _Preparation:
         return None
 
     def _entry_evidence(self, address: int) -> dict[str, object] | None:
-        """Why ``address`` might be an entry point, or ``None`` when nothing is."""
+        """Why ``address`` might be an entry point, or ``None`` when nothing is.
+
+        A symbol outranks an ``unowned_jump``. That jump is the weakest kind
+        on purpose — on its own it says only that unrecognized code branches
+        here — but a name on the address is an independent fact the image
+        itself carries, and ``_ENTRY_PROOF`` lists it as proof. Letting the
+        jump shadow it would make this pass say two false things: that the
+        address is merely control flow inside something unidentified, and,
+        when the bytes refuse to decode, that it carries no reference or
+        symbol at all. The jump stays in the evidence; only the proof kind
+        changes.
+        """
         flags = self._bytes.get_flags(address)
         symbol = self._names.get_name(address) if self._bytes.has_name(flags) else ""
         evidence = self._reference_evidence(address)
@@ -4665,6 +4676,12 @@ class _Preparation:
             evidence = {"kind": "symbol", "from": []}
         elif evidence is None and address % _GAP_ALIGNMENT == 0:
             evidence = {"kind": "aligned_gap", "from": []}
+        elif symbol and evidence is not None and evidence["kind"] == "unowned_jump":
+            evidence = {
+                "kind": "symbol",
+                "from": [],
+                "unowned_jump_from": evidence["from"],
+            }
         if evidence is None:
             return None
         evidence["symbol"] = symbol or None
@@ -7082,30 +7099,58 @@ def _recover_reviewed_proposal(payload: dict[str, object]) -> dict[str, object]:
             "site": _proposal_site(start, end),
         }
     failures: list[str] = []
+    undone = False
     try:
         if kind == "name":
-            if not ida_name.set_name(start, "", ida_name.SN_NOCHECK):
+            if ida_name.set_name(start, "", ida_name.SN_NOCHECK):
+                undone = True
+            else:
                 failures.append(f"IDA refused to clear the name at {start:#x}")
         elif kind == "function_boundary":
-            if not ida_funcs.del_func(start):
+            if ida_funcs.del_func(start):
+                undone = True
+            else:
                 failures.append(f"IDA refused to delete the function at {start:#x}")
         else:
             import ida_nalt
 
-            ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, end - start)
+            if ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, end - start):
+                undone = True
+            else:
+                failures.append(
+                    f"IDA refused to undefine the items at {start:#x}"
+                )
+            # ``del_tinfo`` reports nothing, so it cannot stand as proof that
+            # anything came off; the deletions around it can.
             ida_nalt.del_tinfo(start)
             name = checkpoint.get("type_name")
             if isinstance(name, str) and name:
                 import ida_typeinf
 
-                ida_typeinf.del_named_type(
+                if ida_typeinf.del_named_type(
                     ida_typeinf.get_idati(), name, ida_typeinf.NTF_TYPE
-                )
+                ):
+                    undone = True
     except Exception as error:  # noqa: BLE001 - IDA raises bare exceptions
         failures.append(f"{type(error).__name__}: {error}")
     record, _ = _read_record()
     preparation = record["preparation"]
-    revision = int(preparation.get("revision") or 0) + 1
+    revision = int(preparation.get("revision") or 0)
+    if not undone:
+        # Every undo operation was refused, so the database holds exactly what
+        # the apply left and nothing earned a new revision. This module moves
+        # the revision only in the same write as the change that earned it;
+        # moving it here would claim a change that did not happen, and would
+        # cost a save for it.
+        return {
+            "mutated": False,
+            "recovered": False,
+            "revision": revision,
+            "reason": "; ".join(failures) or None,
+            "site": _proposal_site(start, end),
+            **_preparation_report(record),
+        }
+    revision += 1
     preparation["revision"] = revision
     _write_record(record)
     return {

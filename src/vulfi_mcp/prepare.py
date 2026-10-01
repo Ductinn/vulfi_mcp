@@ -588,8 +588,9 @@ def propose_recovery(
                 " about. Call vulfi_preparation to see the revision this"
                 " target holds. Nothing was stored"
             )
+        taken: set[int] = set()
         submissions = [
-            _submit(catalog, wanted, index, body, refusal, sites, revision)
+            _submit(catalog, wanted, index, body, refusal, sites, taken, revision)
             for index, (body, refusal) in enumerate(checked)
         ]
         report: ProposalResult = {
@@ -744,6 +745,7 @@ def _submit(
     body: dict[str, Any] | None,
     refusal: str | None,
     sites: list[dict[str, Any]],
+    taken: set[int],
     revision: int,
 ) -> ProposalSubmission:
     """Store one accepted proposal, or report why this one is not stored."""
@@ -751,7 +753,9 @@ def _submit(
         return _refused(index, {}, str(refusal))
     # Each site report names the range it is about, so a report is matched to
     # its proposal rather than trusted to arrive in the order it was sent.
-    site = sites[_position(sites, body)]
+    position = _position(sites, body, taken)
+    taken.add(position)
+    site = sites[position]
     try:
         candidate = catalog.candidate(analysis_id, body["candidate_id"])
         if candidate is None:
@@ -808,9 +812,22 @@ def _submit(
     }
 
 
-def _position(sites: list[dict[str, Any]], body: dict[str, Any]) -> int:
-    """Where this proposal's site report is, by the range it asked about."""
+def _position(
+    sites: list[dict[str, Any]], body: dict[str, Any], taken: set[int]
+) -> int:
+    """Where this proposal's site report is, by the range it asked about.
+
+    One request may carry two accepted proposals over the same candidate,
+    kind and range with different values — two alternative names for one
+    address, say, which ``mint_proposal_id`` keeps apart because the value is
+    part of the identity. The site report does not carry the value, so the
+    range alone cannot tell those two apart; each report is therefore handed
+    out once, in the order the ranges were sent, so the second proposal is
+    answered with its own report rather than the first one's.
+    """
     for index, site in enumerate(sites):
+        if index in taken:
+            continue
         if (
             site.get("candidate_id") == body["candidate_id"]
             and site.get("kind") == body["kind"]
