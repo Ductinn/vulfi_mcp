@@ -7,6 +7,7 @@
  * so a board that would be truncated fails the row check.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -60,6 +61,7 @@ async function harness(
 		prepared?: LoadExtensionsResult["preparedExtensions"];
 		confirm?: boolean;
 		select?: string | undefined;
+		onConfirm?: (title: string, message: string) => void;
 	} = {},
 ): Promise<Harness> {
 	await writeFile(
@@ -84,6 +86,7 @@ async function harness(
 		},
 		async confirm(title: string, message: string) {
 			confirms.push({ title, message });
+			options.onConfirm?.(title, message);
 			return state.confirmResult;
 		},
 		async select(title: string, items: Array<string | { label: string }>) {
@@ -475,14 +478,14 @@ describe("VulFi OMP board", () => {
 		}
 	});
 
-	test("declining confirmation never spawns vulfi-mcp, including headless", async () => {
+	test("declining confirmation does not pass --confirmed, including headless", async () => {
 		const cwd = await mkdtemp(path.join(tmpdir(), "vulfi-omp-cli-"));
 		const bin = path.join(cwd, "bin");
 		const marker = path.join(cwd, "spawned");
 		await mkdir(bin);
 		await writeFile(
 			path.join(bin, "vulfi-mcp"),
-			`#!/bin/sh\nconfirmed=0\nprev=\nfor arg in "$@"; do\n  if [ "$prev" = "--confirmed" ]; then confirmed=1; fi\n  prev=$arg\ndone\nif [ "$confirmed" = 0 ]; then\n  echo aborted-no-flag > ${JSON.stringify(marker)}\n  echo stdin-ignored >&2\n  exit 3\nfi\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
+			`#!/bin/sh\nbrief=0\nconfirmed=0\nprev=\nfor arg in "$@"; do\n  if [ "$arg" = "--briefing" ]; then brief=1; fi\n  if [ "$prev" = "--confirmed" ]; then confirmed=1; fi\n  prev=$arg\ndone\nif [ "$brief" = 1 ]; then\n  printf '%s\\n' "IDA image base       0x400000" "external image base  0x400000" "rva                  0x1000" "original bytes       cafebabe" "xrefs                {}" "ida:row:0" "ghidra:row:0"\n  exit 0\nfi\nif [ "$confirmed" = 0 ]; then\n  echo aborted-no-flag > ${JSON.stringify(marker)}\n  echo stdin-ignored >&2\n  exit 3\nfi\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
 		);
 		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
 		const previousPath = process.env.PATH;
@@ -543,9 +546,17 @@ describe("VulFi OMP board", () => {
 			);
 			expect(session.confirms.length).toBeGreaterThan(0);
 			expect(session.confirms.some(item => item.message.includes("prop-1"))).toBe(true);
-			expect(session.confirms.some(item => item.message.includes("ida:row:0") && item.message.includes("ghidra:row:0"))).toBe(
-				true,
-			);
+			expect(
+				session.confirms.some(
+					item =>
+						item.message.includes("ida:row:0") &&
+						item.message.includes("ghidra:row:0") &&
+						item.message.toLowerCase().includes("image base") &&
+						item.message.toLowerCase().includes("rva") &&
+						item.message.toLowerCase().includes("original bytes") &&
+						item.message.toLowerCase().includes("xref"),
+				),
+			).toBe(true);
 			await expect(readFile(marker, "utf8")).rejects.toThrow();
 
 			await headless.runner.emitToolResult(event("vulfi_findings", findingsPage()) as never);
@@ -675,7 +686,7 @@ describe("VulFi OMP board", () => {
 		await mkdir(bin);
 		await writeFile(
 			path.join(bin, "vulfi-mcp"),
-			`#!/bin/sh\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
+			`#!/bin/sh\nbrief=0\nfor arg in "$@"; do\n  if [ "$arg" = "--briefing" ]; then brief=1; fi\ndone\nif [ "$brief" = 1 ]; then\n  printf '%s\\n' "IDA image base       0x400000" "external image base  0x400000" "rva                  0x1000" "original bytes       cafebabe" "xrefs                {}" "space=image" "address=0x401000"\n  exit 0\nfi\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
 		);
 		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
 		const previousPath = process.env.PATH;
@@ -690,9 +701,17 @@ describe("VulFi OMP board", () => {
 			const spawned = (await readFile(marker, "utf8")).trim().split("\n").slice(1);
 			expect(spawned).toContain("Not Checked");
 			expect(spawned).toContain("kept the site");
-			expect(session.confirms.some(item => item.message.includes("space=image") && item.message.includes("address=0x401000"))).toBe(
-				true,
-			);
+			expect(
+				session.confirms.some(
+					item =>
+						item.message.toLowerCase().includes("image base") &&
+						item.message.toLowerCase().includes("rva") &&
+						item.message.toLowerCase().includes("original bytes") &&
+						item.message.toLowerCase().includes("xref") &&
+						item.message.includes("space=image") &&
+						item.message.includes("address=0x401000"),
+				),
+			).toBe(true);
 			await rm(marker);
 			const before = session.notices.length;
 			await session.runner.getCommand("vulfi-link")!.handler(
@@ -764,6 +783,97 @@ describe("VulFi OMP board", () => {
 				}) as never,
 			);
 			expect(boardText(session)).toContain("ida:trusted-command");
+		} finally {
+			process.env.PATH = previousPath;
+			await session.dispose();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("link confirm shows image base, rva, bytes, and xrefs before --confirmed", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "vulfi-omp-brief-"));
+		const bin = path.join(cwd, "bin");
+		const log = path.join(cwd, "spawned");
+		await mkdir(bin);
+		await writeFile(
+			path.join(bin, "vulfi-mcp"),
+			`#!/bin/sh\nprintf '%s\\n' --- >> ${JSON.stringify(log)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(log)}\nbrief=0\nprev=\nfor arg in "$@"; do\n  if [ "$arg" = "--briefing" ]; then brief=1; fi\n  prev=$arg\ndone\nif [ "$brief" = 1 ]; then\n  printf '%s\\n' "IDA image base       0x400000" "external image base  0x400000" "rva                  0x1000" "original bytes       cafebabe" "xrefs                {\\"ida\\":[]}"\n  exit 0\nfi\nexit 0\n`,
+		);
+		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
+		const previousPath = process.env.PATH;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		const session = await harness(cwd, {
+			confirm: true,
+			onConfirm(_title, message) {
+				let spawned = "";
+				try {
+					spawned = readFileSync(log, "utf8");
+				} catch {
+					spawned = "";
+				}
+				const latest = spawned.split("---").filter(part => part.trim().length > 0).pop() ?? "";
+				expect(latest).toContain("--briefing");
+				expect(latest).not.toContain("--confirmed");
+				expect(message.toLowerCase()).toContain("image base");
+				expect(message.toLowerCase()).toContain("rva");
+				expect(message.toLowerCase()).toContain("original bytes");
+				expect(message.toLowerCase()).toContain("xref");
+				expect(message).toContain("cafebabe");
+			},
+		});
+		try {
+			await session.runner.emitToolResult(event("vulfi_findings", findingsPage()) as never);
+			await session.runner.getCommand("vulfi-link")!.handler(
+				`ida:row:0 ghidra:row:0 --binary /tmp/vulfi-target --source ida --status Vulnerable --rationale kept`,
+				session.runner.createCommandContext(),
+			);
+			await session.runner.getCommand("vulfi-link")!.handler(
+				`resolve L-conflict --source external --status Suspicious --rationale conflict`,
+				session.runner.createCommandContext(),
+			);
+			const spawned = await readFile(log, "utf8");
+			expect(spawned).toContain("--briefing");
+			expect(spawned).toContain("--confirmed");
+			expect(spawned.indexOf("--briefing")).toBeLessThan(spawned.indexOf("--confirmed"));
+		} finally {
+			process.env.PATH = previousPath;
+			await session.dispose();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a machine-rejected pair is shown as a refusal and is not confirmed", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "vulfi-omp-refused-"));
+		const bin = path.join(cwd, "bin");
+		const log = path.join(cwd, "spawned");
+		await mkdir(bin);
+		await writeFile(
+			path.join(bin, "vulfi-mcp"),
+			`#!/bin/sh\nprintf '%s\\n' --- >> ${JSON.stringify(log)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(log)}\nfor arg in "$@"; do\n  if [ "$arg" = "ghidra:rejected" ] || [ "$arg" = "L-rejected" ]; then\n    echo "refused  the machine already rejected this pair" >&2\n    exit 1\n  fi\ndone\nexit 0\n`,
+		);
+		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
+		const previousPath = process.env.PATH;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		const session = await harness(cwd, {
+			confirm: true,
+			onConfirm() {
+				throw new Error("a rejected pair must not be confirmed");
+			},
+		});
+		try {
+			await session.runner.emitToolResult(event("vulfi_findings", findingsPage()) as never);
+			await session.runner.getCommand("vulfi-link")!.handler(
+				`ida:row:0 ghidra:rejected --binary /tmp/vulfi-target --source ida --status Vulnerable --rationale kept`,
+				session.runner.createCommandContext(),
+			);
+			await session.runner.getCommand("vulfi-link")!.handler(
+				`resolve L-rejected --source external --status Suspicious --rationale conflict`,
+				session.runner.createCommandContext(),
+			);
+			const spawned = await readFile(log, "utf8");
+			expect(spawned).not.toContain("--confirmed");
+			expect(session.notices.join("\n").toLowerCase()).toContain("refused");
+			expect(session.confirms).toEqual([]);
 		} finally {
 			process.env.PATH = previousPath;
 			await session.dispose();

@@ -55,6 +55,12 @@ COPY_RULE: Rule = {
         "Low": "False",
     },
 }
+MISS_RULE: Rule = {
+    "name": "Absent Callee",
+    "function_names": ["vulfi_no_such_function"],
+    "wrappers": False,
+    "mark_if": {"High": "False", "Medium": "False", "Low": "False"},
+}
 SCOPE = "default"
 INITIAL_STATUS = "False Positive"
 INITIAL_RATIONALE = "reviewed pair, not yet reassessed"
@@ -419,6 +425,157 @@ def test_changed_or_stale_member_pauses_without_relink(
     untouched = _page(str(binary))
     assert _by_id(untouched, neighbor["id"])["status"] != "Vulnerable"
     assert _by_id(untouched, pair["ida"]["id"])["status"] == INITIAL_STATUS
+
+
+@pytest.mark.requires_ghidra
+def test_triage_without_a_findings_read_pauses_a_missed_member(
+    tmp_path: Path, managed_data_dir: Path, ghidra_config: Path
+) -> None:
+    """A partial scan that missed the member pauses before triage writes.
+
+    The production change that must fail this test is journaling the new
+    decision in ``vulfi_triage`` before pause is enforced. Paging findings
+    first is what the older test does, and that hides the write.
+    """
+    binary = _compile(tmp_path, "linked-triage-before-page")
+    pair = _linked_pair(binary)
+    external_id = pair["external"]["id"]
+    ida_id = pair["ida"]["id"]
+    with open_catalog(str(binary)) as catalog:
+        catalog.record_external_scan(
+            backend="ghidra",
+            scope=SCOPE,
+            scan_id="partial-missed-member-no-page",
+            scanned_at=utc_now(),
+            state="evaluated",
+            coverage="partial",
+            reason="this scan saw another row and not the linked member",
+            findings=[_neighbor(pair["external"])],
+        )
+    with pytest.raises(Exception):
+        vulfi_triage(str(binary), external_id, "Vulnerable", "must not propagate")
+    held = _stored_link(binary, pair["link_id"])
+    assert held["sync_state"] == "paused", held
+    assert held["status"] == INITIAL_STATUS
+    assert held["rationale"] == INITIAL_RATIONALE
+    catalog = get_catalog(str(binary))
+    assert catalog is not None
+    try:
+        external_row = catalog.external_finding(external_id)
+    finally:
+        catalog.close()
+    assert external_row is not None
+    assert external_row["status"] == INITIAL_STATUS
+    assert external_row["rationale"] == INITIAL_RATIONALE
+    ida_page = _reopen(lambda: findings_ida(pair["managed"], 0, 200, path=str(binary)))
+    ida_row = next(row for row in ida_page["findings"] if row["id"] == ida_id)
+    assert ida_row["status"] == INITIAL_STATUS
+    assert ida_row["rationale"] == INITIAL_RATIONALE
+
+
+@pytest.mark.requires_ghidra
+def test_empty_ida_index_after_complete_rescan_pauses(
+    tmp_path: Path, managed_data_dir: Path, ghidra_config: Path
+) -> None:
+    """A complete rescan that retires the only IDA member pauses the link.
+
+    The production change that must fail this test is treating an empty IDA
+    index as unknown. The link stays synchronized, and triage then moves the
+    external row before the mirror fails into pending.
+    """
+    binary = _compile(tmp_path, "linked-empty-ida")
+    pair = _linked_pair(binary)
+    external_id = pair["external"]["id"]
+    ida_id = pair["ida"]["id"]
+    retired = _reopen(
+        lambda: scan_ida(pair["managed"], (MISS_RULE,), SCOPE, path=str(binary))
+    )
+    assert retired["coverage"] == "complete", retired
+    assert all(row["id"] != ida_id for row in retired["findings"]), retired
+    ida_after = _reopen(lambda: findings_ida(pair["managed"], 0, 200, path=str(binary)))
+    assert ida_after["findings"] == [], ida_after
+    held = _stored_link(binary, pair["link_id"])
+    assert held["sync_state"] == "paused", held
+    with pytest.raises(Exception):
+        vulfi_triage(str(binary), external_id, "Vulnerable", "must not propagate")
+    catalog = get_catalog(str(binary))
+    assert catalog is not None
+    try:
+        external_row = catalog.external_finding(external_id)
+        stored = catalog.link(pair["link_id"])
+    finally:
+        catalog.close()
+    assert external_row is not None
+    assert external_row["status"] == INITIAL_STATUS
+    assert external_row["rationale"] == INITIAL_RATIONALE
+    assert stored is not None
+    assert stored["sync_state"] == "paused"
+    assert stored["status"] == INITIAL_STATUS
+
+
+@pytest.mark.requires_ghidra
+def test_complete_external_rescan_pauses_instead_of_dropping_the_link(
+    tmp_path: Path, managed_data_dir: Path, ghidra_config: Path
+) -> None:
+    """A digest change stores the new site and pauses; it does not crash after IDA saved.
+
+    The production change that must fail this test is letting ON DELETE
+    RESTRICT abort ``record_external_scan`` after the IDA scope has saved.
+    Dropping the link to make the delete succeed, or copying the old
+    assessment onto the new id, is the same hole.
+    """
+    binary = _compile(tmp_path, "linked-external-digest")
+    pair = _linked_pair(binary)
+    old_external_id = pair["external"]["id"]
+    ida_before = _reopen(lambda: findings_ida(pair["managed"], 0, 200, path=str(binary)))
+    ida_ids = {row["id"] for row in ida_before["findings"]}
+    ida_status = {
+        row["id"]: (row["status"], row["rationale"]) for row in ida_before["findings"]
+    }
+    assert pair["ida"]["id"] in ida_ids
+    changed: Rule = {
+        "name": "Unchecked Copy Retargeted",
+        "function_names": ["strcpy", "wcscpy"],
+        "wrappers": False,
+        "mark_if": {
+            "High": "not param[1].is_constant()",
+            "Medium": "False",
+            "Low": "False",
+        },
+    }
+    result = scan_target(str(binary), (changed,), SCOPE, backend="ghidra")
+    assert result["findings"], result
+    held = _stored_link(binary, pair["link_id"])
+    assert held["sync_state"] == "paused", held
+    assert held["external_finding_id"] == old_external_id
+    new_digest = canonical_rule_digest(changed)
+    catalog = get_catalog(str(binary))
+    assert catalog is not None
+    try:
+        old = catalog.external_finding(old_external_id)
+        page = catalog.page_external_findings(0, 200)
+    finally:
+        catalog.close()
+    assert old is not None
+    assert old["status"] == INITIAL_STATUS
+    assert old["rationale"] == INITIAL_RATIONALE
+    new_rows = [
+        row
+        for row in page["findings"]
+        if row["backend"] == "ghidra" and row["rule_digest"] == new_digest
+    ]
+    assert new_rows, page
+    assert all(row["id"] != old_external_id for row in new_rows)
+    assert all(row["status"] == "Not Checked" for row in new_rows)
+    assert all(row["rationale"] in ("", None) for row in new_rows)
+    ida_after = _reopen(lambda: findings_ida(pair["managed"], 0, 200, path=str(binary)))
+    assert {row["id"] for row in ida_after["findings"]} == ida_ids
+    assert {
+        row["id"]: (row["status"], row["rationale"]) for row in ida_after["findings"]
+    } == ida_status
+
+
+
 
 
 @pytest.mark.requires_ghidra

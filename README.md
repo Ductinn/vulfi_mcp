@@ -69,11 +69,11 @@ vulfi-mcp resolve --path ./target --link-id L-... --source ida \
   --status "False Positive" --rationale "reviewer chose the IDA assessment"
 ```
 
-`--source` is `ida`, `external`, or `new`. `--status` is one of `Not Checked`, `False Positive`, `Suspicious`, `Vulnerable`. The command waits for that source to be typed out in full. `--confirmed <token>` skips that stdin read only when the token is the decision already given; a missing or disagreeing token writes nothing. `--confirmed` is a CLI flag, not an MCP tool. A shell that can already run `vulfi-mcp` can pass it. That is the credential risk, not a second protocol.
+`--source` is `ida`, `external`, or `new`. `--status` is one of `Not Checked`, `False Positive`, `Suspicious`, `Vulnerable`. The command waits for that source to be typed out in full. `--briefing` prints the mapping evidence and exits without writing; a pair the machine has already rejected is a refusal, not a prompt. `--confirmed <token>` skips that stdin read only when the token is the decision already given; a missing or disagreeing token writes nothing. `--confirmed` is a CLI flag, not an MCP tool. A shell that can already run `vulfi-mcp` can pass it. That is the credential risk, not a second protocol.
 
 Link proof is original-binary SHA-256, the full rule digest, a verified address-space mapping to the same call site (RVA, bytes, and a code xref), and the live finding ids. `function_name` is not an identity. External rules that name more than one function store an empty `function_name`. Name matching is not supported. Equal numeric addresses with different image bases do not link. A provisional IDB without verified source proof does not link.
 
-A later triage of either finding id journals one decision. `pending` is the crash window. `synchronized` is only after the IDB save is observed. `conflict` is an unexpected revision; the next update does not overwrite. `paused` is a stale or missing member. `unavailable` is a store that did not answer. `vulfi-mcp resolve` writes a new guarded event after the operator sees the evidence again. It is not last-write-wins, and it does not unpause a link.
+A later triage of either finding id journals one decision, unless the link would pause. Pause is enforced before either row moves: a partial scan that missed the member, a changed digest or ordinal, or an IDA index that was read and no longer contains the linked id — including an empty index after a complete rescan retired the only finding. A complete external scan that cannot delete a linked id pauses that link and stores the new site. It does not drop the link, and it does not attach the old assessment to the new id. `pending` is the crash window. `synchronized` is only after the IDB save is observed. `conflict` is an unexpected revision; the next update does not overwrite. `paused` is a stale or missing member. `unavailable` is a store that did not answer. `vulfi-mcp resolve` writes a new guarded event after the operator sees the evidence again. It is not last-write-wins, and it does not unpause a link.
 
 ## Status meanings
 
@@ -203,7 +203,7 @@ omp --no-extensions -e ./omp/extension.ts
 
 The MCP server entry is trusted only when its configured command is `vulfi-mcp`. The name `vulfi` alone is not enough. An unrelated server that returns VulFi-shaped JSON does not update the board. The extension reads `tool_result` events from OMP's existing bridge. It does not open its own MCP session and it does not page tools on its own.
 
-`/vulfi-board` shows the cache. `/vulfi-review` and `/vulfi-link` show the evidence and, only after a confirmation in the TUI, run a fixed argv:
+`/vulfi-board` shows the cache. `/vulfi-review` shows the cached proposal and, only after a confirmation in the TUI, runs a fixed argv. `/vulfi-link` and `/vulfi-link resolve` first fetch the read-only briefing (`vulfi-mcp link --briefing` or `vulfi-mcp resolve --briefing`). The confirm dialog shows both image bases, the RVA, the original bytes, and the xref proof from that read. A pair the machine has already rejected is shown as a refusal and is not confirmed. Only an accepted dialog then runs:
 
 ```text
 vulfi-mcp review ...
@@ -211,7 +211,7 @@ vulfi-mcp link ...
 vulfi-mcp resolve ...
 ```
 
-Declining the confirmation does not spawn the command. Headless and print modes do not treat a missing dialog as approval and do not spawn it either. The arguments are a list, not a shell string. After the TUI confirmation, the extension passes `--confirmed` with the token the operator already gave, so the CLI does not read stdin for that same decision. That flag is not an MCP tool. A shell that can already run `vulfi-mcp` can pass it; that is the credential risk below, not a second protocol.
+Declining the confirmation does not pass `--confirmed`. A review decline does not spawn `vulfi-mcp` at all, because that evidence is already on the cached proposal. Headless and print modes do not treat a missing dialog as approval and do not spawn a write. The arguments are a list, not a shell string. After the TUI confirmation, the extension passes `--confirmed` with the token the operator already gave, so the CLI does not read stdin for that same decision. That flag is not an MCP tool. A shell that can already run `vulfi-mcp` can pass it; that is the credential risk below, not a second protocol.
 
 **The confirmation is not a credential boundary.** `vulfi-mcp` is an ordinary program. Anything that already has the operator's OS permissions, including a shell-capable agent, can run `vulfi-mcp review`, `vulfi-mcp link`, and `vulfi-mcp resolve` without the board. An installation that needs enforced human separation has to enforce it with credentials: the MCP server principal must not be able to execute those commands or write the managed data directory.
 

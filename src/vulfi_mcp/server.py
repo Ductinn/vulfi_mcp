@@ -618,8 +618,15 @@ def _ida_index(idb_path: str) -> tuple[dict[str, dict], list[dict]]:
     return found, scopes
 
 
-def _pause_reason(catalog, link: dict, ida_rows: dict[str, dict], scopes: list[dict]) -> str | None:
-    """Why this link must pause, or ``None`` when the stale bit is not that fact."""
+def _pause_reason(
+    catalog, link: dict, ida_rows: dict[str, dict], scopes: list[dict], *, ida_index_read: bool
+) -> str | None:
+    """Why this link must pause, or ``None`` when the stale bit is not that fact.
+
+    An IDA index that was read and does not contain the linked id is gone,
+    including when that index is empty. An index that was not read is unknown,
+    not a missing member.
+    """
     from vulfi_mcp.operator import _partial_stale
 
     proof = link.get("proof") if isinstance(link.get("proof"), dict) else {}
@@ -645,8 +652,10 @@ def _pause_reason(catalog, link: dict, ida_rows: dict[str, dict], scopes: list[d
             "a partial scan saw other rows and did not reconfirm the external"
             " member; the link is paused"
         )
+    if not ida_index_read:
+        return None
     ida_row = ida_rows.get(ida_id)
-    if ida_rows and ida_row is None:
+    if ida_row is None:
         return "the IDA member is gone; the link is paused rather than attached to a similar row"
     if ida_row is not None:
         if str(ida_row.get("rule_digest") or "") != str(proof.get("rule_digest") or ""):
@@ -681,19 +690,34 @@ def _ida_not_reconfirmed(row: dict, scopes: list[dict]) -> bool:
     return False
 
 
+def pause_linked_members(path: str, binary_path: str | None = None) -> None:
+    """Pause members a findings read would pause, after a scan has already saved."""
+    writer = _joined_writer(path, binary_path)
+    if writer is None:
+        return
+    try:
+        _refresh_links(writer, path)
+    finally:
+        writer.close()
+
+
 def _refresh_links(catalog, path: str) -> None:
     from vulfi_mcp.ida_adapter import existing_managed_idb
 
     idb = existing_managed_idb(path)
     ida_rows: dict[str, dict] = {}
     scopes: list[dict] = []
+    ida_index_read = False
     if idb is not None:
         ida_rows, scopes = _ida_index(idb)
+        ida_index_read = True
     for link in catalog.links():
         state = str(link.get("sync_state") or "")
         if state in ("pending", "paused"):
             continue
-        reason = _pause_reason(catalog, link, ida_rows, scopes)
+        reason = _pause_reason(
+            catalog, link, ida_rows, scopes, ida_index_read=ida_index_read
+        )
         if reason is not None:
             catalog.pause_link(str(link["link_id"]), reason)
             continue
@@ -908,6 +932,34 @@ def _ida_link_id(path: str, finding_id: str) -> str | None:
     return link_id if isinstance(link_id, str) and link_id else None
 
 
+def _enforce_link_pause(path: str, binary_path: str | None, link: dict) -> dict:
+    """Pause a member a findings read would pause, before any triage write.
+
+    Pause used to run only inside ``_public_findings``. A triage that never
+    paged could journal the new decision and mirror it onto a member a
+    partial scan had already missed.
+    """
+    from vulfi_mcp.catalog import CatalogError
+
+    writer = _joined_writer(path, binary_path)
+    if writer is None:
+        raise CatalogError(
+            "the SQLite catalog is unavailable; a linked edit is refused"
+            " and nothing was written to the IDB"
+        )
+    try:
+        _refresh_links(writer, path)
+        refreshed = writer.link(str(link["link_id"]))
+    finally:
+        writer.close()
+    if not isinstance(refreshed, dict):
+        raise CatalogError(
+            f"link {link['link_id']} could not be re-read before triage."
+            " Nothing was written"
+        )
+    return refreshed
+
+
 def _public_triage(
     path: str,
     finding_id: str,
@@ -938,6 +990,7 @@ def _public_triage(
         )
         result["findings"] = [result["finding"]]
         return result
+    link = _enforce_link_pause(path, binary_path, link)
     if link.get("sync_state") == "paused":
         raise CatalogError(
             f"link {link['link_id']} is paused; a linked edit is refused"

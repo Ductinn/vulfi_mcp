@@ -2203,6 +2203,14 @@ def _link_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rationale", required=True)
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
+        "--briefing",
+        action="store_true",
+        help=(
+            "print the mapping evidence and exit without writing. A pair"
+            " the machine has already rejected is printed as a refusal."
+        ),
+    )
+    parser.add_argument(
         "--confirmed",
         default=None,
         help=(
@@ -2232,6 +2240,8 @@ def link_main(argv: list[str] | None = None) -> int:
         print(f"vulfi-mcp link: {refused}", file=sys.stderr)
         return 1
     print(_render_link_briefing(briefing), file=dialogue)
+    if arguments.briefing:
+        return 1 if briefing.get("reason") else 0
     if briefing.get("reason"):
         if arguments.json:
             print(
@@ -2446,6 +2456,14 @@ def _resolve_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rationale", required=True)
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
+        "--briefing",
+        action="store_true",
+        help=(
+            "print the mapping evidence and exit without writing. A pair"
+            " the machine has already rejected is printed as a refusal."
+        ),
+    )
+    parser.add_argument(
         "--confirmed",
         default=None,
         help=(
@@ -2490,6 +2508,8 @@ def resolve_main(argv: list[str] | None = None) -> int:
         print(f"vulfi-mcp resolve: {refused}", file=sys.stderr)
         return 1
     print(_render_link_briefing(briefing), file=dialogue)
+    if arguments.briefing:
+        return 1 if briefing.get("reason") else 0
     if briefing.get("reason"):
         if arguments.json:
             print(

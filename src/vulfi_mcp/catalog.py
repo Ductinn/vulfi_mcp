@@ -1451,8 +1451,13 @@ class Catalog:
         the stale contract, and it turns on two facts together. A scan that
         ran (``state="evaluated"``) and saw the whole image
         (``coverage="complete"``) retires it: the call site really is gone.
-        Anything else — partial coverage, a failure, an unreachable
-        provider, an identity this could not prove — keeps it and marks it
+        A linked id cannot be deleted — ``links.external_finding_id`` is
+        ``ON DELETE RESTRICT``, and dropping the link to make the delete
+        succeed would throw away the review. That link is paused in this
+        same transaction, the old row is kept with the assessment it already
+        had, and the new site is stored as its own unassessed row. Anything
+        else — partial coverage, a failure, an unreachable provider, an
+        identity this could not prove — keeps the unseen row and marks it
         ``stale``. A run that was cut short is not evidence that the thing an
         earlier run saw has gone away.
 
@@ -1581,12 +1586,37 @@ class Catalog:
             retired: list[str] = []
             staled: list[str] = []
             if held == "evaluated" and covered == "complete":
-                retired = unseen
+                linked: dict[str, str] = {}
+                if unseen:
+                    placeholders = ",".join("?" * len(unseen))
+                    linked = {
+                        str(item[0]): str(item[1])
+                        for item in connection.execute(
+                            "SELECT external_finding_id, link_id FROM links"
+                            f" WHERE external_finding_id IN ({placeholders})",
+                            tuple(unseen),
+                        )
+                    }
                 for finding_id in unseen:
+                    link_id = linked.get(finding_id)
+                    if link_id is None:
+                        connection.execute(
+                            "DELETE FROM external_findings WHERE finding_id = ?",
+                            (finding_id,),
+                        )
+                        retired.append(finding_id)
+                        continue
                     connection.execute(
-                        "DELETE FROM external_findings WHERE finding_id = ?",
-                        (finding_id,),
+                        "UPDATE links SET sync_state = 'paused', updated_at = ?"
+                        " WHERE link_id = ?",
+                        (now, link_id),
                     )
+                    connection.execute(
+                        "UPDATE external_findings SET stale = 1, updated_at = ?"
+                        " WHERE finding_id = ?",
+                        (now, finding_id),
+                    )
+                    staled.append(finding_id)
             else:
                 staled = unseen
                 for finding_id in unseen:

@@ -220,6 +220,84 @@ def test_link_and_resolve_confirmed_flag_skips_stdin(
     assert applied == ["link", "resolve"]
 
 
+def test_briefing_flag_prints_mapping_evidence_and_does_not_write(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--briefing`` is the read-only path. It must not confirm a link.
+
+    The production change that must fail this test is treating ``--briefing``
+    as an unknown flag, or printing the evidence only after ``review_link``.
+    """
+    applied: list[str] = []
+    monkeypatch.setattr(operator, "link_briefing", lambda *_args: _link_briefing())
+    monkeypatch.setattr(
+        operator,
+        "review_link",
+        lambda *_args: applied.append("link") or {"confirmed": True, "link_id": "L1"},
+    )
+    monkeypatch.setattr(
+        operator,
+        "resolve_link",
+        lambda *_args: applied.append("resolve") or {"confirmed": True, "link_id": "L1"},
+    )
+    monkeypatch.setattr(operator, "open_catalog", lambda *_args, **_kwargs: _Catalog())
+    assert (
+        operator.link_main(
+            [
+                "--path",
+                "/tmp/target",
+                "--ida-id",
+                "ida-1",
+                "--external-id",
+                "ext-1",
+                "--binary",
+                "/tmp/target",
+                "--source",
+                "ida",
+                "--status",
+                "Vulnerable",
+                "--rationale",
+                "kept",
+                "--briefing",
+                "--confirmed",
+                "ida",
+            ]
+        )
+        == 0
+    )
+    shown = capsys.readouterr().out.lower()
+    assert "image base" in shown
+    assert "rva" in shown
+    assert "bytes" in shown
+    assert "xref" in shown
+    assert applied == []
+
+    refused = _link_briefing()
+    refused["reason"] = "the machine already rejected this pair"
+    monkeypatch.setattr(operator, "link_briefing", lambda *_args: refused)
+    assert (
+        operator.resolve_main(
+            [
+                "--path",
+                "/tmp/target",
+                "--link-id",
+                "L1",
+                "--source",
+                "external",
+                "--status",
+                "Suspicious",
+                "--rationale",
+                "conflict",
+                "--briefing",
+            ]
+        )
+        == 1
+    )
+    assert "rejected" in capsys.readouterr().out.lower()
+    assert applied == []
+
+
+
 def sys_stdin():
     import sys
 

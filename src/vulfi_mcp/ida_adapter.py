@@ -359,7 +359,14 @@ def scan_ida(
         raw = worker.run("scan", payload)
         evaluation = _evaluate(raw, rules, scope)
         stored = worker.run("store_scan", _store_payload(rules, scope, evaluation))
-    return _scan_result(raw, scope, idb_path, path, evaluation, stored)
+    result = _scan_result(raw, scope, idb_path, path, evaluation, stored)
+    if path:
+        # The save already landed. A member this scan retired must pause now,
+        # not on the next findings page.
+        from vulfi_mcp.server import pause_linked_members
+
+        pause_linked_members(path)
+    return result
 
 
 def findings_ida(

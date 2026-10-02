@@ -2,9 +2,10 @@
  * Optional OMP triage board.
  *
  * This is a session-local view of validated VulFi MCP results. It is not a
- * second MCP client, not a store, and not OMP's native todo list. Operator
- * commands spawn `vulfi-mcp` with a fixed argv only after a TUI confirmation.
- * A shell-capable agent that already has the operator's OS credentials can
+ * second MCP client, not a store, and not OMP's native todo list. A writing
+ * command spawns `vulfi-mcp` with a fixed argv only after a TUI confirmation.
+ * `/vulfi-link` fetches the read-only briefing before that dialog. A
+ * shell-capable agent that already has the operator's OS credentials can
  * still run that binary; the confirmation is not a credential boundary.
  */
 import { accessSync, constants, readFileSync } from "node:fs";
@@ -513,6 +514,40 @@ function statusRefusal(status: string | undefined): string | undefined {
 	return `status ${status ?? "(missing)"} is not one of Not Checked, False Positive, Suspicious, Vulnerable`;
 }
 
+function mappingEvidence(text: string): boolean {
+	const lowered = text.toLowerCase();
+	return (
+		lowered.includes("image base") &&
+		lowered.includes("rva") &&
+		lowered.includes("original bytes") &&
+		lowered.includes("xref")
+	);
+}
+
+async function fetchBriefing(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	args: string[],
+): Promise<string | undefined> {
+	const command = resolveCli();
+	if (!command) {
+		ctx.ui.notify("vulfi-mcp is not on PATH", "error");
+		return undefined;
+	}
+	const result = await pi.exec(command, args);
+	const output = [result.stdout, result.stderr].filter(part => part.trim().length > 0).join("\n");
+	if (result.code !== 0 || !mappingEvidence(output)) {
+		ctx.ui.notify(
+			output.length > 0
+				? output
+				: "the link briefing did not include image bases, RVA, original bytes, and xrefs",
+			"error",
+		);
+		return undefined;
+	}
+	return output;
+}
+
 export default function vulfiBoard(pi: ExtensionAPI): void {
 	const state = emptyBoard();
 
@@ -613,15 +648,23 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 					return;
 				}
 				if (!linkId || !source || !CHOSEN_SOURCES[source] || !rationale || !state.path) return;
-				const link = state.links.find(item => item.linkId === linkId);
-				const accepted = await ctx.ui.confirm(
-					"Resolve conflict",
-					[
-						cachedMapping(state, link?.idaFindingId ?? ""),
-						cachedMapping(state, link?.externalFindingId ?? ""),
-						link ? `link ${link.linkId} ${link.syncState}` : `${linkId} is not on the cached page`,
-					].join("\n"),
-				);
+
+				const evidence = await fetchBriefing(pi, ctx, [
+					"resolve",
+					"--briefing",
+					"--path",
+					state.path,
+					"--link-id",
+					linkId,
+					"--source",
+					source,
+					"--status",
+					status!,
+					"--rationale",
+					rationale,
+				]);
+				if (!evidence) return;
+				const accepted = await ctx.ui.confirm("Resolve conflict", evidence);
 				if (!accepted) return;
 				await runCli(pi, ctx, [
 					"resolve",
@@ -652,10 +695,26 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 				return;
 			}
 			if (!idaId || !externalId || !binary || !source || !CHOSEN_SOURCES[source] || !rationale || !state.path) return;
-			const accepted = await ctx.ui.confirm(
-				"Link findings",
-				[cachedMapping(state, idaId), cachedMapping(state, externalId)].join("\n"),
-			);
+			const evidence = await fetchBriefing(pi, ctx, [
+				"link",
+				"--briefing",
+				"--path",
+				state.path,
+				"--ida-id",
+				idaId,
+				"--external-id",
+				externalId,
+				"--binary",
+				binary,
+				"--source",
+				source,
+				"--status",
+				status!,
+				"--rationale",
+				rationale,
+			]);
+			if (!evidence) return;
+			const accepted = await ctx.ui.confirm("Link findings", evidence);
 			if (!accepted) return;
 			await runCli(pi, ctx, [
 				"link",
