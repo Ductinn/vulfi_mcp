@@ -75,7 +75,9 @@ from vulfi_mcp.prepare import (
 from vulfi_mcp.rules import Rule, load_stock_rules, rule_template, validate_rules
 
 __all__ = [
+    "apply_linked_update",
     "main",
+    "replay_linked_updates",
     "vulfi_findings",
     "vulfi_prepare",
     "vulfi_preparation",
@@ -400,6 +402,123 @@ def vulfi_triage(
     adds.
     """
     return triage_across_backends(path, finding_id, status, rationale, binary_path)
+
+
+def apply_linked_update(
+    path: str,
+    link_id: str,
+    expected_link_revision: int,
+    status: str,
+    rationale: str,
+) -> dict[str, object]:
+    """Journal one linked decision, mirror it, and confirm only a real save.
+
+    SQLite is written first. A missing catalog refuses before the IDB is
+    opened. A failed save stays pending and is never ``synchronized``.
+    """
+    from vulfi_mcp.catalog import CatalogError, catalog_path, open_catalog
+    from vulfi_mcp.ida_adapter import mirror_linked_ida
+
+    if not catalog_path().is_file():
+        raise CatalogError(
+            "the SQLite catalog is unavailable; a linked edit is refused"
+            " and nothing was written to the IDB"
+        )
+    try:
+        catalog = open_catalog(path)
+    except Exception as failed:
+        raise CatalogError(
+            "the SQLite catalog is unavailable; a linked edit is refused"
+            " and nothing was written to the IDB"
+        ) from failed
+    try:
+        started = catalog.begin_linked_update(
+            link_id, expected_link_revision, status, rationale
+        )
+        payload = started["payload"]
+        if not isinstance(payload, dict):
+            started["confirmed"] = False
+            started["sync_state"] = "pending"
+            started["reason"] = "the pending event has no payload"
+            return started
+        decision = payload.get("decision")
+        try:
+            mirrored = mirror_linked_ida(
+                str(payload["idb_path"]),
+                str(payload["ida_finding_id"]),
+                str(started["event_id"]),
+                int(payload["expected_ida_revision"]),
+                dict(decision) if isinstance(decision, dict) else {},
+            )
+        except (OSError, ValueError) as failed:
+            started["confirmed"] = False
+            started["sync_state"] = "pending"
+            started["reason"] = str(failed)
+            return started
+        if mirrored.get("conflict"):
+            conflicted = catalog.mark_link_conflict(
+                str(started["link_id"]),
+                str(mirrored.get("reason") or "unexpected IDB revision"),
+            )
+            catalog.close_link_event(str(started["event_id"]))
+            conflicted["event_id"] = started["event_id"]
+            conflicted["sync_state"] = "conflict"
+            conflicted["confirmed"] = False
+            return conflicted
+        if not (mirrored.get("applied") or mirrored.get("already")) or not mirrored.get(
+            "saved"
+        ):
+            started["confirmed"] = False
+            started["sync_state"] = "pending"
+            started["reason"] = str(mirrored.get("reason") or "the IDB was not saved")
+            return started
+        observed = mirrored.get("triage_revision")
+        if isinstance(observed, bool) or not isinstance(observed, int):
+            observed = int(payload["intended_ida_revision"])
+        confirmed = catalog.confirm_linked_update(str(started["event_id"]), observed)
+        if confirmed.get("sync_state") != "synchronized":
+            confirmed["confirmed"] = False
+        return confirmed
+    finally:
+        catalog.close()
+
+
+def replay_linked_updates(path: str) -> list[dict[str, object]]:
+    """Finish pending linked creates and updates in a new process."""
+    from vulfi_mcp.catalog import open_catalog
+
+    with open_catalog(path) as catalog:
+        return catalog.replay_pending(_mirror_journal_event)
+
+
+def _mirror_journal_event(event: dict[str, object]) -> dict[str, object]:
+    from vulfi_mcp.ida_adapter import mirror_linked_ida
+
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return {
+            "applied": False,
+            "already": False,
+            "conflict": False,
+            "reason": "event has no payload",
+        }
+    decision = payload.get("decision")
+    try:
+        return mirror_linked_ida(
+            str(payload["idb_path"]),
+            str(payload["ida_finding_id"]),
+            str(event["event_id"]),
+            int(payload["expected_ida_revision"]),
+            dict(decision) if isinstance(decision, dict) else {},
+        )
+    except (OSError, ValueError) as failed:
+        return {
+            "applied": False,
+            "already": False,
+            "conflict": False,
+            "saved": False,
+            "reason": str(failed),
+        }
 
 
 def main() -> None:

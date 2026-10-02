@@ -1911,7 +1911,12 @@ class Catalog:
             " AND target_key = ?",
             (_validate_id(link_id, "link_id"), self._target.key),
         ).fetchone()
-        return None if row is None else _link_row(row)
+        if row is None:
+            return None
+        stored = _link_row(row)
+        # Until confirm, link_revision is the last revision a save acknowledged.
+        stored["last_confirmed_revision"] = stored["link_revision"]
+        return stored
 
     def external_identity(self, finding_id: str) -> dict[str, object] | None:
         """One external finding by id, including a row another target owns."""
@@ -1960,6 +1965,171 @@ class Catalog:
             "observed_ids": observed,
         }
 
+    def begin_linked_update(
+        self, link_id: str, expected_link_revision: int, status: str, rationale: str
+    ) -> dict[str, object]:
+        """Record the next linked decision and a pending event, before any IDB save.
+
+        The link row is locked for the transaction. The caller's link revision
+        and the exact finding ids stored on that row are checked before
+        anything is written. The canonical decision and the external row move
+        with the event; ``link_revision`` stays at the last confirmed value
+        until :meth:`confirm_linked_update`. A second identical call returns
+        the same event and does not mint another revision.
+        """
+        self._require_writable()
+        identifier = _validate_id(link_id, "link_id")
+        if isinstance(expected_link_revision, bool) or not isinstance(
+            expected_link_revision, int
+        ):
+            raise CatalogError(
+                "expected_link_revision must be an integer,"
+                f" got {expected_link_revision!r}"
+            )
+        try:
+            chosen_status = validate_status(status)
+            why = validate_rationale(rationale)
+        except OperationError as refused:
+            raise CatalogError(str(refused)) from refused
+        now = utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT l.ida_finding_id, l.external_finding_id, l.proof,"
+                " l.chosen_source, l.link_revision, l.sync_state"
+                " FROM links l WHERE l.link_id = ? AND l.target_key = ?",
+                (identifier, self._target.key),
+            ).fetchone()
+            if row is None:
+                raise CatalogError(
+                    f"no link {identifier!r} is recorded for this target."
+                    " Nothing was written"
+                )
+            if row[5] == "paused":
+                raise CatalogError(
+                    f"link {identifier} is paused; a linked edit is refused"
+                    " until it is reviewed again. Nothing was written"
+                )
+            pending = connection.execute(
+                "SELECT event_id, payload FROM sync_events"
+                " WHERE link_id = ? AND state = 'pending'"
+                " ORDER BY created_at ASC",
+                (identifier,),
+            ).fetchone()
+            if pending is not None:
+                existing = json.loads(pending[1])
+                decision = existing.get("decision") if isinstance(existing, dict) else None
+                same = (
+                    isinstance(existing, dict)
+                    and existing.get("kind") == "update"
+                    and isinstance(decision, dict)
+                    and decision.get("status") == chosen_status
+                    and decision.get("rationale") == why
+                    and existing.get("expected_link_revision") == expected_link_revision
+                )
+                if not same:
+                    raise CatalogError(
+                        f"link {identifier} already has pending event"
+                        f" {pending[0]}; a second update was not started"
+                    )
+                event_id = str(pending[0])
+                payload = existing
+            else:
+                if int(row[4]) != expected_link_revision:
+                    raise CatalogError(
+                        f"link {identifier} is at revision {row[4]}, not"
+                        f" {expected_link_revision}. Nothing was written"
+                    )
+                ida_id = str(row[0])
+                external_id = str(row[1])
+                proof = json.loads(row[2])
+                if not isinstance(proof, dict) or not proof.get("idb_path"):
+                    raise CatalogError(
+                        f"link {identifier} has no IDB path to mirror."
+                        " Nothing was written"
+                    )
+                held = connection.execute(
+                    "SELECT f.finding_id FROM external_findings f"
+                    " JOIN external_scopes s ON s.scope_id = f.scope_id"
+                    " WHERE f.finding_id = ? AND s.target_key = ?",
+                    (external_id, self._target.key),
+                ).fetchone()
+                if held is None:
+                    raise UnknownExternalFindingError(
+                        f"link {identifier} names external finding"
+                        f" {external_id!r}, which this target no longer holds."
+                        " Nothing was written"
+                    )
+                observed = connection.execute(
+                    "SELECT observed_ida_revision FROM sync_events"
+                    " WHERE link_id = ? AND state = 'confirmed'"
+                    " AND observed_ida_revision IS NOT NULL"
+                    " ORDER BY confirmed_at DESC, event_id DESC LIMIT 1",
+                    (identifier,),
+                ).fetchone()
+                if observed is None:
+                    raise CatalogError(
+                        f"link {identifier} has no confirmed IDB revision to"
+                        " compare. Nothing was written"
+                    )
+                current_ida = int(observed[0])
+                intended_ida = current_ida + 1
+                intended_link = expected_link_revision + 1
+                event_id = f"event-{uuid.uuid4().hex}"
+                payload = {
+                    "kind": "update",
+                    "ida_finding_id": ida_id,
+                    "external_finding_id": external_id,
+                    "idb_path": proof["idb_path"],
+                    "expected_ida_revision": current_ida,
+                    "intended_ida_revision": intended_ida,
+                    "expected_link_revision": expected_link_revision,
+                    "intended_link_revision": intended_link,
+                    "decision": {
+                        "status": chosen_status,
+                        "rationale": why,
+                        "chosen_source": row[3],
+                        "link_id": identifier,
+                        "link_revision": intended_link,
+                        "expected_link_revision": expected_link_revision,
+                        "assessed_at": now,
+                    },
+                }
+                connection.execute(
+                    "UPDATE links SET status = ?, rationale = ?,"
+                    " sync_state = 'pending', updated_at = ?"
+                    " WHERE link_id = ?",
+                    (chosen_status, why, now, identifier),
+                )
+                connection.execute(
+                    "UPDATE external_findings SET status = ?, rationale = ?,"
+                    " assessed_at = ?, triage_revision = triage_revision + 1,"
+                    " updated_at = ? WHERE finding_id = ?",
+                    (chosen_status, why, now, now, external_id),
+                )
+                connection.execute(
+                    "INSERT INTO sync_events (event_id, link_id, kind, state,"
+                    " expected_link_revision, intended_ida_revision,"
+                    " observed_ida_revision, payload, created_at, confirmed_at)"
+                    " VALUES (?, ?, 'update', 'pending', ?, ?, NULL, ?, ?, NULL)",
+                    (
+                        event_id,
+                        identifier,
+                        expected_link_revision,
+                        intended_ida,
+                        _dump_json(payload),
+                        now,
+                    ),
+                )
+        stored = self.link(identifier)
+        if stored is None:  # pragma: no cover
+            raise CatalogError(f"link {identifier} was updated and cannot be read")
+        stored["event_id"] = event_id
+        stored["payload"] = payload
+        stored["confirmed"] = False
+        stored["sync_state"] = "pending"
+        stored["last_confirmed_revision"] = expected_link_revision
+        return stored
+
     def confirm_link_event(
         self, event_id: str, observed_ida_revision: int
     ) -> dict[str, object]:
@@ -2004,6 +2174,103 @@ class Catalog:
         stored["event_id"] = identifier
         stored["confirmed"] = True
         return stored
+
+    def confirm_linked_update(
+        self, event_id: str, ida_revision: int
+    ) -> dict[str, object]:
+        """Confirm one update only when the saved IDB revision is the intended one.
+
+        A mismatch is a conflict. It does not become ``synchronized``, and a
+        repeat of a confirmation that already landed does not mint another
+        link revision.
+        """
+        self._require_writable()
+        identifier = _validate_id(event_id, "event_id")
+        if isinstance(ida_revision, bool) or not isinstance(ida_revision, int):
+            raise CatalogError(
+                f"ida_revision must be an integer, got {ida_revision!r}"
+            )
+        now = utc_now()
+        conflicted = False
+        reason = ""
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT e.link_id, e.state, e.kind, e.expected_link_revision,"
+                " e.intended_ida_revision, e.observed_ida_revision"
+                " FROM sync_events e JOIN links l ON l.link_id = e.link_id"
+                " WHERE e.event_id = ? AND l.target_key = ?",
+                (identifier, self._target.key),
+            ).fetchone()
+            if row is None:
+                raise CatalogError(
+                    f"no event {identifier!r} is recorded for this target"
+                )
+            link_identifier = str(row[0])
+            if row[2] != "update":
+                raise CatalogError(
+                    f"event {identifier} is a {row[2]} event, not an update"
+                )
+            intended = int(row[4]) if row[4] is not None else None
+            if row[1] == "confirmed":
+                if row[5] != ida_revision:
+                    raise CatalogError(
+                        f"event {identifier} was already confirmed at IDB"
+                        f" revision {row[5]}, not {ida_revision}"
+                    )
+            elif intended != ida_revision:
+                connection.execute(
+                    "UPDATE sync_events SET state = 'failed',"
+                    " observed_ida_revision = ? WHERE event_id = ?"
+                    " AND state = 'pending'",
+                    (ida_revision, identifier),
+                )
+                connection.execute(
+                    "UPDATE links SET sync_state = 'conflict', updated_at = ?"
+                    " WHERE link_id = ?",
+                    (now, link_identifier),
+                )
+                conflicted = True
+                reason = (
+                    f"observed IDB revision {ida_revision} is not the intended"
+                    f" {intended}"
+                )
+            else:
+                expected_link = int(row[3])
+                connection.execute(
+                    "UPDATE sync_events SET state = 'confirmed',"
+                    " observed_ida_revision = ?, confirmed_at = ?"
+                    " WHERE event_id = ? AND state = 'pending'",
+                    (ida_revision, now, identifier),
+                )
+                connection.execute(
+                    "UPDATE links SET sync_state = 'synchronized',"
+                    " link_revision = ?, updated_at = ?"
+                    " WHERE link_id = ? AND link_revision = ?",
+                    (expected_link + 1, now, link_identifier, expected_link),
+                )
+        stored = self.link(link_identifier)
+        if stored is None:  # pragma: no cover
+            raise CatalogError(
+                f"link {link_identifier} was confirmed and cannot be read"
+            )
+        stored["event_id"] = identifier
+        stored["confirmed"] = not conflicted and stored["sync_state"] == "synchronized"
+        if conflicted:
+            stored["sync_state"] = "conflict"
+            stored["confirmed"] = False
+            stored["reason"] = reason
+        return stored
+
+    def close_link_event(self, event_id: str) -> None:
+        """Stop replaying one event without claiming the link synchronized."""
+        self._require_writable()
+        identifier = _validate_id(event_id, "event_id")
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE sync_events SET state = 'failed' WHERE event_id = ?"
+                " AND state = 'pending'",
+                (identifier,),
+            )
 
     def mark_link_conflict(self, link_id: str, reason: str) -> dict[str, object]:
         """Record that a replay saw a revision it did not intend."""
@@ -2051,11 +2318,18 @@ class Catalog:
     def replay_pending(
         self, mirror: Callable[[dict[str, object]], dict[str, object]]
     ) -> list[dict[str, object]]:
-        """Finish pending creations by comparing expected and intended revisions."""
+        """Finish pending creates and updates from the IDB revision actually saved.
+
+        A finding still at the previous revision is applied once. A finding
+        already at the intended revision is finalized without another write.
+        Any other revision is a conflict. A mirror that did not save leaves
+        the event pending and is never reported synchronized.
+        """
         self._require_writable()
         finished: list[dict[str, object]] = []
         for event in self.pending_events():
-            if event["kind"] != "create":
+            kind = event["kind"]
+            if kind not in ("create", "update"):
                 continue
             outcome = mirror(event)
             if outcome.get("conflict"):
@@ -2063,21 +2337,33 @@ class Catalog:
                     str(event["link_id"]),
                     str(outcome.get("reason") or "unexpected IDB revision"),
                 )
+                if kind == "update":
+                    self.close_link_event(str(event["event_id"]))
                 stored["event_id"] = event["event_id"]
+                stored["sync_state"] = "conflict"
+                stored["confirmed"] = False
                 finished.append(stored)
                 continue
             if outcome.get("applied") or outcome.get("already"):
                 observed = outcome.get("triage_revision")
                 if isinstance(observed, bool) or not isinstance(observed, int):
                     observed = int(event["intended_ida_revision"] or 0)
-                stored = self.confirm_link_event(str(event["event_id"]), observed)
-                stored["sync_state"] = "synchronized"
+                if kind == "update":
+                    stored = self.confirm_linked_update(
+                        str(event["event_id"]), observed
+                    )
+                else:
+                    stored = self.confirm_link_event(
+                        str(event["event_id"]), observed
+                    )
                 finished.append(stored)
                 continue
             held = self.link(str(event["link_id"])) or {}
             held["confirmed"] = False
             held["event_id"] = event["event_id"]
             held["reason"] = str(outcome.get("reason") or "the IDB was not saved")
+            if held.get("sync_state") == "synchronized":
+                held["sync_state"] = "pending"
             finished.append(held)
         return finished
 

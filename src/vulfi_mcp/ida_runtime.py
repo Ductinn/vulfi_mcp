@@ -7273,11 +7273,17 @@ def _mirror_linked(payload: dict[str, object]) -> dict[str, object]:
     current = stored.get("triage_revision")
     current = current if isinstance(current, int) and not isinstance(current, bool) else 0
     intended = expected + 1
+    expected_link = decision.get("expected_link_revision")
+    stored_link = stored.get("link_revision")
     if (
         current == intended
         and stored.get("link_id") == link_id
         and stored.get("status") == status
         and stored.get("rationale") == rationale
+        and (
+            expected_link is None
+            or stored_link == link_revision
+        )
     ):
         return {
             "mutated": False,
@@ -7286,11 +7292,13 @@ def _mirror_linked(payload: dict[str, object]) -> dict[str, object]:
             "conflict": False,
             "triage_revision": current,
             "link_id": link_id,
-            "link_revision": stored.get("link_revision"),
+            "link_revision": stored_link,
             "event_id": event_id,
             "scope": name,
         }
-    if current != expected:
+    if current != expected or (
+        expected_link is not None and stored_link != expected_link
+    ):
         return {
             "mutated": False,
             "applied": False,
@@ -7298,8 +7306,10 @@ def _mirror_linked(payload: dict[str, object]) -> dict[str, object]:
             "conflict": True,
             "triage_revision": current,
             "reason": (
-                f"IDA finding {finding_id} is at triage revision {current},"
-                f" not the expected {expected} or the intended {intended}"
+                f"IDA finding {finding_id} is at triage revision {current}"
+                f" and link revision {stored_link!r}, not the expected"
+                f" triage {expected} / link {expected_link!r} or the intended"
+                f" triage {intended}"
             ),
             "event_id": event_id,
             "scope": name,

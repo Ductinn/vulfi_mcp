@@ -476,7 +476,8 @@ def mirror_linked_ida(
 
     One worker operation does the compare and the write. The lease saves only
     when that operation mutated the record, so a replay that finds the
-    intended revision already present does not save again.
+    intended revision already present does not save again. A save that fails
+    is reported as not applied: it is never a synchronized mirror.
     """
     if not isinstance(finding_id, str) or not finding_id:
         raise ValueError("finding_id must be a non-empty string")
@@ -488,16 +489,28 @@ def mirror_linked_ida(
         )
     if not isinstance(decision, dict):
         raise ValueError("decision must be an object")
-    return invoke_ida(
-        idb_path,
-        "mirror_linked",
-        {
-            "finding_id": finding_id,
-            "event_id": event_id,
-            "expected_revision": expected_revision,
-            "decision": decision,
-        },
-    )
+    try:
+        mirrored = invoke_ida(
+            idb_path,
+            "mirror_linked",
+            {
+                "finding_id": finding_id,
+                "event_id": event_id,
+                "expected_revision": expected_revision,
+                "decision": decision,
+            },
+        )
+    except ManagedDatabaseError as failed:
+        return {
+            "mutated": False,
+            "applied": False,
+            "already": False,
+            "conflict": False,
+            "saved": False,
+            "reason": str(failed),
+        }
+    mirrored["saved"] = bool(mirrored.get("applied") or mirrored.get("already"))
+    return mirrored
 
 
 
