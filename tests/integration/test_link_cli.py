@@ -224,13 +224,48 @@ def test_cli_shows_both_assessments_before_choosing_and_rejects_unknown_status(
         input="ida\n",
     )
     dialogue = reviewed.stderr
-    ida_at = dialogue.find("Suspicious")
-    external_at = dialogue.find("False Positive")
     prompt_at = dialogue.find("Type 'ida'")
-    assert ida_at != -1 and external_at != -1, dialogue
     assert prompt_at != -1, dialogue
-    assert ida_at < prompt_at and external_at < prompt_at
-    assert ida_row["id"] in dialogue and external_row["id"] in dialogue
+    before = dialogue[:prompt_at]
+    assert "Suspicious" in before and "False Positive" in before
+    assert ida_row["id"] in before and external_row["id"] in before
+    lowered = before.lower()
+    # The operator chooses after seeing the mapping, not after a later check.
+    assert "image base" in lowered, before
+    assert "rva" in lowered, before
+    assert "bytes" in lowered, before
+    assert "xref" in lowered, before
+    assert __import__("re").search(r"bytes\s+[0-9a-f]{8,}", lowered), before
+
+    refused = subprocess.run(
+        [
+            _command(),
+            "link",
+            "--path",
+            str(binary),
+            "--ida-id",
+            ida_row["id"],
+            "--external-id",
+            "not-a-stored-finding",
+            "--binary",
+            str(binary),
+            "--source",
+            "ida",
+            "--status",
+            "Vulnerable",
+            "--rationale",
+            "this pair was never proved",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        input="ida\n",
+    )
+    refused_text = refused.stderr + refused.stdout
+    assert refused.returncode != 0
+    assert "Type '" not in refused_text, refused_text
+    assert "nothing was linked" in refused_text.lower() or "no external" in refused_text.lower()
     assert reviewed.returncode == 0, reviewed.stderr
     result = json.loads(reviewed.stdout)
     assert result["confirmed"] is True

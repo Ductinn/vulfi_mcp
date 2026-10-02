@@ -1638,97 +1638,16 @@ def _review_open(
     status: str,
     rationale: str,
 ) -> dict[str, object]:
-    blank = _link_result(ida_finding_id, external_finding_id)
-    identity = catalog.external_identity(external_finding_id)
-    if identity is None:
-        blank["reason"] = (
-            f"no external finding {external_finding_id!r} is stored; nothing was linked"
-        )
-        return blank
-    if not identity["owned"] or identity["source_sha256"] != file_sha:
-        blank["reason"] = (
-            f"external finding {external_finding_id} belongs to original-binary"
-            f" SHA-256 {identity['source_sha256']}, not {file_sha}; equal"
-            " addresses do not make them the same image"
-        )
-        return blank
-    ida_row, ida_rows = _ida_row(idb_path, ida_finding_id, binary)
-    if ida_row is None:
-        blank["reason"] = (
-            f"no IDA finding {ida_finding_id!r} is stored; nothing was linked"
-        )
-        return blank
-    if ida_row["rule_digest"] != identity["rule_digest"]:
-        blank["reason"] = (
-            f"rule digests differ ({ida_row['rule_digest']} and"
-            f" {identity['rule_digest']}); a shared function name is not a"
-            " link. Nothing was linked"
-        )
-        return blank
-    if (
-        identity["address_space"] != f"{identity['backend']}:image"
-        or ida_row["address_space"] != "image"
-    ):
-        blank["reason"] = (
-            f"address spaces {ida_row['address_space']!r} and"
-            f" {identity['address_space']!r} are not the same image space;"
-            " a shared numeric address is not a mapping. Nothing was linked"
-        )
-        return blank
-    if _partial_stale(identity) or _ida_partial_stale(ida_row, ida_rows):
-        blank["reason"] = (
-            "a partial scan saw other rows and did not reconfirm this"
-            " finding; the link is refused rather than attached to a stale"
-            " member. Nothing was linked"
-        )
-        return blank
-    ida_address = _parse_address(ida_row["address"])
-    external_address = _parse_address(identity["address"])
-    if ida_address is None or external_address is None:
-        blank["reason"] = "a finding address could not be read; nothing was linked"
-        return blank
-    try:
-        ida_proof = call_site_proof_ida(idb_path, ida_address)
-        names = _rule_names(identity, ida_row)
-        if identity["backend"] == "ghidra":
-            provider_proof = prove_provider_call_site(binary, external_address, names)
-        else:
-            provider_proof = _prove_backend(
-                str(identity["backend"]), binary, external_address, names
-            )
-    except (ManagedDatabaseError, LinkError, ProviderError, OSError) as refused:
-        blank["reason"] = str(refused)
-        return blank
-    mapped = _mapping_refusal(
-        ida_proof, provider_proof, ida_address, external_address, binary
+    gathered = _gather_link_evidence(
+        catalog, idb_path, binary, file_sha, ida_finding_id, external_finding_id
     )
-    if mapped is not None:
-        blank["reason"] = mapped
+    if gathered["reason"]:
+        blank = _link_result(ida_finding_id, external_finding_id)
+        blank["reason"] = gathered["reason"]
         return blank
-    ida_base = int(str(ida_proof["image_base"]), 16)
-    provider_base = int(provider_proof["image_base"])
-    rva = ida_address - ida_base
-    proof = {
-        "rule_digest": ida_row["rule_digest"],
-        "source_sha256": file_sha,
-        "managed_idb_id": ida_proof.get("managed_idb_id"),
-        "idb_path": idb_path,
-        "ida_address_space": "image",
-        "external_address_space": identity["address_space"],
-        "ida_address": hex(ida_address),
-        "external_address": hex(external_address),
-        "ida_image_base": hex(ida_base),
-        "external_image_base": hex(provider_base),
-        "rva": hex(rva),
-        "bytes": str(ida_proof.get("bytes") or ""),
-        "xrefs": {
-            "ida": ida_proof.get("xrefs_from") or [],
-            "external": provider_proof.get("xrefs") or [],
-        },
-        "segment": ida_proof.get("segment"),
-        "expected_ida_triage_revision": int(ida_row["triage_revision"]),
-        "expected_external_triage_revision": int(identity["triage_revision"]),
-    }
+    proof = gathered["proof"]
+    ida_row = gathered["ida"]
+    assert isinstance(proof, dict) and isinstance(ida_row, dict)
     try:
         created = catalog.create_link(
             ida_finding_id,
@@ -1741,8 +1660,9 @@ def _review_open(
             },
         )
     except CatalogError as refused:
-        blank["reason"] = str(refused)
-        return blank
+        failed = _link_result(ida_finding_id, external_finding_id)
+        failed["reason"] = str(refused)
+        return failed
     decision = {
         "status": status,
         "rationale": rationale,
@@ -2023,25 +1943,174 @@ def _link_result(ida_id: str, external_id: str) -> dict[str, object]:
 def link_briefing(
     path: str, ida_finding_id: str, external_finding_id: str, binary_path: str
 ) -> dict[str, object]:
-    """Both assessments, read before a reviewer is asked to choose."""
-    binary = str(Path(binary_path).expanduser().resolve())
+    """Assessments and call-site proof, read before a reviewer is asked.
+
+    The same check :func:`review_link` enforces runs here first. A pair the
+    machine has already rejected is returned with ``reason`` set and no
+    proof, so the command can show that refusal instead of asking.
+    """
     named = Path(path).expanduser().resolve()
+    binary = Path(binary_path).expanduser().resolve()
+    empty = {
+        "ida": None,
+        "external": None,
+        "proof": None,
+        "reason": None,
+        "path": str(named),
+        "binary": str(binary),
+    }
+    if not binary.is_file() or binary.suffix.lower() in IDB_SUFFIXES:
+        empty["reason"] = (
+            f"{binary} is not the original binary a link can be proved against"
+        )
+        return empty
+    file_sha = _file_sha(binary)
     idb_path = (
         str(named)
         if named.suffix.lower() in IDB_SUFFIXES
         else existing_managed_idb(str(named))
     )
-    ida_row = None
-    if idb_path is not None:
-        ida_row, _rows = _ida_row(idb_path, ida_finding_id, binary)
-    external = None
-    catalog = get_catalog(binary)
-    if catalog is not None:
-        try:
-            external = catalog.external_finding(external_finding_id)
-        finally:
-            catalog.close()
-    return {"ida": ida_row, "external": external, "path": str(named), "binary": binary}
+    if idb_path is None:
+        empty["reason"] = f"no managed IDB exists for {named}; nothing was linked"
+        return empty
+    catalog, refusal = _catalog_for_link(named, binary, file_sha, idb_path)
+    if catalog is None:
+        empty["reason"] = refusal or "provisional IDB without verified source proof"
+        return empty
+    try:
+        gathered = _gather_link_evidence(
+            catalog,
+            idb_path,
+            str(binary),
+            file_sha,
+            ida_finding_id,
+            external_finding_id,
+        )
+    finally:
+        catalog.close()
+    return {
+        "ida": gathered["ida"],
+        "external": gathered["external"],
+        "proof": gathered["proof"],
+        "reason": gathered["reason"],
+        "path": str(named),
+        "binary": str(binary),
+    }
+
+
+def _gather_link_evidence(
+    catalog: Catalog,
+    idb_path: str,
+    binary: str,
+    file_sha: str,
+    ida_finding_id: str,
+    external_finding_id: str,
+) -> dict[str, object]:
+    """Read both findings and the call-site proof, or say why a link is refused.
+
+    This writes nothing. :func:`review_link` calls it again at the write, so
+    a briefing cannot authorize a pair the machine would reject.
+    """
+    held: dict[str, object] = {
+        "ida": None,
+        "external": None,
+        "proof": None,
+        "reason": None,
+    }
+    identity = catalog.external_identity(external_finding_id)
+    if identity is None:
+        held["reason"] = (
+            f"no external finding {external_finding_id!r} is stored;"
+            " nothing was linked"
+        )
+        return held
+    held["external"] = identity
+    if not identity["owned"] or identity["source_sha256"] != file_sha:
+        held["reason"] = (
+            f"external finding {external_finding_id} belongs to original-binary"
+            f" SHA-256 {identity['source_sha256']}, not {file_sha}; equal"
+            " addresses do not make them the same image"
+        )
+        return held
+    ida_row, ida_rows = _ida_row(idb_path, ida_finding_id, binary)
+    if ida_row is None:
+        held["reason"] = (
+            f"no IDA finding {ida_finding_id!r} is stored; nothing was linked"
+        )
+        return held
+    held["ida"] = ida_row
+    if ida_row["rule_digest"] != identity["rule_digest"]:
+        held["reason"] = (
+            f"rule digests differ ({ida_row['rule_digest']} and"
+            f" {identity['rule_digest']}); a shared function name is not a"
+            " link. Nothing was linked"
+        )
+        return held
+    if (
+        identity["address_space"] != f"{identity['backend']}:image"
+        or ida_row["address_space"] != "image"
+    ):
+        held["reason"] = (
+            f"address spaces {ida_row['address_space']!r} and"
+            f" {identity['address_space']!r} are not the same image space;"
+            " a shared numeric address is not a mapping. Nothing was linked"
+        )
+        return held
+    if _partial_stale(identity) or _ida_partial_stale(ida_row, ida_rows):
+        held["reason"] = (
+            "a partial scan saw other rows and did not reconfirm this"
+            " finding; the link is refused rather than attached to a stale"
+            " member. Nothing was linked"
+        )
+        return held
+    ida_address = _parse_address(ida_row["address"])
+    external_address = _parse_address(identity["address"])
+    if ida_address is None or external_address is None:
+        held["reason"] = "a finding address could not be read; nothing was linked"
+        return held
+    try:
+        ida_proof = call_site_proof_ida(idb_path, ida_address)
+        names = _rule_names(identity, ida_row)
+        if identity["backend"] == "ghidra":
+            provider_proof = prove_provider_call_site(binary, external_address, names)
+        else:
+            provider_proof = _prove_backend(
+                str(identity["backend"]), binary, external_address, names
+            )
+    except (ManagedDatabaseError, LinkError, ProviderError, OSError) as refused:
+        held["reason"] = str(refused)
+        return held
+    mapped = _mapping_refusal(
+        ida_proof, provider_proof, ida_address, external_address, binary
+    )
+    if mapped is not None:
+        held["reason"] = mapped
+        return held
+    ida_base = int(str(ida_proof["image_base"]), 16)
+    provider_base = int(provider_proof["image_base"])
+    rva = ida_address - ida_base
+    held["proof"] = {
+        "rule_digest": ida_row["rule_digest"],
+        "source_sha256": file_sha,
+        "managed_idb_id": ida_proof.get("managed_idb_id"),
+        "idb_path": idb_path,
+        "ida_address_space": "image",
+        "external_address_space": identity["address_space"],
+        "ida_address": hex(ida_address),
+        "external_address": hex(external_address),
+        "ida_image_base": hex(ida_base),
+        "external_image_base": hex(provider_base),
+        "rva": hex(rva),
+        "bytes": str(ida_proof.get("bytes") or ""),
+        "xrefs": {
+            "ida": ida_proof.get("xrefs_from") or [],
+            "external": provider_proof.get("xrefs") or [],
+        },
+        "segment": ida_proof.get("segment"),
+        "expected_ida_triage_revision": int(ida_row["triage_revision"]),
+        "expected_external_triage_revision": int(identity["triage_revision"]),
+    }
+    return held
 
 
 def _render_link_briefing(briefing: Mapping[str, object]) -> str:
@@ -2059,6 +2128,23 @@ def _render_link_briefing(briefing: Mapping[str, object]) -> str:
             f"  address   {row.get('address')} space {row.get('address_space')}"
         )
         lines.append(f"  digest    {row.get('rule_digest')}")
+    proof = briefing.get("proof")
+    if isinstance(proof, dict):
+        lines.extend(
+            [
+                "  mapping evidence, read from the open database and the"
+                " original file",
+                f"    IDA image base       {proof.get('ida_image_base')}",
+                f"    external image base  {proof.get('external_image_base')}",
+                f"    rva                  {proof.get('rva')}",
+                f"    original bytes       {proof.get('bytes')}",
+                "    xrefs                "
+                + json.dumps(proof.get("xrefs") or {}, sort_keys=True),
+            ]
+        )
+    reason = briefing.get("reason")
+    if reason:
+        lines.append(f"  refused  {reason}")
     return "\n".join(lines)
 
 
@@ -2100,6 +2186,20 @@ def link_main(argv: list[str] | None = None) -> int:
         print(f"vulfi-mcp link: {refused}", file=sys.stderr)
         return 1
     print(_render_link_briefing(briefing), file=dialogue)
+    if briefing.get("reason"):
+        if arguments.json:
+            print(
+                json.dumps(
+                    {
+                        "confirmed": False,
+                        "reason": briefing["reason"],
+                        "sync_state": "unlinked",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        return 1
     print(
         f"\nType '{arguments.source}' to choose that assessment as canonical,"
         " anything else to abort: ",
