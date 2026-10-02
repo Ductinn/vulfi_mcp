@@ -118,6 +118,8 @@ __all__ = [
     "prove_provider_call_site",
     "reopen_proposal",
     "replay_pending_links",
+    "resolve_link",
+    "resolve_main",
     "review_link",
     "review_proposal",
 ]
@@ -2236,3 +2238,246 @@ def link_main(argv: list[str] | None = None) -> int:
             print(result["reason"], file=dialogue)
     return 0 if result.get("confirmed") else 1
 
+
+
+
+def resolve_link(
+    path: str,
+    link_id: str,
+    chosen_source: Literal["ida", "external", "new"],
+    status: str,
+    rationale: str,
+) -> dict[str, object]:
+    """Resolve a conflict with a new guarded event, after re-verification.
+
+    The caller has already chosen. This still re-reads the pair and refuses
+    a member whose identity no longer matches. A matching conflict is not
+    overwritten in place: a new pending event is mirrored and confirmed only
+    if the IDB is still at the revision just observed.
+    """
+    blank = _link_result("", "")
+    blank["link_id"] = link_id
+    if chosen_source not in CHOSEN_SOURCES:
+        blank["reason"] = (
+            "chosen_source must be 'ida', 'external', or 'new',"
+            f" got {chosen_source!r}"
+        )
+        return blank
+    if status not in TRIAGE_STATUSES:
+        blank["reason"] = (
+            f"status must be one of {' | '.join(TRIAGE_STATUSES)}, got {status!r}"
+        )
+        return blank
+    try:
+        why = validate_rationale(rationale)
+    except OperationError as refused:
+        blank["reason"] = str(refused)
+        return blank
+    try:
+        named = Path(path).expanduser().resolve()
+    except OSError as refused:
+        blank["reason"] = str(refused)
+        return blank
+    if not named.is_file() or named.suffix.lower() in IDB_SUFFIXES:
+        blank["reason"] = f"{named} is not the original binary this conflict can be resolved against"
+        return blank
+    try:
+        catalog = open_catalog(str(named))
+    except (CatalogError, OSError) as refused:
+        blank["reason"] = str(refused)
+        blank["sync_state"] = "unavailable"
+        return blank
+    try:
+        link = catalog.link(link_id)
+    finally:
+        catalog.close()
+    if link is None:
+        blank["reason"] = f"no link {link_id!r} is recorded for {named}. Nothing was written"
+        return blank
+    blank["ida_finding_id"] = str(link["ida_finding_id"])
+    blank["external_finding_id"] = str(link["external_finding_id"])
+    blank["sync_state"] = link["sync_state"]
+    blank["link_revision"] = link["link_revision"]
+    if link["sync_state"] == "paused":
+        blank["reason"] = (
+            f"link {link_id} is paused; resolution cannot relink a member"
+            " that was not reconfirmed. Nothing was written"
+        )
+        return blank
+    if link["sync_state"] != "conflict":
+        blank["reason"] = (
+            f"link {link_id} is {link['sync_state']}, not a conflict."
+            " Nothing was written"
+        )
+        return blank
+    briefing = link_briefing(
+        str(named),
+        str(link["ida_finding_id"]),
+        str(link["external_finding_id"]),
+        str(named),
+    )
+    if briefing.get("reason"):
+        blank["reason"] = str(briefing["reason"])
+        blank["proof"] = briefing.get("proof") if isinstance(briefing.get("proof"), dict) else {}
+        return blank
+    ida_row = briefing.get("ida")
+    if not isinstance(ida_row, dict) or not isinstance(ida_row.get("triage_revision"), int):
+        blank["reason"] = "the IDA member could not be re-read; nothing was written"
+        return blank
+    observed = int(ida_row["triage_revision"])
+    try:
+        catalog = open_catalog(str(named))
+    except (CatalogError, OSError) as refused:
+        blank["reason"] = str(refused)
+        return blank
+    try:
+        started = catalog.begin_link_resolution(
+            link_id, observed, chosen_source, status, why
+        )
+        payload = started["payload"]
+        if not isinstance(payload, dict):
+            started["confirmed"] = False
+            started["sync_state"] = "pending"
+            started["reason"] = "the resolution event has no payload"
+            return started
+        decision = payload.get("decision")
+        try:
+            mirrored = mirror_linked_ida(
+                str(payload["idb_path"]),
+                str(payload["ida_finding_id"]),
+                str(started["event_id"]),
+                int(payload["expected_ida_revision"]),
+                dict(decision) if isinstance(decision, dict) else {},
+            )
+        except (ManagedDatabaseError, OSError, ValueError) as failed:
+            started["confirmed"] = False
+            started["sync_state"] = "pending"
+            started["reason"] = str(failed)
+            return started
+        if mirrored.get("conflict"):
+            conflicted = catalog.mark_link_conflict(
+                str(started["link_id"]),
+                str(mirrored.get("reason") or "unexpected IDB revision"),
+            )
+            catalog.close_link_event(str(started["event_id"]))
+            conflicted["event_id"] = started["event_id"]
+            conflicted["sync_state"] = "conflict"
+            conflicted["confirmed"] = False
+            return conflicted
+        if not (mirrored.get("applied") or mirrored.get("already")) or not mirrored.get("saved"):
+            started["confirmed"] = False
+            started["sync_state"] = "pending"
+            started["reason"] = str(mirrored.get("reason") or "the IDB was not saved")
+            return started
+        seen = mirrored.get("triage_revision")
+        if isinstance(seen, bool) or not isinstance(seen, int):
+            seen = int(payload["intended_ida_revision"])
+        confirmed = catalog.confirm_linked_update(str(started["event_id"]), seen)
+        if confirmed.get("sync_state") != "synchronized":
+            confirmed["confirmed"] = False
+        confirmed["reason"] = "" if confirmed.get("confirmed") else str(confirmed.get("reason") or "")
+        return confirmed
+    finally:
+        catalog.close()
+
+
+def _resolve_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="vulfi-mcp resolve",
+        description=(
+            "Choose which assessment wins a conflicting link. This is not an"
+            " MCP tool. The pair is re-verified and shown before a new"
+            " guarded event is written."
+        ),
+    )
+    parser.add_argument("--path", required=True)
+    parser.add_argument("--link-id", required=True)
+    parser.add_argument("--source", required=True, choices=CHOSEN_SOURCES)
+    parser.add_argument("--status", required=True, choices=TRIAGE_STATUSES)
+    parser.add_argument("--rationale", required=True)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def resolve_main(argv: list[str] | None = None) -> int:
+    """Run ``vulfi-mcp resolve``. Returns the process exit status."""
+    try:
+        arguments = _resolve_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    except SystemExit as exited:
+        return int(exited.code or 0)
+    dialogue = sys.stderr if arguments.json else sys.stdout
+    try:
+        catalog = open_catalog(str(Path(arguments.path).expanduser()))
+    except (CatalogError, OSError) as refused:
+        print(f"vulfi-mcp resolve: {refused}", file=sys.stderr)
+        return 1
+    try:
+        link = catalog.link(arguments.link_id)
+    finally:
+        catalog.close()
+    if link is None:
+        print(
+            f"vulfi-mcp resolve: no link {arguments.link_id!r} is recorded."
+            " Nothing was written",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        briefing = link_briefing(
+            arguments.path,
+            str(link["ida_finding_id"]),
+            str(link["external_finding_id"]),
+            arguments.path,
+        )
+    except (CatalogError, ManagedDatabaseError, OSError) as refused:
+        print(f"vulfi-mcp resolve: {refused}", file=sys.stderr)
+        return 1
+    print(_render_link_briefing(briefing), file=dialogue)
+    if briefing.get("reason"):
+        if arguments.json:
+            print(
+                json.dumps(
+                    {
+                        "confirmed": False,
+                        "reason": briefing["reason"],
+                        "sync_state": link.get("sync_state"),
+                        "link_id": arguments.link_id,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        return 1
+    print(
+        f"\nType '{arguments.source}' to choose that assessment as canonical,"
+        " anything else to abort: ",
+        end="",
+        file=dialogue,
+        flush=True,
+    )
+    try:
+        answer = sys.stdin.readline()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    print("", file=dialogue)
+    if answer.strip() != arguments.source:
+        print("Nothing was resolved.", file=dialogue)
+        return 1
+    result = resolve_link(
+        arguments.path,
+        arguments.link_id,
+        arguments.source,
+        arguments.status,
+        arguments.rationale,
+    )
+    if arguments.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        print(
+            f"link {result.get('link_id')}: "
+            + ("synchronized" if result.get("confirmed") else "NOT synchronized"),
+            file=dialogue,
+        )
+        if result.get("reason"):
+            print(result["reason"], file=dialogue)
+    return 0 if result.get("confirmed") else 1

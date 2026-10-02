@@ -100,7 +100,9 @@ if TYPE_CHECKING:
     #: How an IDA row and its reviewer-linked external partner stand. Plan 4
     #: creates links; until then every stored row is ``unlinked``, which is not
     #: the same claim as ``synchronized``.
-    SyncState = Literal["unlinked", "pending", "synchronized", "conflict", "paused"]
+    SyncState = Literal[
+        "unlinked", "pending", "synchronized", "conflict", "paused", "unavailable"
+    ]
 
     #: What one backend made of one pass or one rule when it was asked.
     #:
@@ -277,8 +279,15 @@ class FindingsPage(TypedDict):
     target_total_complete: bool
     stale_total: int
     status_counts: dict[str, dict[str, int]]
+    scope_health: dict[str, JsonValue]
     store_health: dict[str, JsonValue]
     sync_state: SyncState
+    #: Rows this response carries. ``target_total`` is every row the available
+    #: stores hold; a missing store is not counted as zero.
+    loaded: int
+    #: One entry per reviewer link visible to this page. A linked pair is
+    #: still two findings; this does not merge them.
+    links: list[dict[str, JsonValue]]
     warnings: list[str]
 
 
@@ -302,6 +311,12 @@ class TriageResult(TypedDict):
     store_health: dict[str, JsonValue]
     sync_state: SyncState
     warnings: list[str]
+    #: Both members, and only after a confirmed linked save. Absent on an
+    #: unlinked assessment, which still returns ``finding`` alone.
+    findings: NotRequired[list[Finding]]
+    scope_health: NotRequired[dict[str, JsonValue]]
+    links: NotRequired[list[dict[str, JsonValue]]]
+    loaded: NotRequired[int]
 
 
 class AddressGap(TypedDict):

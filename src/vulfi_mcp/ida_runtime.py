@@ -3141,6 +3141,14 @@ def _scope_summary(name: str, stored: dict[str, Any]) -> dict[str, object]:
         "stale": sum(
             1 for row in findings.values() if row.get("last_seen_scan_id") != scan_id
         ),
+        # Rows this scan actually saw again. A partial scan that saw other
+        # rows and left one behind is "not reconfirmed"; a count of zero is
+        # not that fact.
+        "observed": sum(
+            1
+            for row in findings.values()
+            if row.get("last_seen_scan_id") == scan_id
+        ),
     }
 
 

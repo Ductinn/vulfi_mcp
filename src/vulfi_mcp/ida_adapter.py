@@ -253,6 +253,16 @@ def ensure_managed_idb(path: str) -> str:
     return _analyze_binary(source, managed, workspace)
 
 
+
+def _is_managed_database(source: Path) -> bool:
+    """Whether ``source`` is already a database this server keeps."""
+    try:
+        source.resolve().relative_to((data_dir() / "databases").resolve())
+    except ValueError:
+        return False
+    return source.is_file() and source.suffix.lower() in IDB_SUFFIXES
+
+
 def existing_managed_idb(path: str) -> str | None:
     """The managed IDB for ``path``, or ``None`` when there is not one yet.
 
@@ -265,6 +275,10 @@ def existing_managed_idb(path: str) -> str | None:
     truth is "nothing has scanned this target".
     """
     source = _canonical_source(path)
+    if source.suffix.lower() in IDB_SUFFIXES and _is_managed_database(source):
+        # The caller named the managed database itself. Looking for a copy of
+        # that copy would miss the store this file already is.
+        return str(source)
     if source.suffix.lower() in IDB_SUFFIXES:
         # Same gate as `ensure_managed_idb`, for the same reason: a live IDB's
         # bytes are not its saved bytes, so the workspace key would be read

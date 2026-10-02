@@ -9,9 +9,8 @@ What this milestone implements is the IDA backend and nothing else. A caller
 may pass the parameters the full design reserves — ``backend`` and
 ``binary_path`` — and each of them is answered honestly: an unimplemented
 capability is refused by name, never served as an empty success that reads
-like "nothing found". The external Ghidra/radare2 providers and
-reviewer-linked triage are not built here, and nothing below pretends
-otherwise.
+like "nothing found". Reviewer-linked triage uses the catalog journal. An unlinked finding
+still updates only its own store.
 
 Preparation *is* built here. ``vulfi_prepare`` recovers what the evidence
 justifies in a managed analysis, ``vulfi_preparation`` pages what it found
@@ -355,7 +354,7 @@ def vulfi_findings(
     # Refused before a database is even looked for, so an out-of-range page
     # never costs a workspace lookup to say no.
     validate_page(offset, limit)
-    return findings_across_backends(path, binary_path, offset, limit)
+    return _public_findings(path, binary_path, offset, limit)
 
 
 @tool(title="Assess one VulFi finding")
@@ -396,12 +395,493 @@ def vulfi_triage(
     assessment revision, and the target's triage counts across every store
     that answered. Assessing a target with no such store is refused outright:
     there is no id it could hold, and no database is analyzed or created to
-    establish that. Assessments in this build are unlinked: they update one
-    row's own authority and nothing else, and are never copied into another
-    backend's store as a substitute for the reviewer-created link Plan 4
-    adds.
+    establish that. An unlinked finding updates only the store that authored it. A
+    reviewer-linked pair, addressed by either finding id, is journaled
+    and is not reported synchronized until the IDB save is confirmed. A
+    missing catalog refuses that edit and does not write the IDB.
     """
-    return triage_across_backends(path, finding_id, status, rationale, binary_path)
+    return _public_triage(path, finding_id, status, rationale, binary_path)
+
+
+
+def _replay_startup() -> None:
+    """Finish pending linked events before the server accepts a connection.
+
+    A restarted process has no target argument. Each pending event names the
+    IDB it was mirroring; replay opens that database and finalizes or
+    conflicts from the revision actually saved. A missing catalog is not an
+    error: there is nothing to replay.
+    """
+    import json
+    import sqlite3
+
+    from vulfi_mcp.catalog import catalog_path
+
+    store = catalog_path()
+    if not store.is_file():
+        return
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+        rows = connection.execute(
+            "SELECT payload FROM sync_events WHERE state = 'pending'"
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    finally:
+        if connection is not None:
+            connection.close()
+    seen: set[str] = set()
+    for (payload,) in rows:
+        try:
+            body = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        idb = body.get("idb_path") if isinstance(body, dict) else None
+        if not isinstance(idb, str) or idb in seen:
+            continue
+        seen.add(idb)
+        try:
+            replay_linked_updates(idb)
+        except (OSError, ValueError):
+            continue
+
+
+_LINK_RANK = {
+    "unlinked": 0,
+    "synchronized": 1,
+    "pending": 2,
+    "paused": 3,
+    "conflict": 4,
+    "unavailable": 5,
+}
+
+
+
+_ROLLBACK = "the save before this one left a database it cannot read"
+
+
+def _retry_ida(call):
+    """One retry after IDA 9.4 puts a bad pack back to the previous generation."""
+    try:
+        return call()
+    except Exception as failed:
+        if _ROLLBACK not in str(failed):
+            raise
+        return call()
+
+
+def _ordinal(finding_id: str) -> int | None:
+    tail = finding_id.rsplit(":", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _joined_writer(path: str, binary_path: str | None):
+    """The catalog a linked read may update, or ``None`` when it may not join."""
+    return _retry_ida(lambda: _open_joined_writer(path, binary_path))
+
+
+def _open_joined_writer(path: str, binary_path: str | None):
+    from vulfi_mcp.catalog import catalog_path
+    from vulfi_mcp.prepare import _verified_catalog
+
+    if not catalog_path().is_file():
+        return None
+    opened, _reason = _verified_catalog(path, binary_path, writable=False)
+    if opened is None:
+        return None
+    opened.close()
+    writer, _reason = _verified_catalog(path, binary_path, writable=True)
+    return writer
+
+
+def _ida_index(idb_path: str) -> tuple[dict[str, dict], list[dict]]:
+    """Every stored IDA row, keyed by id, plus the scope summaries."""
+    from vulfi_mcp.ida_adapter import invoke_ida
+
+    found: dict[str, dict] = {}
+    scopes: list[dict] = []
+    offset = 0
+    total = None
+    while True:
+        window = _retry_ida(lambda: invoke_ida(
+            idb_path, "findings_page", {"offset": offset, "limit": 200}
+        ))
+        if not scopes:
+            raw = window.get("scopes")
+            if isinstance(raw, list):
+                scopes = [item for item in raw if isinstance(item, dict)]
+        rows = window.get("findings")
+        page = [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+        for row in page:
+            identifier = row.get("id")
+            if isinstance(identifier, str):
+                found[identifier] = row
+        if total is None:
+            try:
+                total = int(window.get("target_total") or 0)
+            except (TypeError, ValueError):
+                total = len(page)
+        offset += len(page)
+        if not page or offset >= total:
+            break
+    return found, scopes
+
+
+def _pause_reason(catalog, link: dict, ida_rows: dict[str, dict], scopes: list[dict]) -> str | None:
+    """Why this link must pause, or ``None`` when the stale bit is not that fact."""
+    from vulfi_mcp.operator import _partial_stale
+
+    proof = link.get("proof") if isinstance(link.get("proof"), dict) else {}
+    external_id = str(link["external_finding_id"])
+    ida_id = str(link["ida_finding_id"])
+    identity = catalog.external_identity(external_id)
+    held = catalog.external_finding(external_id)
+    if identity is None or held is None:
+        return "the external member is gone; the link is paused rather than attached to a similar row"
+    if str(held.get("rule_digest") or "") != str(proof.get("rule_digest") or ""):
+        return "the external member's rule digest changed; the link is paused"
+    ordinal = _ordinal(external_id)
+    occurrence = held.get("occurrence")
+    if (
+        ordinal is not None
+        and isinstance(occurrence, int)
+        and not isinstance(occurrence, bool)
+        and occurrence != ordinal
+    ):
+        return "the external member's occurrence ordinal changed; the link is paused"
+    if _partial_stale(identity):
+        return (
+            "a partial scan saw other rows and did not reconfirm the external"
+            " member; the link is paused"
+        )
+    ida_row = ida_rows.get(ida_id)
+    if ida_rows and ida_row is None:
+        return "the IDA member is gone; the link is paused rather than attached to a similar row"
+    if ida_row is not None:
+        if str(ida_row.get("rule_digest") or "") != str(proof.get("rule_digest") or ""):
+            return "the IDA member's rule digest changed; the link is paused"
+        ida_ordinal = _ordinal(ida_id)
+        ida_occurrence = ida_row.get("occurrence")
+        if (
+            ida_ordinal is not None
+            and isinstance(ida_occurrence, int)
+            and not isinstance(ida_occurrence, bool)
+            and ida_occurrence != ida_ordinal
+        ):
+            return "the IDA member's occurrence ordinal changed; the link is paused"
+        if ida_row.get("stale") and _ida_not_reconfirmed(ida_row, scopes):
+            return (
+                "a partial scan saw other IDA rows and did not reconfirm this"
+                " member; the link is paused"
+            )
+    return None
+
+
+def _ida_not_reconfirmed(row: dict, scopes: list[dict]) -> bool:
+    """True only when this stale IDA row was missed by a scan that saw others."""
+    source = row.get("source")
+    for scope in scopes:
+        if scope.get("scope") != source:
+            continue
+        observed = scope.get("observed")
+        if isinstance(observed, bool) or not isinstance(observed, int):
+            observed = 0
+        return scope.get("coverage") == "partial" and observed > 0
+    return False
+
+
+def _refresh_links(catalog, path: str) -> None:
+    from vulfi_mcp.ida_adapter import existing_managed_idb
+
+    idb = existing_managed_idb(path)
+    ida_rows: dict[str, dict] = {}
+    scopes: list[dict] = []
+    if idb is not None:
+        ida_rows, scopes = _ida_index(idb)
+    for link in catalog.links():
+        state = str(link.get("sync_state") or "")
+        if state in ("pending", "paused"):
+            continue
+        reason = _pause_reason(catalog, link, ida_rows, scopes)
+        if reason is not None:
+            catalog.pause_link(str(link["link_id"]), reason)
+            continue
+        if state == "conflict":
+            continue
+        confirmed = catalog.last_confirmed_ida_revision(str(link["link_id"]))
+        ida_row = ida_rows.get(str(link["ida_finding_id"]))
+        if confirmed is None or ida_row is None:
+            continue
+        current = ida_row.get("triage_revision")
+        if isinstance(current, bool) or not isinstance(current, int):
+            continue
+        if current != confirmed:
+            catalog.mark_link_conflict(
+                str(link["link_id"]),
+                f"IDA triage revision {current} is not the confirmed {confirmed}",
+            )
+
+
+def _replay_joined(path: str, binary_path: str | None) -> None:
+    writer = _joined_writer(path, binary_path)
+    if writer is None:
+        return
+    try:
+        writer.replay_pending(_mirror_journal_event)
+        _refresh_links(writer, path)
+    finally:
+        writer.close()
+
+
+def _scope_health(path: str, binary_path: str | None) -> dict:
+    from vulfi_mcp.catalog import CatalogError
+    from vulfi_mcp.ida_adapter import existing_managed_idb, invoke_ida
+    from vulfi_mcp.prepare import _verified_catalog
+
+    health: dict = {}
+    idb = existing_managed_idb(path)
+    if idb is not None:
+        window = _retry_ida(lambda: invoke_ida(idb, "findings_page", {"offset": 0, "limit": 1}))
+        raw = window.get("scopes")
+        health["ida"] = {
+            "available": True,
+            "scopes": [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else [],
+        }
+    try:
+        catalog, _reason = _verified_catalog(path, binary_path)
+    except CatalogError:
+        return health
+    if catalog is None:
+        return health
+    try:
+        for scope in catalog.external_scopes():
+            backend = str(scope.get("backend") or "")
+            if not backend:
+                continue
+            health[backend] = {
+                "state": scope.get("state"),
+                "coverage": scope.get("coverage"),
+                "reason": scope.get("reason"),
+                "scope": scope.get("scope"),
+                "total": scope.get("total"),
+                "stale_total": scope.get("stale_total"),
+            }
+    finally:
+        catalog.close()
+    return health
+
+
+def _link_views(path: str, binary_path: str | None) -> list[dict]:
+    from vulfi_mcp.catalog import CatalogError
+    from vulfi_mcp.prepare import _verified_catalog
+
+    try:
+        catalog, _reason = _verified_catalog(path, binary_path)
+    except CatalogError:
+        return []
+    if catalog is None:
+        return []
+    try:
+        views = []
+        for link in catalog.links():
+            views.append(
+                {
+                    "link_id": link["link_id"],
+                    "sync_state": link["sync_state"],
+                    "link_revision": link["link_revision"],
+                    "last_confirmed_revision": link.get("last_confirmed_revision"),
+                    "ida_finding_id": link["ida_finding_id"],
+                    "external_finding_id": link["external_finding_id"],
+                    "status": link.get("status"),
+                    "rationale": link.get("rationale"),
+                    "assessed_at": link.get("updated_at"),
+                    "chosen_source": link.get("chosen_source"),
+                }
+            )
+        return views
+    finally:
+        catalog.close()
+
+
+def _page_sync(links: list[dict], catalog_available: bool) -> str:
+    if not catalog_available:
+        return "unavailable"
+    if not links:
+        return "unlinked"
+    return max(links, key=lambda item: _LINK_RANK.get(str(item.get("sync_state")), 0))[
+        "sync_state"
+    ]
+
+
+def _annotate_page(
+    page: dict, path: str, binary_path: str | None, *, catalog_available: bool
+) -> FindingsPage:
+    links = _link_views(path, binary_path) if catalog_available else []
+    page["loaded"] = int(page.get("page_total") or 0)
+    page["links"] = links
+    page["scope_health"] = _scope_health(path, binary_path)
+    page["sync_state"] = _page_sync(links, catalog_available)
+    return page
+
+
+def _ida_only_page(path: str, offset: int, limit: int, reason: str) -> FindingsPage:
+    """IDA rows only. The catalog could not be identified, so it is not zero."""
+    from pathlib import Path as _Path
+
+    from vulfi_mcp.ida_adapter import (
+        IDB_SUFFIXES,
+        existing_managed_idb,
+        findings_ida,
+        unscanned_findings_page,
+    )
+
+    named = _Path(path)
+    idb = existing_managed_idb(path)
+    if idb is None and named.suffix.lower() in IDB_SUFFIXES and named.is_file():
+        # The caller named the managed database itself, not the binary it
+        # was analyzed from. That file is the store; do not look for a copy
+        # of a copy.
+        idb = str(named)
+    if idb is None:
+        page = dict(unscanned_findings_page(path, offset, limit))
+    else:
+        page = dict(_retry_ida(lambda: findings_ida(idb, offset, limit, path=path)))
+    health = page.get("store_health")
+    if not isinstance(health, dict):
+        health = {}
+    health = dict(health)
+    health["catalog"] = {"available": False, "reason": reason}
+    page["store_health"] = health
+    page["target_total_complete"] = False
+    # Drop a joined backend the IDA page does not have. A missing catalog is
+    # not a ghidra table of zeroes.
+    counts = page.get("status_counts")
+    if isinstance(counts, dict):
+        page["status_counts"] = {
+            name: table for name, table in counts.items() if name in ("ida", "aggregate")
+        }
+        if "ida" in page["status_counts"] and "aggregate" not in page["status_counts"]:
+            page["status_counts"]["aggregate"] = dict(page["status_counts"]["ida"])
+    return _annotate_page(page, path, None, catalog_available=False)
+
+
+def _public_findings(
+    path: str, binary_path: str | None, offset: int, limit: int
+) -> FindingsPage:
+    """Replay, pause or conflict, then page. A missing store stays unavailable."""
+    from pathlib import Path as _Path
+
+    from vulfi_mcp.catalog import CatalogError
+    from vulfi_mcp.ida_adapter import IDB_SUFFIXES
+
+    # An IDB path alone is not permission to join the original-binary catalog.
+    # binary_path is how this request proves those bytes.
+    if binary_path is None and _Path(path).suffix.lower() in IDB_SUFFIXES:
+        return _ida_only_page(
+            path,
+            offset,
+            limit,
+            "this request names a database and not the original binary;"
+            " supply binary_path to prove the bytes before external rows"
+            " or link state can be joined",
+        )
+    try:
+        _replay_joined(path, binary_path)
+        page = dict(findings_across_backends(path, binary_path, offset, limit))
+    except CatalogError as refused:
+        return _ida_only_page(path, offset, limit, str(refused))
+    catalog_health = {}
+    store_health = page.get("store_health")
+    if isinstance(store_health, dict) and isinstance(store_health.get("catalog"), dict):
+        catalog_health = store_health["catalog"]
+    catalog_available = bool(catalog_health.get("available"))
+    return _annotate_page(page, path, binary_path, catalog_available=catalog_available)
+
+
+def _ida_link_id(path: str, finding_id: str) -> str | None:
+    from vulfi_mcp.ida_adapter import existing_managed_idb
+
+    if not finding_id.startswith("ida:"):
+        return None
+    idb = existing_managed_idb(path)
+    if idb is None:
+        return None
+    rows, _scopes = _ida_index(idb)
+    row = rows.get(finding_id)
+    link_id = row.get("link_id") if isinstance(row, dict) else None
+    return link_id if isinstance(link_id, str) and link_id else None
+
+
+def _public_triage(
+    path: str,
+    finding_id: str,
+    status: str,
+    rationale: str,
+    binary_path: str | None,
+) -> TriageResult:
+    """Journal a linked edit; leave an unlinked finding on its own authority."""
+    from vulfi_mcp.catalog import CatalogError, catalog_path
+    from vulfi_mcp.prepare import _verified_catalog
+
+    link = None
+    if catalog_path().is_file():
+        catalog, _reason = _retry_ida(lambda: _verified_catalog(path, binary_path, writable=False))
+        if catalog is not None:
+            try:
+                link = catalog.link_for_finding(finding_id)
+            finally:
+                catalog.close()
+    if link is None:
+        if _ida_link_id(path, finding_id):
+            raise CatalogError(
+                "the SQLite catalog is unavailable; a linked edit is refused"
+                " and nothing was written to the IDB"
+            )
+        result = triage_across_backends(
+            path, finding_id, status, rationale, binary_path
+        )
+        result["findings"] = [result["finding"]]
+        return result
+    if link.get("sync_state") == "paused":
+        raise CatalogError(
+            f"link {link['link_id']} is paused; a linked edit is refused"
+            " until it is reviewed again. Nothing was written"
+        )
+    finished = _retry_ida(lambda: apply_linked_update(
+        path,
+        str(link["link_id"]),
+        int(link["link_revision"]),
+        status,
+        rationale,
+    ))
+    page = _public_findings(path, binary_path, 0, 200)
+    requested = next((row for row in page["findings"] if row["id"] == finding_id), None)
+    partner_id = (
+        link["external_finding_id"]
+        if finding_id == link["ida_finding_id"]
+        else link["ida_finding_id"]
+    )
+    partner = next((row for row in page["findings"] if row["id"] == partner_id), None)
+    both = [row for row in (requested, partner) if row is not None]
+    if requested is None:
+        requested = both[0] if both else page["findings"][0]
+    return {
+        "path": page["path"],
+        "idb_path": page["idb_path"],
+        "finding": requested,
+        "triage_revision": int(requested["triage_revision"]),
+        "target_total": page["target_total"],
+        "target_total_complete": page["target_total_complete"],
+        "status_counts": page["status_counts"],
+        "store_health": page["store_health"],
+        "sync_state": str(finished.get("sync_state") or page["sync_state"]),
+        "warnings": list(page.get("warnings") or []),
+        "findings": both,
+        "scope_health": page["scope_health"],
+        "links": page["links"],
+        "loaded": page["loaded"],
+    }
 
 
 def apply_linked_update(
@@ -529,6 +1009,7 @@ def main() -> None:
     MCP tool: each asks a person before it changes a managed analysis.
     """
     if not sys.argv[1:]:
+        _replay_startup()
         serve_stdio()
         return
     command = sys.argv[1]
@@ -540,9 +1021,14 @@ def main() -> None:
         from vulfi_mcp.operator import link_main
 
         raise SystemExit(link_main(sys.argv[2:]))
+    if command == "resolve":
+        from vulfi_mcp.operator import resolve_main
+
+        raise SystemExit(resolve_main(sys.argv[2:]))
     raise SystemExit(
         f"vulfi-mcp: {command!r} is not a command. Run 'vulfi-mcp' with no"
         " arguments to serve MCP over stdio, 'vulfi-mcp review --help' to"
-        " review stored recovery proposals, or 'vulfi-mcp link --help' to"
-        " review a finding link."
+        " review stored recovery proposals, 'vulfi-mcp link --help' to"
+        " review a finding link, or 'vulfi-mcp resolve --help' to choose"
+        " the assessment that wins a conflict."
     )

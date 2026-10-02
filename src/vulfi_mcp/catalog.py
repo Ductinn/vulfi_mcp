@@ -1902,6 +1902,200 @@ class Catalog:
         created["confirmed"] = False
         return created
 
+    def link_for_finding(self, finding_id: str) -> dict[str, object] | None:
+        """The link that names this finding, from either side, or ``None``."""
+        identifier = _validate_id(finding_id, "finding_id")
+        row = self._connection.execute(
+            "SELECT link_id FROM links WHERE target_key = ?"
+            " AND (ida_finding_id = ? OR external_finding_id = ?)",
+            (self._target.key, identifier, identifier),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.link(str(row[0]))
+
+    def links(self) -> list[dict[str, object]]:
+        """Every link of this target, in link-id order."""
+        rows = self._connection.execute(
+            "SELECT link_id FROM links WHERE target_key = ? ORDER BY link_id",
+            (self._target.key,),
+        ).fetchall()
+        return [stored for row in rows if (stored := self.link(str(row[0]))) is not None]
+
+    def pause_link(self, link_id: str, reason: str) -> dict[str, object]:
+        """Stop synchronization without dropping either assessment.
+
+        A paused link is not a conflict and not a deletion. The rows keep the
+        decision they already had; a later edit is refused until review.
+        """
+        self._require_writable()
+        identifier = _validate_id(link_id, "link_id")
+        why = reason.strip() or "a linked member was not reconfirmed"
+        now = utc_now()
+        with self._transaction() as connection:
+            held = connection.execute(
+                "SELECT sync_state FROM links WHERE link_id = ? AND target_key = ?",
+                (identifier, self._target.key),
+            ).fetchone()
+            if held is None:
+                raise CatalogError(f"no link {identifier!r} is recorded for this target")
+            if held[0] != "paused":
+                connection.execute(
+                    "UPDATE links SET sync_state = 'paused', updated_at = ?"
+                    " WHERE link_id = ?",
+                    (now, identifier),
+                )
+        stored = self.link(identifier)
+        if stored is None:  # pragma: no cover
+            raise CatalogError(f"link {identifier} was paused and cannot be read")
+        stored["reason"] = why
+        stored["confirmed"] = False
+        return stored
+
+    def last_confirmed_ida_revision(self, link_id: str) -> int | None:
+        """The IDB triage revision the last confirmed event actually saved."""
+        row = self._connection.execute(
+            "SELECT observed_ida_revision FROM sync_events"
+            " WHERE link_id = ? AND state = 'confirmed'"
+            " AND observed_ida_revision IS NOT NULL"
+            " ORDER BY confirmed_at DESC, event_id DESC LIMIT 1",
+            (_validate_id(link_id, "link_id"),),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+
+    def begin_link_resolution(
+        self,
+        link_id: str,
+        observed_ida_revision: int,
+        chosen_source: str,
+        status: str,
+        rationale: str,
+    ) -> dict[str, object]:
+        """Start a new guarded event from the revision the reviewer just saw.
+
+        This is not a last-write-wins overwrite. The expected IDB revision is
+        the one re-verification observed, so a further out-of-band edit still
+        conflicts, and ``link_revision`` does not move until that save is
+        confirmed.
+        """
+        self._require_writable()
+        identifier = _validate_id(link_id, "link_id")
+        if isinstance(observed_ida_revision, bool) or not isinstance(
+            observed_ida_revision, int
+        ):
+            raise CatalogError(
+                "observed_ida_revision must be an integer,"
+                f" got {observed_ida_revision!r}"
+            )
+        if chosen_source not in ("ida", "external", "new"):
+            raise CatalogError(
+                "chosen_source must be 'ida', 'external', or 'new',"
+                f" got {chosen_source!r}"
+            )
+        try:
+            chosen_status = validate_status(status)
+            why = validate_rationale(rationale)
+        except OperationError as refused:
+            raise CatalogError(str(refused)) from refused
+        now = utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT l.ida_finding_id, l.external_finding_id, l.proof,"
+                " l.link_revision, l.sync_state"
+                " FROM links l WHERE l.link_id = ? AND l.target_key = ?",
+                (identifier, self._target.key),
+            ).fetchone()
+            if row is None:
+                raise CatalogError(
+                    f"no link {identifier!r} is recorded for this target."
+                    " Nothing was written"
+                )
+            if row[4] == "paused":
+                raise CatalogError(
+                    f"link {identifier} is paused; resolution cannot relink a"
+                    " member that was not reconfirmed. Nothing was written"
+                )
+            if row[4] not in ("conflict", "synchronized"):
+                raise CatalogError(
+                    f"link {identifier} is {row[4]}, not a conflict a reviewer"
+                    " can resolve. Nothing was written"
+                )
+            pending = connection.execute(
+                "SELECT event_id FROM sync_events WHERE link_id = ?"
+                " AND state = 'pending'",
+                (identifier,),
+            ).fetchone()
+            if pending is not None:
+                raise CatalogError(
+                    f"link {identifier} already has pending event {pending[0]};"
+                    " resolve it before choosing again. Nothing was written"
+                )
+            proof = json.loads(row[2])
+            if not isinstance(proof, dict) or not proof.get("idb_path"):
+                raise CatalogError(
+                    f"link {identifier} has no IDB path to mirror."
+                    " Nothing was written"
+                )
+            expected_link = int(row[3])
+            intended_link = expected_link + 1
+            intended_ida = observed_ida_revision + 1
+            event_id = f"event-{uuid.uuid4().hex}"
+            payload = {
+                "kind": "update",
+                "resolution": True,
+                "ida_finding_id": str(row[0]),
+                "external_finding_id": str(row[1]),
+                "idb_path": proof["idb_path"],
+                "expected_ida_revision": observed_ida_revision,
+                "intended_ida_revision": intended_ida,
+                "expected_link_revision": expected_link,
+                "intended_link_revision": intended_link,
+                "decision": {
+                    "status": chosen_status,
+                    "rationale": why,
+                    "chosen_source": chosen_source,
+                    "link_id": identifier,
+                    "link_revision": intended_link,
+                    "expected_link_revision": expected_link,
+                    "assessed_at": now,
+                },
+            }
+            connection.execute(
+                "UPDATE links SET status = ?, rationale = ?, chosen_source = ?,"
+                " sync_state = 'pending', updated_at = ? WHERE link_id = ?",
+                (chosen_status, why, chosen_source, now, identifier),
+            )
+            connection.execute(
+                "UPDATE external_findings SET status = ?, rationale = ?,"
+                " assessed_at = ?, triage_revision = triage_revision + 1,"
+                " updated_at = ? WHERE finding_id = ?",
+                (chosen_status, why, now, now, str(row[1])),
+            )
+            connection.execute(
+                "INSERT INTO sync_events (event_id, link_id, kind, state,"
+                " expected_link_revision, intended_ida_revision,"
+                " observed_ida_revision, payload, created_at, confirmed_at)"
+                " VALUES (?, ?, 'update', 'pending', ?, ?, NULL, ?, ?, NULL)",
+                (
+                    event_id,
+                    identifier,
+                    expected_link,
+                    intended_ida,
+                    _dump_json(payload),
+                    now,
+                ),
+            )
+        stored = self.link(identifier)
+        if stored is None:  # pragma: no cover
+            raise CatalogError(f"link {identifier} was updated and cannot be read")
+        stored["event_id"] = event_id
+        stored["payload"] = payload
+        stored["confirmed"] = False
+        stored["sync_state"] = "pending"
+        return stored
+
     def link(self, link_id: str) -> dict[str, object] | None:
         """One stored link of this target, or ``None``."""
         row = self._connection.execute(
