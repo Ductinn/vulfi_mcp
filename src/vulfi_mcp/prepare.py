@@ -106,6 +106,8 @@ from vulfi_mcp.ida_adapter import (
     MAX_SCAN_FINDINGS,
     SYNC_STATE,
     ManagedDatabaseError,
+    _CATALOG_REASON,
+    _CATALOG_WARNING,
     ensure_managed_idb,
     existing_managed_idb,
     findings_ida,
@@ -910,7 +912,17 @@ def _route_rules(
                 attempts[-1] = _attempt(backend, _outcome_of(state), why)
                 continue
             if not _ranges_complete(evidence):
+                # Partial or empty coverage is not an answer. The measured
+                # rows stay — they are alongside, not instead — and the next
+                # backend is asked for what this one did not establish.
+                # Discarding them so a later backend can answer instead is
+                # the collapse this branch already refused at pass level.
                 complete[backend] = False
+                findings.setdefault(backend, []).extend(rows)
+                gap = why or _incomplete_coverage(evidence)
+                attempts[-1] = _attempt(backend, "unsupported", gap)
+                states[backend][index] = ("unsupported", gap)
+                continue
             findings.setdefault(backend, []).extend(rows)
             settled = ("answered", backend, None)
             break
@@ -1023,10 +1035,34 @@ def _rule_routing(
 
 
 def _ranges_complete(evidence: RuleEvidence) -> bool:
-    """Whether this evidence was established over every address it names."""
-    return all(
-        str(item.get("coverage")) == "complete"
-        for item in _entries(evidence.get("ranges"))
+    """Whether this evidence was established over every address it names.
+
+    An empty range list names nothing. ``all([])`` is true, and reading that
+    as complete coverage is how a scan that never looked retires a row it
+    did not see. No address named is not every address read.
+    """
+    ranges = _entries(evidence.get("ranges"))
+    if not ranges:
+        return False
+    return all(str(item.get("coverage")) == "complete" for item in ranges)
+
+
+def _incomplete_coverage(evidence: RuleEvidence) -> str:
+    """Why this evidence does not answer the rule it was asked."""
+    ranges = _entries(evidence.get("ranges"))
+    if not ranges:
+        return (
+            "this backend returned no address range for this rule, and an"
+            " empty range list is not complete coverage"
+        )
+    unread = [
+        str(item.get("coverage"))
+        for item in ranges
+        if str(item.get("coverage")) != "complete"
+    ]
+    return (
+        "at least one range this backend returned was not read in full"
+        f" ({', '.join(unread[:4])}), so the rule is not answered"
     )
 
 
@@ -1193,6 +1229,26 @@ def _external_scope_report(
     evaluated = [
         index for index in asked if states.get(index, ("", None))[0] == "evaluated"
     ]
+    coverage_rows = [
+        {
+            "rule_index": index,
+            "backend": backend,
+            "state": states[index][0],
+            "reason": states[index][1],
+        }
+        for index in sorted(states)
+    ]
+    if not evaluated:
+        # A non-empty ``asked`` is not a scan that ran. Plan 4 reading
+        # ``state == "evaluated"`` would treat a total failure as one.
+        # ``evaluated`` + ``complete`` remains the only retirement pair, and
+        # a scope that did not evaluate a rule has no coverage to claim.
+        return {
+            "state": _unevaluated_scope_state(states, refusal),
+            "coverage": None,
+            "reason": _scope_reason(backend, rules, asked, states, False),
+            "rule_coverage": coverage_rows,
+        }
     whole = len(asked) == len(rules) and len(evaluated) == len(rules)
     return {
         "state": "evaluated",
@@ -1200,16 +1256,30 @@ def _external_scope_report(
         "reason": None
         if whole and ranges_complete
         else _scope_reason(backend, rules, asked, states, ranges_complete),
-        "rule_coverage": [
-            {
-                "rule_index": index,
-                "backend": backend,
-                "state": states[index][0],
-                "reason": states[index][1],
-            }
-            for index in sorted(states)
-        ],
+        "rule_coverage": coverage_rows,
     }
+
+
+def _unevaluated_scope_state(
+    states: dict[int, tuple[str, str | None]],
+    refusal: tuple[str, str] | None,
+) -> str:
+    """The scope state when every asked rule failed to evaluate.
+
+    ``failed`` is the ordinary outcome. ``unverified`` and ``unavailable``
+    are kept when that is what the backend actually reported, so a provider
+    that was never reached is not stored as a scan that tried and died.
+    """
+    outcomes = {state for state, _reason in states.values()}
+    if outcomes == {"unverified"} or (
+        refusal is not None and refusal[0] == "unverified" and not outcomes
+    ):
+        return "unverified"
+    if outcomes == {"unavailable"} or (
+        refusal is not None and refusal[0] == "unavailable" and not outcomes
+    ):
+        return "unavailable"
+    return "failed"
 
 
 def _scope_reason(
@@ -1247,6 +1317,17 @@ def _scope_reason(
 # --------------------------------------------------------------------------
 
 
+def _session_never_opened(report: Mapping[str, Any], findings: list[Finding]) -> bool:
+    """Whether this scope never opened a session and has nothing to store.
+
+    ``unverified`` and ``unavailable`` are refusals that happen before a
+    session exists. Recording one with no findings is what flips ``stale``
+    on rows the scan did not look at, while the stored reason still says
+    nothing was written.
+    """
+    return str(report.get("state")) in ("unverified", "unavailable") and not findings
+
+
 def _merge_scan(
     path: str,
     result: ScanResult,
@@ -1277,6 +1358,12 @@ def _merge_scan(
     if catalog is not None:
         with catalog:
             for backend, report in sorted(routed.scopes.items()):
+                if _session_never_opened(report, routed.findings.get(backend, [])):
+                    # An identity refusal or an unreachable provider did not
+                    # open a session and produced no rows. Writing that scope
+                    # would stale every prior finding and store a reason that
+                    # says nothing was written. Leave the prior rows alone.
+                    continue
                 try:
                     stored[backend] = catalog.record_external_scan(
                         backend=backend,
@@ -1331,14 +1418,20 @@ def _merge_scan(
     ida_available = bool(
         _mapping(result["store_health"].get(BACKEND)).get("available")
     )
-    result["target_total_complete"] = ida_available and catalog is not None
+    result["target_total_complete"] = _stores_complete(
+        idb_present=bool(result.get("idb_path")),
+        ida_counted=ida_available,
+        catalog_answered=catalog is not None,
+    )
     result["status_counts"] = _merged_counts(result["status_counts"], counts)
     result["store_health"]["catalog"] = _catalog_health(
         catalog_reason, totals, scopes
     )
     if not _routing_clean(routed.routing):
         result["coverage"] = "partial"
-    result["warnings"] = _warnings([*result["warnings"], *routed.warnings])
+    result["warnings"] = _without_milestone(
+        [*result["warnings"], *routed.warnings]
+    )
     return result
 
 
@@ -1405,6 +1498,48 @@ def _mapping(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _stores_complete(
+    *, idb_present: bool, ida_counted: bool, catalog_answered: bool
+) -> bool:
+    """Whether every available store was counted.
+
+    An absent IDB is unavailable, not a store this read failed to count, so
+    it does not make the total incomplete. A catalog that did not answer is
+    a store that was not counted.
+    """
+    if not catalog_answered:
+        return False
+    if not idb_present:
+        return True
+    return ida_counted
+
+
+def _without_milestone(warnings: list[str]) -> list[str]:
+    """Drop the IDA-only milestone sentences from an aggregated page.
+
+    Those sentences tell an agent to ignore the catalog. The catalog is in
+    this milestone; an aggregated read must not repeat them.
+    """
+    dropped = {_CATALOG_WARNING, _CATALOG_REASON}
+    return _warnings([item for item in warnings if item not in dropped])
+
+
+def _without_milestone_health(health: dict[str, object]) -> dict[str, object]:
+    """The same drop, for a catalog reason copied off the IDA page."""
+    copied = dict(health)
+    catalog = copied.get("catalog")
+    if isinstance(catalog, dict) and catalog.get("reason") in (
+        _CATALOG_WARNING,
+        _CATALOG_REASON,
+    ):
+        copied["catalog"] = {
+            key: value for key, value in catalog.items() if key != "reason"
+        }
+    return copied
+
+
+
+
 # --------------------------------------------------------------------------
 # Reading and assessing rows across both stores
 # --------------------------------------------------------------------------
@@ -1467,12 +1602,16 @@ def findings_across_backends(
         "findings": page,
         "page_total": len(page),
         "target_total": ida_total + external_total,
-        "target_total_complete": idb_path is not None and catalog is not None,
+        "target_total_complete": _stores_complete(
+            idb_present=idb_path is not None,
+            ida_counted=idb_path is not None,
+            catalog_answered=catalog is not None,
+        ),
         "stale_total": int(ida_page["stale_total"]) + stale,
         "status_counts": _merged_counts(ida_page["status_counts"], counts),
-        "store_health": store_health,
+        "store_health": _without_milestone_health(store_health),
         "sync_state": SYNC_STATE,
-        "warnings": _warnings(
+        "warnings": _without_milestone(
             [*ida_page["warnings"], *([reason] if reason is not None else [])]
         ),
     }
@@ -1585,7 +1724,7 @@ def triage_across_backends(
         "finding": stored,
         "triage_revision": int(stored["triage_revision"]),
         "target_total": ida_total + int(totals["total"]),
-        "target_total_complete": idb_path is not None,
+        "target_total_complete": True,
         "status_counts": _merged_counts(ida_counts, counts),
         "store_health": store_health,
         "sync_state": SYNC_STATE,
@@ -1603,10 +1742,13 @@ def _completed_triage(
     before the assessment is written, not after.
     """
     if catalog is None:
-        result["store_health"] = {
-            **result["store_health"],
-            "catalog": {"available": False, "reason": reason},
-        }
+        result["store_health"] = _without_milestone_health(
+            {
+                **result["store_health"],
+                "catalog": {"available": False, "reason": reason},
+            }
+        )
+        result["warnings"] = _without_milestone(list(result.get("warnings") or []))
         return result
     with catalog:
         totals = catalog.external_totals()
@@ -1615,7 +1757,10 @@ def _completed_triage(
     result["target_total"] = int(result["target_total"]) + int(totals["total"])
     result["target_total_complete"] = True
     result["status_counts"] = _merged_counts(result["status_counts"], counts)
-    result["store_health"] = {**result["store_health"], "catalog": health}
+    result["store_health"] = _without_milestone_health(
+        {**result["store_health"], "catalog": health}
+    )
+    result["warnings"] = _without_milestone(list(result.get("warnings") or []))
     return result
 
 
@@ -2948,6 +3093,52 @@ def _reused_routing(
 # --------------------------------------------------------------------------
 
 
+def _refused_preparation(
+    path: str,
+    requested_backend: str,
+    primary: str,
+    requested: tuple[str, ...],
+    routed: _Routed,
+) -> PreparationResult:
+    """The routing refusal, returned without opening the catalog.
+
+    An external-only run that stored no pass has no analysis row. Reading
+    one back raises ``UnknownAnalysisError``. Opening the catalog for a
+    saved database raises ``CatalogError``. Either one replaces the identity
+    sentence the operator has to see, and either one is a write the refusal
+    said did not happen.
+    """
+    wording = _routing_summary(routed.routing)
+    return {
+        "path": path,
+        "idb_path": None,
+        "backend": primary,
+        "requested_backend": requested_backend,
+        "analysis_id": "",
+        "target_key": "",
+        "source_sha256": None,
+        "managed_idb_id": None,
+        "source_association": None,
+        "capability_fingerprint": "",
+        "preparation_revision": 0,
+        "reused": False,
+        "requested_passes": list(requested),
+        "passes": [],
+        "coverage": "unavailable",
+        "candidates": [],
+        "candidate_total": 0,
+        "applied_ids": [],
+        "applied_total": 0,
+        "skipped_prerequisites": routed.skipped,
+        "routing": routed.routing,
+        "artifact_paths": {"managed_idb": None, "catalog": None},
+        "catalog_available": False,
+        "warnings": _warnings(
+            [*routed.warnings, *_routing_warnings(routed.routing), wording]
+        ),
+    }
+
+
 def _record(
     path: str,
     requested_backend: str,
@@ -3003,6 +3194,16 @@ def _record(
             + _routing_summary(routed.routing)
         )
     else:
+        if not routed.results:
+            # Nothing was stored, so there is no analysis row to read back.
+            # Calling ``pass_results`` here raises ``UnknownAnalysisError``
+            # and drops the identity sentence; opening the catalog on a
+            # saved database raises ``CatalogError`` (``managed_idb_id`` is
+            # required) and drops it the same way. The routing refusal is
+            # the result.
+            return _refused_preparation(
+                path, requested_backend, primary, requested, routed
+            )
         fingerprint = adapter_fingerprint(primary)
         revision = max(
             (

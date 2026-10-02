@@ -37,21 +37,20 @@ Four gates, in the order they fire:
     stripped, so a provider cannot even repaint a terminal through a reason
     string.
 
-The two schema gates are **not** backed by the same safety net, and the
-difference decides how much the pin-time refusal has to carry:
+The two schema gates are not the same check, and neither one is the SDK
+running a provider's output schema on this event loop:
 
 * an **input** schema is evaluated by this module, on a worker thread, under
   ``schema_deadline_seconds``. A cost that slips past the pin becomes a
   :class:`CapabilityUnavailableError` on the deadline — unless it holds the
   GIL, which is why regular expressions are refused outright rather than timed;
-* an **output** schema is evaluated by the SDK, inside
-  ``ClientSession.call_tool``'s ``validate_tool_result``, on this event loop,
-  **after** ``send_request`` has returned. ``read_timeout_seconds`` bounds the
-  wait for the answer and not what is done with it; the operator's response
-  budgets are applied by :func:`_envelope`, which runs later still. There is no
-  thread, no deadline and no budget on that path, so **the pin-time refusal is
-  the entire defence there** — which is why :data:`_COSTLY_KEYWORDS` exists and
-  why both schemas are vetted, not just the one this module runs itself.
+* an **output** schema is vetted once, at pin time, and then dropped.
+  :class:`_UnvalidatedResultSession` declines ``validate_tool_result``, so
+  the SDK does not compile or run that schema on the way back.
+  :class:`_Capability` has no slot for it and :func:`_envelope` never
+  consults it. The pin is one layer; the declined SDK check is the other.
+  The budget comment on :data:`MAX_SCHEMA_BYTES` states both, and why
+  neither covers the other. Do not restore ``validate_tool_result``.
 
 The session itself is an async context manager, and it releases the provider on
 the way out of the ``with`` — on success, on error and on cancellation alike.
@@ -799,20 +798,19 @@ async def _list_tools(
 def _pin(tool: types.Tool, limits: ProviderLimits) -> _Capability:
     """One advertised tool, with **both** its schemas vetted before anything runs.
 
-    A tool schema is the provider-controlled value this module *runs* rather
+    A tool schema is the provider-controlled value this module vets rather
     than merely reads, so it is checked here, once, while the session is being
     built — not at call time, where a refusal would already have cost whatever
-    the schema asked it to cost.
+    the schema asked it to cost. Vetting is not running.
 
-    Both, because both are run. The input schema is evaluated by
-    :func:`_check_arguments` before a call goes out; the **output** schema is
-    evaluated by the SDK itself — ``ClientSession.call_tool`` calls
-    ``validate_tool_result``, which compiles the provider's ``outputSchema``
-    and runs it against the provider's own structured content, in this
-    process's event loop, on the way back. A ``^(a+)+$`` there cost 10.5
-    seconds against a five-second call timeout, needing no input schema at all.
-    Vetting one and not the other was the same hole through a field nobody had
-    looked at.
+    The input schema is later evaluated by :func:`_check_arguments`, on a
+    worker thread. The output schema is vetted and then dropped:
+    :class:`_Capability` keeps no copy of it, :func:`_envelope` never consults
+    it, and :class:`_UnvalidatedResultSession` declines
+    ``validate_tool_result``, so the SDK does not run it on this event loop.
+    The budget comment above :data:`MAX_SCHEMA_BYTES` is the statement of both
+    layers. This docstring must not contradict it, and it must not send a
+    later editor back to ``validate_tool_result``.
 
     ``outputSchema`` is optional, and absent is not unusable: radare2-mcp
     cannot declare one at all, so a missing field means nothing is compiled and

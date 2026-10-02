@@ -1347,3 +1347,429 @@ def test_unfinished_pass_shapes_stay_failed_and_missing_tools_do_not(
     (budget_attempt,) = mixed_rows["functions"]["attempts"]
     assert budget_attempt["outcome"] == "answered"
     assert budget_attempt["outcome"] != "failed"
+
+
+def _prepared(binary: Path) -> dict[str, Any]:
+    """A preparation a scan can hang a catalog write on, with no IDA in it."""
+    return {
+        "idb_path": None,
+        "source_sha256": _sha(binary),
+        "analysis_id": "prep-empty-evidence",
+        "preparation_revision": 1,
+        "backend": "ghidra",
+        "managed_idb_id": None,
+        "warnings": [],
+    }
+
+
+def test_empty_evaluated_ghidra_evidence_does_not_retire_an_assessment(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An assessed row must survive evaluated evidence that named no address.
+
+    ``list_functions`` is not a sweep of executable bytes. Evidence that
+    comes back ``evaluated`` with no contexts and no ranges did not look, and
+    a scan that did not look is not a complete scan. Today the empty range
+    list is treated as complete coverage, the scope is recorded
+    ``evaluated``+``complete``, and ``record_external_scan`` deletes the
+    assessment.
+    """
+    import vulfi_mcp.prepare as prepare
+
+    binary = _binary(tmp_path)
+    held = _finding("ghidra", "default", 0x401000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[held])
+        catalog.assess_external_finding(
+            held["id"], "Vulnerable", "reachable from the parser"
+        )
+
+    async def empty_evidence(
+        target: str, rule: dict[str, Any], index: int
+    ) -> dict[str, Any]:
+        return {
+            "backend": "ghidra",
+            "rule_index": index,
+            "contexts": [],
+            "ranges": [],
+            "state": "evaluated",
+            "reason": None,
+        }
+
+    monkeypatch.setitem(prepare._EVIDENCE_OF, "ghidra", empty_evidence)
+    rules = (load_stock_rules()[0],)
+    prepared = _prepared(binary)
+    routed = prepare._route_rules(
+        str(binary), ("ghidra",), rules, "default", {}, prepared
+    )
+    result = prepare._unscanned_ida(str(binary), prepared, "default")
+    prepare._merge_scan(str(binary), result, routed, prepared, "default", rules)
+
+    (row,) = routed.routing
+    assert row["state"] != "answered", routed.routing
+    with open_catalog(str(binary)) as catalog:
+        still = catalog.external_finding(held["id"])
+    assert still is not None
+    assert still["status"] == "Vulnerable"
+    assert still["rationale"] == "reachable from the parser"
+    assert still["triage_revision"] == 1
+    assert held["id"] not in result["scope_health"].get("ghidra", {}).get(
+        "retired", []
+    )
+
+
+def test_ghidra_refuses_a_wrapper_rule_and_an_absent_callee() -> None:
+    """A wrapper rule, and a callee the listing does not contain, are unsupported.
+
+    Following only direct references would answer a different rule. An empty
+    ``list_functions`` hit is not a sweep of executable bytes, so it is not
+    an evaluated zero.
+    """
+    import asyncio
+
+    from vulfi_mcp.providers import ghidra
+
+    rule = load_stock_rules()[0]
+    wrapped = {**rule, "wrappers": True}
+    evidence = asyncio.run(ghidra._rule_evidence(None, None, wrapped, 0))
+    assert evidence["state"] == "unsupported", evidence
+    assert "wrapper" in (evidence["reason"] or "").lower()
+    assert evidence["contexts"] == []
+    assert evidence["ranges"] == []
+
+    missing = {**rule, "function_names": ["strcpy"], "wrappers": False}
+
+    async def other_functions(session: object) -> list[dict[str, object]]:
+        return [{"entry": 0x1000, "name": "printf"}]
+
+    original = ghidra._functions
+    ghidra._functions = other_functions
+    try:
+        absent = asyncio.run(ghidra._rule_evidence(None, None, missing, 0))
+    finally:
+        ghidra._functions = original
+    assert absent["state"] == "unsupported", absent
+    assert "not a sweep of the executable" in (absent["reason"] or "")
+    assert absent["state"] != "evaluated"
+
+
+def test_partial_rule_evidence_keeps_the_measured_site_and_asks_the_next(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One measured site is stored; the unread site is asked of the next backend.
+
+    The rule is not answered, and a prior assessment is not retired.
+    """
+    import vulfi_mcp.prepare as prepare
+
+    binary = _binary(tmp_path)
+    prior = _finding("ghidra", "default", 0x401000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[prior])
+        catalog.assess_external_finding(
+            prior["id"], "Vulnerable", "reachable from the parser"
+        )
+    asked: list[str] = []
+
+    async def partial(
+        target: str, rule: dict[str, Any], index: int
+    ) -> dict[str, Any]:
+        asked.append("ghidra")
+        return {
+            "backend": "ghidra",
+            "rule_index": index,
+            "contexts": [{"params": [{"constant": False}, {"constant": False}]}],
+            "ranges": [
+                _site(0x1000, "handler"),
+                {
+                    "name": "unread",
+                    "stage": "instructions",
+                    "start": 0x2000,
+                    "end": 0x2001,
+                    "coverage": "unavailable",
+                    "unvisited": [{"start": 0x2000, "end": 0x2001}],
+                    "reason": "P-code failed at this site",
+                },
+            ],
+            "state": "evaluated",
+            "reason": None,
+        }
+
+    async def next_backend(
+        target: str, rule: dict[str, Any], index: int
+    ) -> dict[str, Any]:
+        asked.append("r2")
+        return {
+            "backend": "r2",
+            "rule_index": index,
+            "contexts": [],
+            "ranges": [],
+            "state": "unsupported",
+            "reason": "radare2 was asked and could not establish the unread site",
+        }
+
+    monkeypatch.setitem(prepare._EVIDENCE_OF, "ghidra", partial)
+    monkeypatch.setitem(prepare._EVIDENCE_OF, "r2", next_backend)
+    rules = (load_stock_rules()[0],)
+    prepared = _prepared(binary)
+    routed = prepare._route_rules(
+        str(binary), ("ghidra", "r2"), rules, "default", {}, prepared
+    )
+    result = prepare._unscanned_ida(str(binary), prepared, "default")
+    prepare._merge_scan(str(binary), result, routed, prepared, "default", rules)
+
+    assert asked == ["ghidra", "r2"]
+    assert routed.routing[0]["state"] != "answered"
+    assert routed.findings.get("ghidra"), routed.findings
+    assert routed.findings["ghidra"][0]["address"] == "0x1000"
+    with open_catalog(str(binary)) as catalog:
+        still = catalog.external_finding(prior["id"])
+        measured = [
+            row
+            for row in catalog.page_external_findings(0, 20)["findings"]
+            if row["address"] == "0x1000"
+        ]
+    assert still is not None
+    assert still["status"] == "Vulnerable"
+    assert still["rationale"] == "reachable from the parser"
+    assert still["triage_revision"] == 1
+    assert prior["id"] not in result["scope_health"]["ghidra"].get("retired", [])
+    assert measured, "the site this backend did measure was discarded"
+
+
+def test_a_scope_that_failed_every_asked_rule_reopens_as_failed(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    """Total failure is not an evaluated scan, and a mixed scope does not retire."""
+    rules = load_stock_rules()[:2]
+    failed = _external_scope_report(
+        "ghidra",
+        rules,
+        [0, 1],
+        {0: ("failed", "boom"), 1: ("failed", "again")},
+        False,
+        None,
+    )
+    assert failed["state"] == "failed"
+    assert failed["coverage"] is None
+    binary = _binary(tmp_path)
+    prior = _finding("ghidra", "default", 0x401000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[prior])
+        catalog.record_external_scan(
+            backend="ghidra",
+            scope="default",
+            scan_id="scan-failed",
+            scanned_at="2026-10-02T00:00:00Z",
+            state=str(failed["state"]),
+            coverage=failed["coverage"],
+            reason=failed["reason"],
+            rules=[dict(rule) for rule in rules],
+            rule_coverage=failed["rule_coverage"],
+            findings=[],
+        )
+    reopened = get_catalog(str(binary))
+    assert reopened is not None
+    with reopened:
+        stored = reopened.external_scope("ghidra", "default")
+        assert stored is not None
+        assert stored["state"] == "failed"
+        assert reopened.external_finding(prior["id"]) is not None
+
+    mixed = _external_scope_report(
+        "ghidra",
+        rules,
+        [0, 1],
+        {0: ("failed", "boom"), 1: ("evaluated", None)},
+        True,
+        None,
+    )
+    assert mixed["state"] == "evaluated"
+    assert mixed["coverage"] != "complete"
+    with open_catalog(str(binary)) as catalog:
+        recorded = catalog.record_external_scan(
+            backend="ghidra",
+            scope="default",
+            scan_id="scan-mixed",
+            scanned_at="2026-10-02T00:00:01Z",
+            state=str(mixed["state"]),
+            coverage=mixed["coverage"],
+            reason=mixed["reason"],
+            findings=[],
+        )
+        assert prior["id"] not in recorded["retired"]
+        assert catalog.external_finding(prior["id"]) is not None
+
+
+def test_a_hash_mismatch_returns_the_identity_refusal_and_writes_nothing(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ghidra on a different-hash map returns the identity sentence.
+
+    It must not raise ``UnknownAnalysisError``, and a prior assessment —
+    including ``stale`` — is untouched.
+    """
+    from vulfi_mcp.prepare import prepare_target
+
+    here = tmp_path / "here"
+    there = tmp_path / "there"
+    here.mkdir()
+    there.mkdir()
+    binary = here / "subject"
+    binary.write_bytes(b"\x7fELFthe real one")
+    (there / "subject").write_bytes(b"\x7fELFa different one")
+    _providers_toml(
+        tmp_path,
+        "\n".join(
+            (
+                "[ghidra]",
+                'transport = "stdio"',
+                'command = "/bin/false"',
+                "args = []",
+                "",
+                "[[ghidra.binaries]]",
+                f'local = "{here}"',
+                f'remote = "{there}"',
+                "",
+            )
+        ),
+        monkeypatch,
+    )
+    held = _finding("ghidra", "default", 0x401000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[held])
+        catalog.assess_external_finding(
+            held["id"], "Vulnerable", "reachable from the parser"
+        )
+    result = prepare_target(str(binary), backend="ghidra", passes=["strings"])
+    text = " ".join(result["warnings"])
+    assert "Nothing was analysed and nothing was written" in text, text
+    assert "UnknownAnalysisError" not in text
+    with open_catalog(str(binary)) as catalog:
+        still = catalog.external_finding(held["id"])
+    assert still is not None
+    assert still["status"] == "Vulnerable"
+    assert still["rationale"] == "reachable from the parser"
+    assert still["triage_revision"] == 1
+    assert still["stale"] is False
+
+
+def test_an_i64_identity_refusal_returns_before_open_catalog(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved database is refused with the unverified wording, not CatalogError."""
+    from vulfi_mcp.prepare import prepare_target
+
+    database = tmp_path / "subject.i64"
+    database.write_bytes(b"IDA2 container bytes")
+    _providers_toml(
+        tmp_path,
+        "\n".join(
+            (
+                "[ghidra]",
+                'transport = "stdio"',
+                'command = "/bin/false"',
+                "args = []",
+                "",
+                "[[ghidra.binaries]]",
+                f'local = "{tmp_path}"',
+                f'remote = "{tmp_path}"',
+                "",
+            )
+        ),
+        monkeypatch,
+    )
+    result = prepare_target(str(database), backend="ghidra", passes=["strings"])
+    text = " ".join(result["warnings"])
+    assert "saved IDA database" in text, text
+    assert "nothing was analysed" in text
+    assert "managed_idb_id" not in text
+    assert "CatalogError" not in text
+
+
+def test_an_unverified_scope_does_not_stale_a_prior_assessment(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rule-routing identity refusal does not write the scope it never opened."""
+    import vulfi_mcp.prepare as prepare
+
+    here = tmp_path / "here"
+    there = tmp_path / "there"
+    here.mkdir()
+    there.mkdir()
+    binary = here / "subject"
+    binary.write_bytes(b"\x7fELFthe real one")
+    (there / "subject").write_bytes(b"\x7fELFa different one")
+    _providers_toml(
+        tmp_path,
+        "\n".join(
+            (
+                "[ghidra]",
+                'transport = "stdio"',
+                'command = "/bin/false"',
+                "args = []",
+                "",
+                "[[ghidra.binaries]]",
+                f'local = "{here}"',
+                f'remote = "{there}"',
+                "",
+            )
+        ),
+        monkeypatch,
+    )
+    held = _finding("ghidra", "default", 0x401000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[held])
+        catalog.assess_external_finding(
+            held["id"], "Vulnerable", "reachable from the parser"
+        )
+    rules = (load_stock_rules()[0],)
+    prepared = _prepared(binary)
+    routed = prepare._route_rules(
+        str(binary), ("ghidra",), rules, "default", {}, prepared
+    )
+    result = prepare._unscanned_ida(str(binary), prepared, "default")
+    prepare._merge_scan(str(binary), result, routed, prepared, "default", rules)
+    reason = str(result["scope_health"]["ghidra"]["reason"])
+    assert "Nothing was analysed and nothing was written" in reason, reason
+    with open_catalog(str(binary)) as catalog:
+        still = catalog.external_finding(held["id"])
+        scope = catalog.external_scope("ghidra", "default")
+    assert still is not None
+    assert still["stale"] is False
+    assert still["status"] == "Vulnerable"
+    assert still["rationale"] == "reachable from the parser"
+    assert still["triage_revision"] == 1
+    assert scope is not None
+    assert scope["scan_id"] == "scan-1"
+
+
+def test_a_ghidra_only_catalog_page_is_complete_and_does_not_deny_the_catalog(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    """A catalog that answered in full is a complete total, milestone text gone."""
+    from vulfi_mcp.prepare import findings_across_backends
+
+    other = _binary(tmp_path, b"\x7fELFother-target")
+    with open_catalog(str(other)):
+        pass
+    never = tmp_path / "never-scanned"
+    never.write_bytes(b"\x7fELFnever-scanned")
+    empty = findings_across_backends(str(never), None, 0, 50)
+    assert empty["store_health"]["catalog"]["available"] is True
+    assert empty["store_health"]["catalog"]["total"] == 0
+    assert "not part of this IDA-only milestone" not in " ".join(empty["warnings"])
+    assert "arrives with Plan 3" not in " ".join(empty["warnings"])
+
+    binary = _binary(tmp_path, b"\x7fELFghidra-only")
+    row = _finding("ghidra", "default", 0x401000)
+    with open_catalog(str(binary)) as catalog:
+        _record(catalog, "ghidra", "default", "scan-1", findings=[row])
+    page = findings_across_backends(str(binary), None, 0, 50)
+    assert page["target_total_complete"] is True
+    assert page["store_health"]["catalog"]["available"] is True
+    assert page["target_total"] == 1
+    text = " ".join(page["warnings"])
+    assert "not part of this IDA-only milestone" not in text
+    assert "arrives with Plan 3" not in text
+    assert "ignore" not in text.lower()

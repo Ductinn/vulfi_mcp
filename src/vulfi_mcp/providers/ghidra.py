@@ -1970,16 +1970,40 @@ def _unreachable_site(entry: int, reason: str) -> AddressRange:
 async def _rule_evidence(
     session: ProviderSession, program: _Program, rule: Rule, rule_index: int
 ) -> RuleEvidence:
-    functions = await _functions(session)
-    wanted = _wanted_names(rule)
-    targets = [row for row in functions if _normalize(row["name"]) in wanted]
-    if not targets:
+    if rule.get("wrappers"):
+        # Upstream VulFi follows a rule's callee one level out through its
+        # wrappers. Finding a wrapper needs argument flow across a call, and
+        # this provider states none — so following only the direct references
+        # below would answer a different rule than the one that was asked.
         return _evidence(
             rule_index,
             [],
             [],
-            "evaluated",
-            None,
+            "unsupported",
+            f"rule {rule['name']!r} is a wrapper-following rule, and"
+            " GhidraMCP 6.0.0 states no argument flow across a call: this"
+            " adapter can only follow direct references to the functions the"
+            " rule names, so a wrapper of one of them would be missed rather"
+            " than searched",
+        )
+    functions = await _functions(session)
+    wanted = _wanted_names(rule)
+    targets = [row for row in functions if _normalize(row["name"]) in wanted]
+    if not targets:
+        # Not a clean zero. ``list_functions`` covers what Ghidra's analysis
+        # recognised, not every executable byte, so "this listing has no
+        # strcpy in it" is not "this image calls none".
+        return _evidence(
+            rule_index,
+            [],
+            [],
+            "unsupported",
+            f"rule {rule['name']!r} names"
+            f" {', '.join(sorted(rule['function_names'])[:8])} and none of"
+            f" them is in the {len(functions)} functions Ghidra's analysis"
+            " recognised; that listing is not a sweep of the executable"
+            " ranges, so this is a rule this backend could not look for, not"
+            " a rule that matched nothing",
         )
     entries = sorted({row["entry"] for row in functions})
     names = {row["entry"]: row["name"] for row in functions}
