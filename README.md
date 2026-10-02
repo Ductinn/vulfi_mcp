@@ -60,10 +60,9 @@ Findings are scoped by backend **and** by `default`/`custom:<scan_name>`, in ind
 
 `vulfi-mcp review approve` can apply a reviewed change to Ghidra's managed project, through its own safe writer, which revalidates the overlap and the project revision at the moment it applies. radare2 has no project and no save, so a mutation would not outlive the session that made it: a proposal against one of its candidates is refused by name.
 
-## Not implemented in this milestone
+## Limits
 
-- **Linked triage.** Every stored row reports `sync_state: "unlinked"`, and no link is ever created automatically — not by a matching address, not by a matching name. Reviewer-created cross-store links arrive with Plan 4.
-- **OMP confirmation UI.** The design also describes reviewing proposals through an explicit OMP confirmation surface. The local command above is the review path this milestone ships.
+- **Automatic links.** No link is created by a matching address or a matching name. A reviewer creates one with `vulfi-mcp link`, and chooses the assessment that wins a conflict with `vulfi-mcp resolve`. Both are local commands, not MCP tools.
 
 ### A save IDA 9.4.260714 cannot read back
 
@@ -96,6 +95,33 @@ uv run --python 3.11 vulfi-mcp
   }
 }
 ```
+
+## Optional OMP board
+
+The board is an OMP extension, not another MCP client and not part of OMP's native todo list. It does not create, edit, or complete todo tasks. It keeps a session-local cache of validated VulFi tool results and draws that cache under the editor. Without the extension, `vulfi-mcp` and the local review commands work as before.
+
+Install is opt-in. From a checkout:
+
+```sh
+omp --no-extensions -e ./omp/extension.ts
+```
+
+The MCP server entry the board trusts is named `vulfi`, or any configured server whose command is `vulfi-mcp`. An unrelated server that returns VulFi-shaped JSON does not update the board. Point that entry at this package the same way as the example above. The extension reads `tool_result` events from OMP's existing bridge. It does not open its own MCP session and it does not page tools on its own.
+
+`/vulfi-board` shows the cache. `/vulfi-review` and `/vulfi-link` show the evidence and, only after a confirmation in the TUI, run a fixed argv:
+
+```text
+vulfi-mcp review ...
+vulfi-mcp link ...
+vulfi-mcp resolve ...
+```
+
+Declining the confirmation does not spawn the command. Headless and print modes do not treat a missing dialog as approval and do not spawn it either. The arguments are a list, not a shell string.
+
+**The confirmation is not a credential boundary.** `vulfi-mcp` is an ordinary program. Anything that already has the operator's OS permissions, including a shell-capable agent, can run `vulfi-mcp review`, `vulfi-mcp link`, and `vulfi-mcp resolve` without the board. An installation that needs enforced human separation has to enforce it with credentials: the MCP server principal must not be able to execute those commands or write the managed data directory.
+
+The board is stale until the agent calls `vulfi_findings` or `vulfi_preparation` again. It shows the last refresh time and `loaded / target_total`. A store that did not answer is an offline warning, not a zero count. A linked pair stays two rows. A finding is identified by its id; an empty `function_name` is not an identity. A stale flag on a row is not a paused link. Pause is the link state `paused`.
+
 
 ## Managed workspace
 

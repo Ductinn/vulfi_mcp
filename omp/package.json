@@ -1,0 +1,10 @@
+{
+  "name": "vulfi-omp-board",
+  "private": true,
+  "type": "module",
+  "description": "Optional OMP triage board for VulFi MCP results. Not a second MCP client.",
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.3.2",
+    "@oh-my-pi/pi-tui": "18.3.2"
+  }
+}
