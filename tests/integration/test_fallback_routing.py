@@ -668,8 +668,13 @@ def test_provider_pseudocode_without_facts_is_not_clean(
     # the twenty-fourth needs no fact and is answerable only where its target
     # function is in the image. On a fixture that does not call it, that rule
     # is unsupported too — which is the honest answer, not a clean negative.
+    # A scope that evaluated no rule is ``failed``, not ``evaluated``: only
+    # an evaluated rule may claim coverage, and nothing here was evaluated.
     assert len(unsupported) >= 23, sorted(
         (index, states[index]["state"]) for index in states
+    )
+    assert not evaluated, sorted(
+        (index, states[index]["state"]) for index in evaluated
     )
     assert not [index for index, entry in states.items() if entry["state"] == "failed"]
     for index in sorted(unsupported):
@@ -681,22 +686,17 @@ def test_provider_pseudocode_without_facts_is_not_clean(
             or "radare2-mcp 1.8.8" in reason
             or "none of them is in the" in reason
         ), (index, reason)
-    for index in sorted(evaluated):
-        # An evaluated rule on this backend rests on facts, never on text.
-        assert states[index]["reason"] is None, states[index]
 
     # No finding was invented from text, and the IDA store is reported as one
     # nobody looked in rather than one that was empty.
-    assert all(row["backend"] != "ida" for row in result["findings"])
+    assert result["findings"] == []
     assert result["store_health"]["ida"]["available"] is False
     assert "not opened" in str(result["store_health"]["ida"]["reason"])
     assert result["coverage"] == "partial"
 
-    # The scope that was written says it covered part of the image, so none of
-    # its rows could ever be retired by it.
     scope = result["scope_health"]["r2"]
-    assert scope["state"] == "evaluated"
-    assert scope["coverage"] == "partial"
+    assert scope["state"] == "failed", scope
+    assert scope["coverage"] is None
     assert scope["reason"]
 
 

@@ -303,10 +303,8 @@ def test_invalid_passes_and_rules_do_not_mutate(
         vulfi_prepare(target, passes=[])
     with pytest.raises(Exception, match="nonesuch"):
         vulfi_prepare(target, passes=["nonesuch"])
-    with pytest.raises(Exception, match="ghidra"):
-        vulfi_prepare(target, backend="ghidra")
-    with pytest.raises(Exception, match="r2"):
-        vulfi_prepare(target, backend="r2")
+    with pytest.raises(Exception, match="binaryninja"):
+        vulfi_prepare(target, backend="binaryninja")
     with pytest.raises(Exception, match=r"rules\[0\]"):
         vulfi_scan(target, rules=[MALICIOUS_RULE], scan_name=SCAN_NAME)
     with pytest.raises(Exception, match="analysis_id"):
@@ -316,6 +314,14 @@ def test_invalid_passes_and_rules_do_not_mutate(
     # The whole point: every refusal above happened while the request was
     # still data, so no database and no catalog were ever created.
     assert _workspace_contents(managed_data_dir) == []
+
+    # ghidra and r2 are backends. A configured one may prepare. An
+    # unconfigured one refuses with a reason. Neither is an invalid name.
+    named = vulfi_prepare(target, backend="ghidra")
+    assert named["requested_backend"] == "ghidra"
+    if named.get("coverage") == "unavailable":
+        assert named.get("warnings")
+        assert _workspace_contents(managed_data_dir) == []
 
 
 def test_catalog_unavailable_is_not_empty(

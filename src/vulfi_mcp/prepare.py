@@ -2806,10 +2806,12 @@ def _ida_passes(
         idb_path = ensure_managed_idb(path)
         result = run_ida_passes(idb_path, pending)
     except ManagedDatabaseError as refused:
-        # No usable managed database is this backend being unavailable, not a
-        # pass that ran and found nothing. Under ``auto`` the chain goes on to
-        # the providers; under ``ida`` there is nowhere to go, and the routing
-        # rows say exactly that.
+        # A save that did not land is the operator's failure, not a reason to
+        # ask the next backend and then report that one as absent. Opening a
+        # database that does not exist is the other case: nobody looked, and
+        # the chain may go on.
+        if _save_was_refused(refused):
+            raise
         return [], {}, ("unavailable", str(refused)), None, None
     return (
         _entries(result.get("passes")),
@@ -2853,6 +2855,21 @@ def _external_passes(
         # not state, and a base of zero is a claim, not an absence.
         entry.pop("image_base", None)
     return entries, candidates, None
+
+
+def _save_was_refused(error: BaseException) -> bool:
+    """Whether ``error`` is a save that did not land, not a missing database.
+
+    Those two share :class:`ManagedDatabaseError`. Only the missing database
+    may be reported as this backend being unavailable so the chain can ask
+    the next one. A refused save has to stay the exception the operator sees.
+    """
+    text = str(error)
+    return (
+        "IDA reported no save" in text
+        or "the save before this one left a database it cannot read" in text
+        or "could not read back" in text
+    )
 
 
 def _unavailable_error(backend: str) -> type[BaseException]:

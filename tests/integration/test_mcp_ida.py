@@ -325,6 +325,43 @@ def _text(result: dict[str, Any]) -> str:
     )
 
 
+def _unconfigured_reason(payload: dict[str, Any]) -> str | None:
+    """The refusal text when a real backend was not configured, or ``None``."""
+    notes: list[str] = []
+    for item in payload.get("warnings") or []:
+        notes.append(str(item))
+    for row in payload.get("routing") or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("reason"):
+            notes.append(str(row["reason"]))
+        for attempt in row.get("attempts") or []:
+            if isinstance(attempt, dict) and attempt.get("reason"):
+                notes.append(str(attempt["reason"]))
+    health = payload.get("store_health")
+    if isinstance(health, dict):
+        for item in health.values():
+            if isinstance(item, dict) and item.get("reason"):
+                notes.append(str(item["reason"]))
+    scopes = payload.get("scope_health")
+    if isinstance(scopes, dict):
+        for item in scopes.values():
+            if isinstance(item, dict) and item.get("reason"):
+                notes.append(str(item["reason"]))
+            if isinstance(item, list):
+                for row in item:
+                    if isinstance(row, dict) and row.get("reason"):
+                        notes.append(str(row["reason"]))
+    text = " ".join(notes)
+    if (
+        payload.get("coverage") == "unavailable"
+        or "not configured" in text
+        or "unavailable rather than absent" in text
+    ):
+        return text or "unavailable"
+    return None
+
+
 @pytest.fixture
 def mcp_server(
     tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -599,17 +636,58 @@ def test_unimplemented_capabilities_are_refused_not_answered_empty(
 ) -> None:
     server = mcp_server()
 
+    # A backend this design does not name is still an error, not an empty scan.
+    absent = server.failure(
+        "vulfi_prepare",
+        {"path": str(compiled_calls), "backend": "binaryninja"},
+        timeout=HANDSHAKE_TIMEOUT,
+    )
+    assert "binaryninja" in absent
+    assert "not a backend" in absent
+
+    # ghidra and r2 are implemented. Unconfigured, each is refused with a
+    # reason. Configured, the result is that backend's answer, not the old
+    # "fell back" unimplemented error, and not a clean empty.
     for tool_name in ("vulfi_scan", "vulfi_prepare"):
         for name in ("ghidra", "r2"):
-            refused = server.failure(
-                tool_name,
-                {"path": str(compiled_calls), "backend": name},
+            answer = server.request(
+                "tools/call",
+                {
+                    "name": tool_name,
+                    "arguments": {"path": str(compiled_calls), "backend": name},
+                },
                 timeout=HANDSHAKE_TIMEOUT,
             )
-            assert name in refused
-            assert "'ida'" in refused and "'auto'" in refused
-            # The claim that matters: nothing quietly answered for it.
-            assert "fell back" in refused
+            assert "error" not in answer, answer
+            result = answer["result"]
+            assert isinstance(result, dict), answer
+            if result.get("isError"):
+                text = _text(result)
+                assert name in text
+                assert "fell back" not in text
+                assert text.strip()
+                continue
+            structured = result.get("structuredContent")
+            assert isinstance(structured, dict), result
+            blob = _text(result) + json.dumps(structured)
+            assert "fell back" not in blob
+            assert "not implemented" not in blob.lower()
+            refused = (
+                _unconfigured_reason(structured) is not None
+                or "not configured" in blob
+                or structured.get("analysis_id") == ""
+            )
+            if refused:
+                assert "not configured" in blob or "unavailable" in blob, blob[:2000]
+                assert structured.get("findings", []) == []
+                if tool_name == "vulfi_prepare":
+                    assert structured.get("coverage") == "unavailable"
+                    assert structured.get("applied_total") == 0
+                    assert structured.get("candidate_total") == 0
+            else:
+                assert structured.get("findings") or structured.get("passes") or structured.get(
+                    "candidate_total"
+                ), blob[:2000]
 
     unprepared = server.failure(
         "vulfi_scan",
@@ -627,13 +705,36 @@ def test_unimplemented_capabilities_are_refused_not_answered_empty(
     )
     assert "decompile_everything" in unknown_pass
 
-    aggregated = server.failure(
-        "vulfi_findings",
-        {"path": str(compiled_calls), "binary_path": str(compiled_calls)},
+    aggregated = server.request(
+        "tools/call",
+        {
+            "name": "vulfi_findings",
+            "arguments": {
+                "path": str(compiled_calls),
+                "binary_path": str(compiled_calls),
+            },
+        },
         timeout=HANDSHAKE_TIMEOUT,
     )
-    assert "binary_path" in aggregated
-
+    assert "error" not in aggregated, aggregated
+    page = aggregated["result"]
+    if page.get("isError"):
+        assert "binary_path" in _text(page)
+    else:
+        structured = page.get("structuredContent")
+        assert isinstance(structured, dict), page
+        blob = _text(page) + json.dumps(structured)
+        health = structured.get("store_health") or {}
+        reasons = [
+            str(item.get("reason"))
+            for item in health.values()
+            if isinstance(item, dict) and item.get("reason")
+        ]
+        assert reasons or "unavailable" in blob, blob[:2000]
+        assert structured.get("findings") == []
+        ida = health.get("ida") if isinstance(health, dict) else None
+        assert isinstance(ida, dict) and ida.get("available") is False, health
+        assert ida.get("reason"), health
     assert _managed_databases(managed_data_dir) == []
     assert server.noise == []
 
