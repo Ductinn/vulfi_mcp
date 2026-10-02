@@ -2869,6 +2869,7 @@ def _save_was_refused(error: BaseException) -> bool:
         "IDA reported no save" in text
         or "the save before this one left a database it cannot read" in text
         or "could not read back" in text
+        or "neither can the copy taken before its last save" in text
     )
 
 

@@ -47,7 +47,7 @@ import pytest
 from conftest import missing_prerequisite, names_the_rollback
 from vulfi_mcp.catalog import CATALOG_NAME, CATALOG_UNAVAILABLE_REASON
 from vulfi_mcp.ida_adapter import ManagedDatabaseError, ensure_managed_idb, scan_ida
-from vulfi_mcp.prepare import run_ida_passes
+from vulfi_mcp.prepare import PreparationError, prepare_target, run_ida_passes
 from vulfi_mcp.rules import validate_rules
 from vulfi_mcp.server import vulfi_prepare, vulfi_preparation, vulfi_scan
 
@@ -379,6 +379,61 @@ def test_failed_save_retains_partial(
             _failed_save_claims_nothing(compiled_flow)
         finally:
             produced.extend(str(path) for path in _managed_databases(managed_data_dir))
+
+
+def test_an_unreadable_spare_is_re_raised_not_substituted(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spare that cannot be opened is the operator's failure, not an absent backend."""
+    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(tmp_path / "absent.toml"))
+    binary = tmp_path / "firmware"
+    binary.write_bytes(b"not a database")
+    dead = tmp_path / "dead.i64"
+    phrase = (
+        f"IDA could not open {dead}, and neither can the copy taken before"
+        " its last save; nothing in this workspace is usable and it has to"
+        " be built again from its source"
+    )
+
+    def _dead(path: str) -> str:
+        raise ManagedDatabaseError(phrase)
+
+    monkeypatch.setattr("vulfi_mcp.prepare.ensure_managed_idb", _dead)
+    with pytest.raises(ManagedDatabaseError) as refused:
+        prepare_target(str(binary), backend="auto")
+    assert "neither can the copy taken before its last save" in str(refused.value)
+    assert "no backend in the chain" not in str(refused.value)
+
+
+def test_a_missing_database_still_advances_the_chain(
+    tmp_path: Path, managed_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No database was produced, so the chain may ask the next backend."""
+    monkeypatch.setenv("VULFI_MCP_PROVIDER_CONFIG", str(tmp_path / "absent.toml"))
+    binary = tmp_path / "firmware"
+    binary.write_bytes(b"not a database")
+    produced = tmp_path / "missing.i64"
+    phrases = (
+        f"IDA did not leave a database at {produced}",
+        (
+            f"IDA could not open the copy it made of {binary}: those bytes"
+            " are a database IDA 9.4 packed and can no longer load. Nothing"
+            f" was written to {binary}, and no managed database was produced"
+            " from it — it has to be built again from its source binary."
+        ),
+    )
+    for phrase in phrases:
+        def _missing(path: str, message: str = phrase) -> str:
+            raise ManagedDatabaseError(message)
+
+        monkeypatch.setattr("vulfi_mcp.prepare.ensure_managed_idb", _missing)
+        with pytest.raises(PreparationError) as advanced:
+            prepare_target(str(binary), backend="auto")
+        assert "no backend in the" in str(advanced.value) and "chain prepared" in str(
+            advanced.value
+        )
+        assert phrase in str(advanced.value)
+        assert not isinstance(advanced.value, ManagedDatabaseError)
 
 
 def _refuse_to_save(handle: object, database: object) -> None:
