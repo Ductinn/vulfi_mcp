@@ -8,6 +8,7 @@ link; a failed scope that found nothing does not.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -27,14 +28,15 @@ from vulfi_mcp.ida_adapter import (
     ManagedDatabaseError,
     ensure_managed_idb,
     findings_ida,
+    invoke_ida,
     scan_ida,
     triage_ida,
 )
 from vulfi_mcp.ida_runtime import OperationError, utc_now
-from vulfi_mcp.operator import review_link
+from vulfi_mcp.operator import link_briefing, review_link
 from vulfi_mcp.prepare import scan_target
 from vulfi_mcp.rules import Rule, canonical_rule_digest
-from vulfi_mcp.server import vulfi_findings, vulfi_triage
+from vulfi_mcp.server import _replay_startup, vulfi_findings, vulfi_triage
 
 pytestmark = pytest.mark.requires_ida
 
@@ -593,3 +595,238 @@ def _event_ids(binary: Path, link_id: str) -> set[str]:
     finally:
         catalog.close()
     return {str(row[0]) for row in rows}
+
+
+def _event_state(binary: Path, event_id: str) -> str:
+    catalog = get_catalog(str(binary))
+    assert catalog is not None
+    try:
+        row = catalog._connection.execute(
+            "SELECT state FROM sync_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+    finally:
+        catalog.close()
+    assert row is not None, event_id
+    return str(row[0])
+
+
+def _external_pad(binary: Path, count: int) -> None:
+    """Rows that sort ahead of a real Ghidra finding, in another scope."""
+    digest = "c" * 64
+    findings = []
+    for ordinal in range(1, count + 1):
+        findings.append(
+            {
+                "id": f"ghidra:custom:pad:0:{digest}:ghidra:image:0x{ordinal:x}:0",
+                "backend": "ghidra",
+                "source": "custom:pad",
+                "rule_index": 0,
+                "rule_digest": digest,
+                "rule_name": "Pad",
+                "function_name": "",
+                "found_in": "pad",
+                "address_space": "ghidra:image",
+                "address": ordinal,
+                "occurrence": 0,
+                "priority": "High",
+                "evidence": {},
+            }
+        )
+    catalog = open_catalog(str(binary))
+    try:
+        catalog.record_external_scan(
+            backend="ghidra",
+            scope="custom:pad",
+            scan_id="scan-pad",
+            scanned_at=utc_now(),
+            state="evaluated",
+            coverage="complete",
+            findings=findings,
+        )
+    finally:
+        catalog.close()
+
+
+def _store_page_two(binary: Path, managed: str) -> str:
+    """201 IDA rows so the last one is on the second page of 200."""
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    scope = "custom:pad"
+    findings = []
+    target = ""
+    for ordinal in range(1, 202):
+        address = "0x7fffffff" if ordinal == 201 else f"0x{ordinal:x}"
+        finding_id = f"ida:{scope}:0:{'d' * 64}:image:{address}:0"
+        if ordinal == 201:
+            target = finding_id
+        findings.append(
+            {
+                "id": finding_id,
+                "backend": "ida",
+                "source": scope,
+                "binary_sha256": digest,
+                "rule_index": 0,
+                "rule_digest": "d" * 64,
+                "rule_name": "Pad",
+                "function_name": "",
+                "found_in": "pad",
+                "address_space": "image",
+                "address": address,
+                "relative_address": None,
+                "occurrence": 0,
+                "priority": "High",
+                "evidence": {},
+            }
+        )
+    invoke_ida(
+        managed,
+        "store_scan",
+        {
+            "scope": scope,
+            "scan_id": "scan-page-two",
+            "scanned_at": utc_now(),
+            "coverage": "complete",
+            "rules": [{"name": "Pad", "function_names": ["pad"], "mark_if": {}}],
+            "rule_coverage": [
+                {"rule_index": 0, "state": "evaluated", "backend": "ida"}
+            ],
+            "warnings": [],
+            "findings": findings,
+            "offset": 0,
+            "limit": 1,
+        },
+    )
+    return target
+
+
+@pytest.mark.requires_ghidra
+def test_startup_replay_confirms_pending_before_any_findings_read(
+    tmp_path: Path, managed_data_dir: Path, ghidra_config: Path
+) -> None:
+    """A restart finishes the pending save before any public findings read.
+
+    Opening the managed IDB as if it were the binary, then swallowing that
+    refusal, leaves the crash window open. This test never calls
+    ``vulfi_findings``.
+    """
+    binary = _compile(tmp_path, "startup-replay")
+    pair = _linked_pair(binary)
+    catalog = open_catalog(str(binary))
+    try:
+        started = catalog.begin_linked_update(
+            str(pair["link_id"]),
+            int(pair["link_revision"]),
+            EXTERNAL_STATUS,
+            "restart must finish this save",
+        )
+    finally:
+        catalog.close()
+    assert started["sync_state"] == "pending", started
+    event_id = str(started["event_id"])
+
+    _replay_startup()
+
+    assert _event_state(binary, event_id) == "confirmed"
+    stored = _stored_link(binary, str(pair["link_id"]))
+    assert stored["sync_state"] == "synchronized", stored
+    ida_page = _reopen(
+        lambda: findings_ida(str(pair["managed"]), 0, 200, path=str(binary))
+    )
+    ida_row = next(row for row in ida_page["findings"] if row["id"] == pair["ida"]["id"])
+    assert ida_row["status"] == EXTERNAL_STATUS
+    assert ida_row["rationale"] == "restart must finish this save"
+
+
+@pytest.mark.requires_ghidra
+def test_triage_result_names_requested_id_past_first_page(
+    tmp_path: Path, managed_data_dir: Path, ghidra_config: Path
+) -> None:
+    """A linked edit names the requested row, not whoever sorted onto page one."""
+    binary = _compile(tmp_path, "past-page")
+    pair = _linked_pair(binary)
+    external_id = str(pair["external"]["id"])
+    _external_pad(binary, 220)
+    result = vulfi_triage(
+        str(binary),
+        external_id,
+        EXTERNAL_STATUS,
+        "named row, not a neighbor",
+    )
+    catalog = get_catalog(str(binary))
+    assert catalog is not None
+    try:
+        stored = catalog.external_finding(external_id)
+    finally:
+        catalog.close()
+    assert stored is not None
+    assert result["finding"]["id"] == external_id
+    assert result["triage_revision"] == int(stored["triage_revision"])
+    assert result["finding"]["triage_revision"] == result["triage_revision"]
+
+
+def test_page_two_finding_reaches_briefing(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    """A finding past the first IDA page is still the row the briefing reads."""
+    binary = _compile(tmp_path, "page-two")
+    managed = ensure_managed_idb(str(binary))
+    target = _store_page_two(binary, managed)
+    digest = "e" * 64
+    external_id = f"ghidra:default:0:{digest}:ghidra:image:0x1000:0"
+    catalog = open_catalog(str(binary))
+    try:
+        catalog.record_external_scan(
+            backend="ghidra",
+            scope="default",
+            scan_id="scan-brief",
+            scanned_at=utc_now(),
+            state="evaluated",
+            coverage="partial",
+            findings=[
+                {
+                    "id": external_id,
+                    "backend": "ghidra",
+                    "source": "default",
+                    "rule_index": 0,
+                    "rule_digest": digest,
+                    "rule_name": "Brief",
+                    "function_name": "",
+                    "found_in": "brief",
+                    "address_space": "ghidra:image",
+                    "address": 0x1000,
+                    "occurrence": 0,
+                    "priority": "High",
+                    "evidence": {},
+                }
+            ],
+        )
+    finally:
+        catalog.close()
+    briefing = link_briefing(str(binary), target, external_id, str(binary))
+    assert isinstance(briefing["ida"], dict), briefing
+    assert briefing["ida"]["id"] == target
+
+
+def test_two_external_scopes_both_appear(
+    tmp_path: Path, managed_data_dir: Path
+) -> None:
+    """One backend keeps every scope, the way the IDA side already does."""
+    binary = tmp_path / "two-scopes.bin"
+    binary.write_bytes(b"\x7fELF" + b"not-a-real-image")
+    with open_catalog(str(binary)) as catalog:
+        for scope in ("default", "custom:night"):
+            catalog.record_external_scan(
+                backend="ghidra",
+                scope=scope,
+                scan_id=f"scan-{scope}",
+                scanned_at=utc_now(),
+                state="evaluated",
+                coverage="complete",
+                findings=[],
+            )
+    page = vulfi_findings(str(binary))
+    health = page["scope_health"]["ghidra"]
+    assert isinstance(health, dict), health
+    scopes = health["scopes"]
+    assert isinstance(scopes, list), health
+    assert {item["scope"] for item in scopes} == {"default", "custom:night"}

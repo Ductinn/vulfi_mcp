@@ -415,7 +415,7 @@ def _replay_startup() -> None:
     import json
     import sqlite3
 
-    from vulfi_mcp.catalog import catalog_path
+    from vulfi_mcp.catalog import CatalogError, catalog_path
 
     store = catalog_path()
     if not store.is_file():
@@ -424,7 +424,11 @@ def _replay_startup() -> None:
     try:
         connection = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
         rows = connection.execute(
-            "SELECT payload FROM sync_events WHERE state = 'pending'"
+            "SELECT e.payload, l.proof, l.target_key, t.managed_idb_id"
+            " FROM sync_events e"
+            " JOIN links l ON l.link_id = e.link_id"
+            " JOIN targets t ON t.target_key = l.target_key"
+            " WHERE e.state = 'pending'"
         ).fetchall()
     except sqlite3.Error:
         return
@@ -432,20 +436,106 @@ def _replay_startup() -> None:
         if connection is not None:
             connection.close()
     seen: set[str] = set()
-    for (payload,) in rows:
+    for payload, proof_text, target_key, stored_id in rows:
         try:
             body = json.loads(payload)
+            proof = json.loads(proof_text) if isinstance(proof_text, str) else {}
         except json.JSONDecodeError:
             continue
-        idb = body.get("idb_path") if isinstance(body, dict) else None
+        if not isinstance(body, dict):
+            continue
+        if not isinstance(proof, dict):
+            proof = {}
+        event_proof = body.get("proof") if isinstance(body.get("proof"), dict) else {}
+        idb = body.get("idb_path") or proof.get("idb_path")
         if not isinstance(idb, str) or idb in seen:
             continue
         seen.add(idb)
-        try:
-            replay_linked_updates(idb)
-        except (OSError, ValueError):
-            continue
+        idb_id = event_proof.get("managed_idb_id") or proof.get("managed_idb_id")
+        if not isinstance(idb_id, str) or not idb_id:
+            idb_id = stored_id if isinstance(stored_id, str) and stored_id else None
+        if not isinstance(idb_id, str) or not idb_id:
+            idb_id = _managed_id_from_database(idb)
+        if not isinstance(idb_id, str) or not idb_id:
+            raise CatalogError(
+                f"{idb} is an IDA database, so its original bytes are unknown:"
+                " a managed_idb_id from its netnode is required to identify it"
+            )
+        if isinstance(stored_id, str) and stored_id and stored_id != idb_id:
+            raise CatalogError(
+                f"target {target_key} is managed database {stored_id},"
+                f" not {idb_id}"
+            )
+        if not isinstance(stored_id, str) or not stored_id:
+            _bind_managed_id(str(target_key), idb_id)
+        replay_linked_updates(idb, idb_id)
 
+
+
+def _managed_id_from_database(idb: str) -> str | None:
+    """The netnode id of ``idb``, when the event itself did not carry one."""
+    from vulfi_mcp.ida_adapter import findings_ida
+
+    page = findings_ida(idb, 0, 1)
+    health = page.get("store_health")
+    if not isinstance(health, dict):
+        return None
+    ida = health.get("ida")
+    if not isinstance(ida, dict):
+        return None
+    value = ida.get("managed_idb_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _bind_managed_id(target_key: str, managed_idb_id: str) -> None:
+    """Record the event's database id on the target that already owns the link.
+
+    A catalog opened from the original binary does not always store this id.
+    Startup has the id, from the link proof, and has to open that same target
+    by it. Writing a second target would replay nothing and leave the crash
+    window open.
+    """
+    import sqlite3
+
+    from vulfi_mcp.catalog import catalog_path
+
+    connection = sqlite3.connect(catalog_path())
+    try:
+        connection.execute(
+            "UPDATE targets SET managed_idb_id = ? WHERE target_key = ?"
+            " AND managed_idb_id IS NULL",
+            (managed_idb_id, target_key),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _committed_finding(
+    path: str, binary_path: str | None, finding_id: str
+) -> dict | None:
+    """The row ``finding_id`` names, read from its store, not from a page window."""
+    from pathlib import Path as _Path
+
+    from vulfi_mcp.ida_adapter import IDB_SUFFIXES, existing_managed_idb
+    from vulfi_mcp.prepare import _verified_catalog
+
+    if finding_id.startswith("ida:"):
+        named = _Path(path)
+        idb = existing_managed_idb(path)
+        if idb is None and named.suffix.lower() in IDB_SUFFIXES and named.is_file():
+            idb = str(named)
+        if idb is None:
+            return None
+        found, _scopes = _ida_index(idb)
+        return found.get(finding_id)
+    catalog, _reason = _verified_catalog(path, binary_path)
+    if catalog is None:
+        return None
+    try:
+        return catalog.external_finding(finding_id)
+    finally:
+        catalog.close()
 
 _LINK_RANK = {
     "unlinked": 0,
@@ -655,18 +745,23 @@ def _scope_health(path: str, binary_path: str | None) -> dict:
     if catalog is None:
         return health
     try:
+        grouped: dict[str, list] = {}
         for scope in catalog.external_scopes():
             backend = str(scope.get("backend") or "")
             if not backend:
                 continue
-            health[backend] = {
-                "state": scope.get("state"),
-                "coverage": scope.get("coverage"),
-                "reason": scope.get("reason"),
-                "scope": scope.get("scope"),
-                "total": scope.get("total"),
-                "stale_total": scope.get("stale_total"),
-            }
+            grouped.setdefault(backend, []).append(
+                {
+                    "state": scope.get("state"),
+                    "coverage": scope.get("coverage"),
+                    "reason": scope.get("reason"),
+                    "scope": scope.get("scope"),
+                    "total": scope.get("total"),
+                    "stale_total": scope.get("stale_total"),
+                }
+            )
+        for backend, scopes in grouped.items():
+            health[backend] = {"scopes": scopes}
     finally:
         catalog.close()
     return health
@@ -856,16 +951,18 @@ def _public_triage(
         rationale,
     ))
     page = _public_findings(path, binary_path, 0, 200)
-    requested = next((row for row in page["findings"] if row["id"] == finding_id), None)
+    requested = _committed_finding(path, binary_path, finding_id)
     partner_id = (
         link["external_finding_id"]
         if finding_id == link["ida_finding_id"]
         else link["ida_finding_id"]
     )
-    partner = next((row for row in page["findings"] if row["id"] == partner_id), None)
+    partner = _committed_finding(path, binary_path, str(partner_id))
     both = [row for row in (requested, partner) if row is not None]
     if requested is None:
-        requested = both[0] if both else page["findings"][0]
+        raise CatalogError(
+            f"finding {finding_id} was updated and cannot be read back"
+        )
     return {
         "path": page["path"],
         "idb_path": page["idb_path"],
@@ -963,11 +1060,13 @@ def apply_linked_update(
         catalog.close()
 
 
-def replay_linked_updates(path: str) -> list[dict[str, object]]:
+def replay_linked_updates(
+    path: str, managed_idb_id: str | None = None
+) -> list[dict[str, object]]:
     """Finish pending linked creates and updates in a new process."""
     from vulfi_mcp.catalog import open_catalog
 
-    with open_catalog(path) as catalog:
+    with open_catalog(path, managed_idb_id) as catalog:
         return catalog.replay_pending(_mirror_journal_event)
 
 

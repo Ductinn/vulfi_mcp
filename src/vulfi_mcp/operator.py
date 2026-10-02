@@ -1898,9 +1898,10 @@ def _ida_row(
         matched = next((row for row in found if row.get("id") == finding_id), None)
         if matched is not None:
             return matched, rows
-        if offset + int(page["loaded"]) >= int(page["target_total"]) or not found:
+        window = int(page["page_total"])
+        if offset + window >= int(page["target_total"]) or not found:
             return None, rows
-        offset += int(page["loaded"])
+        offset += window
 
 
 def _parse_address(value: object) -> int | None:
