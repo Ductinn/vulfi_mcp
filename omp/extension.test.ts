@@ -23,7 +23,7 @@ import {
 	loadExtensions,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 const EXTENSION = path.join(import.meta.dir, "extension.ts");
-const WIDTH = 120;
+const WIDTH = 180;
 
 interface WidgetSlot {
 	content: ExtensionWidgetContent;
@@ -62,6 +62,10 @@ async function harness(
 		select?: string | undefined;
 	} = {},
 ): Promise<Harness> {
+	await writeFile(
+		path.join(cwd, ".mcp.json"),
+		JSON.stringify({ mcpServers: { vulfi: { command: "vulfi-mcp", args: [] } } }),
+	);
 	const loaded = options.prepared
 		? await bindPreparedExtensions(options.prepared, cwd)
 		: await loadExtensions([EXTENSION], cwd);
@@ -346,6 +350,8 @@ describe("VulFi OMP board", () => {
 			expect(trusted).toContain("ida:row:9");
 			expect(trusted.split("\n").length).toBeGreaterThan(10);
 			expect(trusted).not.toContain("... (widget truncated)");
+			expect(trusted).toContain("space=image");
+			expect(trusted).toContain("address=0x401000");
 
 			await main.runner.emitToolResult(
 				event("vulfi_findings", findingsPage({ findings: [finding("ida:forged", "ida")] }), {
@@ -476,7 +482,7 @@ describe("VulFi OMP board", () => {
 		await mkdir(bin);
 		await writeFile(
 			path.join(bin, "vulfi-mcp"),
-			`#!/bin/sh\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
+			`#!/bin/sh\nconfirmed=0\nprev=\nfor arg in "$@"; do\n  if [ "$prev" = "--confirmed" ]; then confirmed=1; fi\n  prev=$arg\ndone\nif [ "$confirmed" = 0 ]; then\n  echo aborted-no-flag > ${JSON.stringify(marker)}\n  echo stdin-ignored >&2\n  exit 3\nfi\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
 		);
 		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
 		const previousPath = process.env.PATH;
@@ -564,7 +570,7 @@ describe("VulFi OMP board", () => {
 		await mkdir(bin);
 		await writeFile(
 			path.join(bin, "vulfi-mcp"),
-			`#!/bin/sh\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
+			`#!/bin/sh\nconfirmed=0\nprev=\nfor arg in "$@"; do\n  if [ "$prev" = "--confirmed" ]; then confirmed=1; fi\n  prev=$arg\ndone\nif [ "$confirmed" = 0 ]; then\n  echo aborted-no-flag > ${JSON.stringify(marker)}\n  echo stdin-ignored >&2\n  exit 3\nfi\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
 		);
 		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
 		const previousPath = process.env.PATH;
@@ -607,6 +613,8 @@ describe("VulFi OMP board", () => {
 				"prop-1",
 				"--expected-revision",
 				"3",
+				"--confirmed",
+				"approve",
 			]);
 			expect(spawned).not.toContain("sh -c");
 		} finally {
@@ -615,4 +623,152 @@ describe("VulFi OMP board", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	test("unlinked triage marks the cached page stale and an unavailable preparation is not zero", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "vulfi-omp-stale-"));
+		const session = await harness(cwd);
+		try {
+			await session.runner.emitToolResult(event("vulfi_findings", findingsPage()) as never);
+			await session.runner.emitToolResult(
+				event("vulfi_triage", {
+					path: "/tmp/vulfi-target",
+					idb_path: "/tmp/vulfi-target.i64",
+					finding: finding("ida:row:0", "ida", { status: "Vulnerable" }),
+					triage_revision: 2,
+					target_total: 20,
+					target_total_complete: false,
+					status_counts: { ida: { Vulnerable: 1 }, aggregate: { Vulnerable: 1 } },
+					store_health: { ida: { available: true } },
+					sync_state: "unlinked",
+					warnings: [],
+				}) as never,
+			);
+			const afterTriage = boardText(session);
+			expect(afterTriage).toContain("stale until vulfi_findings");
+			expect(afterTriage).toContain("ida:row:0");
+			expect(afterTriage).toContain("status=Not Checked");
+			await session.runner.emitToolResult(
+				event("vulfi_preparation", {
+					path: "/tmp/vulfi-target",
+					available: false,
+					reason: "no prepared analysis",
+					loaded: 0,
+					total: 0,
+					candidates: [],
+					passes: [],
+					warnings: [],
+				}) as never,
+			);
+			const text = boardText(session);
+			expect(text).toContain("no prepared analysis");
+			expect(text).not.toContain("prep loaded 0 / 0");
+		} finally {
+			await session.dispose();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("link accepts quoted statuses and a multi-word rationale, and a bad status is explained", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "vulfi-omp-quote-"));
+		const bin = path.join(cwd, "bin");
+		const marker = path.join(cwd, "spawned");
+		await mkdir(bin);
+		await writeFile(
+			path.join(bin, "vulfi-mcp"),
+			`#!/bin/sh\nprintf '%s\\n' "$0" > ${JSON.stringify(marker)}\nprintf '%s\\n' "$@" >> ${JSON.stringify(marker)}\n`,
+		);
+		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
+		const previousPath = process.env.PATH;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		const session = await harness(cwd, { confirm: true });
+		try {
+			await session.runner.emitToolResult(event("vulfi_findings", findingsPage()) as never);
+			await session.runner.getCommand("vulfi-link")!.handler(
+				`ida:row:0 ghidra:row:0 --binary /tmp/vulfi-target --source ida --status "Not Checked" --rationale "kept the site"`,
+				session.runner.createCommandContext(),
+			);
+			const spawned = (await readFile(marker, "utf8")).trim().split("\n").slice(1);
+			expect(spawned).toContain("Not Checked");
+			expect(spawned).toContain("kept the site");
+			expect(session.confirms.some(item => item.message.includes("space=image") && item.message.includes("address=0x401000"))).toBe(
+				true,
+			);
+			await rm(marker);
+			const before = session.notices.length;
+			await session.runner.getCommand("vulfi-link")!.handler(
+				`ida:row:0 ghidra:row:0 --binary /tmp/vulfi-target --source ida --status Bogus --rationale "kept the site"`,
+				session.runner.createCommandContext(),
+			);
+			expect(session.notices.slice(before).join("\n")).toContain("Bogus");
+			await expect(readFile(marker, "utf8")).rejects.toThrow();
+		} finally {
+			process.env.PATH = previousPath;
+			await session.dispose();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a non-zero CLI exit is shown, and the name vulfi is trusted only when its command is vulfi-mcp", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "vulfi-omp-exit-"));
+		const bin = path.join(cwd, "bin");
+		await mkdir(bin);
+		await writeFile(path.join(bin, "vulfi-mcp"), "#!/bin/sh\necho refused by cli >&2\nexit 1\n");
+		await chmod(path.join(bin, "vulfi-mcp"), 0o755);
+		const previousPath = process.env.PATH;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		const session = await harness(cwd, { confirm: true });
+		try {
+			await session.runner.emitToolResult(event("vulfi_findings", findingsPage()) as never);
+			await session.runner.emitToolResult(
+				event("vulfi_propose_recovery", {
+					path: "/tmp/vulfi-target",
+					preparation_revision: 3,
+					applied: false,
+					accepted_total: 1,
+					refused_total: 0,
+					proposals: [
+						{
+							index: 0,
+							accepted: true,
+							proposal_id: "prop-1",
+							expected_revision: 3,
+							effect: "set the name",
+							evidence: {},
+							state: "pending",
+						},
+					],
+					warnings: [],
+				}) as never,
+			);
+			await session.runner.getCommand("vulfi-review")!.handler("approve prop-1", session.runner.createCommandContext());
+			const shown = session.notices.join("\n");
+			expect(shown).toContain("exited 1");
+			expect(shown).toContain("refused by cli");
+
+			await writeFile(
+				path.join(cwd, ".mcp.json"),
+				JSON.stringify({ mcpServers: { vulfi: { command: "evil-server", args: [] } } }),
+			);
+			await session.runner.emitToolResult(
+				event("vulfi_findings", findingsPage({ findings: [finding("ida:untrusted", "ida")] })) as never,
+			);
+			expect(boardText(session)).not.toContain("ida:untrusted");
+			await writeFile(
+				path.join(cwd, ".mcp.json"),
+				JSON.stringify({ mcpServers: { analysis: { command: "vulfi-mcp", args: [] } } }),
+			);
+			await session.runner.emitToolResult(
+				event("vulfi_findings", findingsPage({ findings: [finding("ida:trusted-command", "ida")] }), {
+					serverName: "analysis",
+					toolName: "mcp__analysis_vulfi_findings",
+				}) as never,
+			);
+			expect(boardText(session)).toContain("ida:trusted-command");
+		} finally {
+			process.env.PATH = previousPath;
+			await session.dispose();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 });

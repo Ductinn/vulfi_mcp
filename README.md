@@ -106,7 +106,7 @@ Install is opt-in. From a checkout:
 omp --no-extensions -e ./omp/extension.ts
 ```
 
-The MCP server entry the board trusts is named `vulfi`, or any configured server whose command is `vulfi-mcp`. An unrelated server that returns VulFi-shaped JSON does not update the board. Point that entry at this package the same way as the example above. The extension reads `tool_result` events from OMP's existing bridge. It does not open its own MCP session and it does not page tools on its own.
+The MCP server entry is trusted only when its configured command is `vulfi-mcp`. The name `vulfi` alone is not enough. An unrelated server that returns VulFi-shaped JSON does not update the board. The extension reads `tool_result` events from OMP's existing bridge. It does not open its own MCP session and it does not page tools on its own.
 
 `/vulfi-board` shows the cache. `/vulfi-review` and `/vulfi-link` show the evidence and, only after a confirmation in the TUI, run a fixed argv:
 
@@ -116,7 +116,7 @@ vulfi-mcp link ...
 vulfi-mcp resolve ...
 ```
 
-Declining the confirmation does not spawn the command. Headless and print modes do not treat a missing dialog as approval and do not spawn it either. The arguments are a list, not a shell string.
+Declining the confirmation does not spawn the command. Headless and print modes do not treat a missing dialog as approval and do not spawn it either. The arguments are a list, not a shell string. After the TUI confirmation, the extension passes `--confirmed` with the token the operator already gave, so the CLI does not read stdin for that same decision. That flag is not an MCP tool. A shell that can already run `vulfi-mcp` can pass it; that is the credential risk below, not a second protocol.
 
 **The confirmation is not a credential boundary.** `vulfi-mcp` is an ordinary program. Anything that already has the operator's OS permissions, including a shell-capable agent, can run `vulfi-mcp review`, `vulfi-mcp link`, and `vulfi-mcp resolve` without the board. An installation that needs enforced human separation has to enforce it with credentials: the MCP server principal must not be able to execute those commands or write the managed data directory.
 

@@ -109,6 +109,24 @@ function emptyBoard(): BoardState {
 	};
 }
 
+function trustedServers(cwd: string): Record<string, true> {
+	const trusted: Record<string, true> = {};
+	for (const relative of [".mcp.json", "mcp.json", path.join(".omp", "mcp.json")]) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(readFileSync(path.join(cwd, relative), "utf8"));
+		} catch {
+			continue;
+		}
+		if (!isRecord(parsed) || !isRecord(parsed.mcpServers)) continue;
+		for (const [name, config] of Object.entries(parsed.mcpServers)) {
+			if (!isRecord(config) || typeof config.command !== "string") continue;
+			if (path.basename(config.command) === "vulfi-mcp") trusted[name] = true;
+		}
+	}
+	return trusted;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -128,29 +146,6 @@ function mintedToolName(serverName: string, toolName: string): string {
 	if (tool.startsWith(prefix)) tool = tool.slice(prefix.length);
 	return `mcp__${server}_${tool}`;
 }
-
-function trustedServers(cwd: string): Record<string, true> {
-	const trusted: Record<string, true> = { vulfi: true };
-	for (const relative of [".mcp.json", "mcp.json", path.join(".omp", "mcp.json")]) {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(readFileSync(path.join(cwd, relative), "utf8"));
-		} catch {
-			continue;
-		}
-		if (!isRecord(parsed) || !isRecord(parsed.mcpServers)) continue;
-		for (const [name, config] of Object.entries(parsed.mcpServers)) {
-			if (!isRecord(config) || typeof config.command !== "string") continue;
-			const command = path.basename(config.command);
-			const args = Array.isArray(config.args) ? config.args.map(item => String(item)) : [];
-			if (command === "vulfi-mcp" || args.some(item => path.basename(item) === "vulfi-mcp")) {
-				trusted[name] = true;
-			}
-		}
-	}
-	return trusted;
-}
-
 function stripUntrusted(value: string): string {
 	const withoutControls = value
 		.replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
@@ -281,7 +276,7 @@ function boardLines(state: BoardState): string[] {
 		const label = row.functionName.length > 0 ? ` function=${row.functionName}` : " function=";
 		const rationale = row.rationale.length > 0 ? ` ${row.rationale.replace(/\n/g, " ")}` : "";
 		lines.push(
-			`${row.backend} id=${row.id} status=${row.status} ${row.stale ? "stale" : "fresh"}${row.linkId ? ` link=${row.linkId}` : ""}${label}${rationale}`,
+			`${row.backend} id=${row.id} space=${row.addressSpace} address=${row.address} status=${row.status} ${row.stale ? "stale" : "fresh"}${row.linkId ? ` link=${row.linkId}` : ""}${label}${rationale}`,
 		);
 	}
 	for (const link of state.links) {
@@ -345,9 +340,9 @@ function applyFindings(state: BoardState, page: Record<string, unknown>, append:
 }
 
 function markFindingsStale(state: BoardState, page: Record<string, unknown>): boolean {
-	if (typeof page.path !== "string" || !Array.isArray(page.findings)) return false;
-	if (typeof page.target_total !== "number" || !isRecord(page.status_counts) || !isRecord(page.store_health)) return false;
-	if (state.findings.length > 0) state.findingsStale = true;
+	if (typeof page.path !== "string") return false;
+	if (!Array.isArray(page.findings) && !isRecord(page.finding)) return false;
+	if (state.path.length > 0 || state.findings.length > 0) state.findingsStale = true;
 	return true;
 }
 
@@ -398,6 +393,22 @@ function prepLines(page: Record<string, unknown>): string[] {
 
 function applyPreparation(state: BoardState, page: Record<string, unknown>, refresh: boolean): boolean {
 	if (typeof page.path !== "string") return false;
+	if (page.available === false) {
+		const reason =
+			typeof page.reason === "string" && page.reason.length > 0
+				? stripUntrusted(page.reason)
+				: "preparation is unavailable";
+		const line = `prep unavailable: ${reason}`;
+		if (refresh) {
+			state.prepLines = [line];
+			state.prepRefreshedAt = new Date().toISOString();
+			state.prepStale = false;
+		} else {
+			state.prepStale = true;
+			if (state.prepLines.length === 0) state.prepLines = [line];
+		}
+		return true;
+	}
 	const lines = prepLines(page);
 	if (lines.length === 0 && !Array.isArray(page.passes) && typeof page.candidate_total !== "number") return false;
 	if (refresh) {
@@ -449,15 +460,61 @@ function resolveCli(): string | undefined {
 	return undefined;
 }
 
-async function runCli(pi: ExtensionAPI, args: string[]): Promise<void> {
+async function runCli(pi: ExtensionAPI, ctx: ExtensionCommandContext, args: string[]): Promise<void> {
 	const command = resolveCli();
-	if (!command) return;
-	await pi.exec(command, args);
+	if (!command) {
+		ctx.ui.notify("vulfi-mcp is not on PATH", "error");
+		return;
+	}
+	const result = await pi.exec(command, args);
+	const output = [result.stdout, result.stderr].filter(part => part.trim().length > 0).join("\n");
+	if (result.code !== 0) {
+		ctx.ui.notify(`vulfi-mcp exited ${result.code}${output.length > 0 ? `\n${output}` : ""}`, "error");
+		return;
+	}
+	if (output.length > 0) ctx.ui.notify(output, "info");
+}
+
+function tokenize(raw: string): string[] {
+	const tokens: string[] = [];
+	let current = "";
+	let quote = "";
+	for (const char of raw) {
+		if (quote.length > 0) {
+			if (char === quote) quote = "";
+			else current += char;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			continue;
+		}
+		if (/\s/.test(char)) {
+			if (current.length > 0) {
+				tokens.push(current);
+				current = "";
+			}
+			continue;
+		}
+		current += char;
+	}
+	if (current.length > 0) tokens.push(current);
+	return tokens;
+}
+
+function cachedMapping(state: BoardState, id: string): string {
+	const row = state.findings.find(item => item.id === id);
+	if (!row) return `${id} is not on the cached page`;
+	return `${row.backend} id=${row.id} space=${row.addressSpace} address=${row.address} status=${row.status}${row.stale ? " stale" : ""}`;
+}
+
+function statusRefusal(status: string | undefined): string | undefined {
+	if (status && TRIAGE_STATUSES[status]) return undefined;
+	return `status ${status ?? "(missing)"} is not one of Not Checked, False Positive, Suspicious, Vulnerable`;
 }
 
 export default function vulfiBoard(pi: ExtensionAPI): void {
 	const state = emptyBoard();
-	const trusted = trustedServers(process.cwd());
 
 	pi.on("tool_result", (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
@@ -466,6 +523,7 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 		const serverName = event.details.serverName;
 		const mcpToolName = event.details.mcpToolName;
 		if (typeof serverName !== "string" || typeof mcpToolName !== "string") return;
+		const trusted = { ...trustedServers(ctx.cwd), ...trustedServers(process.cwd()) };
 		if (!trusted[serverName] || !VULFI_TOOLS[mcpToolName]) return;
 		if (event.toolName !== mintedToolName(serverName, mcpToolName)) return;
 		if (event.details.isError === true) return;
@@ -514,13 +572,15 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 					proposal.proposalId,
 					"--expected-revision",
 					String(proposal.expectedRevision),
+					"--confirmed",
+					decision,
 				];
 				if (decision === "reject") {
-					const reason = raw.trim().split(/\s+/).slice(2).join(" ");
+					const reason = tokenize(raw).slice(2).join(" ");
 					if (reason.length === 0) return;
 					args.push("--reason", reason);
 				}
-				await runCli(pi, args);
+				await runCli(pi, ctx, args);
 				return;
 			}
 			if (!state.proposalPath && !state.path) {
@@ -533,7 +593,7 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 				listed.length > 0 ? listed : `No cached proposals for ${state.path || state.proposalPath}`,
 			);
 			if (!accepted) return;
-			await runCli(pi, ["review", "list", "--path", state.proposalPath || state.path, "--json"]);
+			await runCli(pi, ctx, ["review", "list", "--path", state.proposalPath || state.path, "--json"]);
 		},
 	});
 
@@ -541,23 +601,29 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 		description: "Show link evidence and, only after confirmation, run vulfi-mcp link or resolve.",
 		handler: async (raw, ctx) => {
 			if (!interactive(ctx)) return;
-			const tokens = raw.trim().split(/\s+/).filter(token => token.length > 0);
+			const tokens = tokenize(raw);
 			if (tokens[0] === "resolve") {
 				const linkId = tokens[1];
 				const source = flagValue(tokens, "--source");
 				const status = flagValue(tokens, "--status");
 				const rationale = flagValue(tokens, "--rationale");
+				const refused = statusRefusal(status);
+				if (refused) {
+					ctx.ui.notify(refused, "error");
+					return;
+				}
+				if (!linkId || !source || !CHOSEN_SOURCES[source] || !rationale || !state.path) return;
 				const link = state.links.find(item => item.linkId === linkId);
-				if (!linkId || !source || !CHOSEN_SOURCES[source] || !status || !TRIAGE_STATUSES[status] || !rationale) return;
-				if (!state.path) return;
 				const accepted = await ctx.ui.confirm(
 					"Resolve conflict",
-					[`link ${linkId}`, link ? link.syncState : "not on the cached page", `source ${source}`, `status ${status}`, rationale].join(
-						"\n",
-					),
+					[
+						cachedMapping(state, link?.idaFindingId ?? ""),
+						cachedMapping(state, link?.externalFindingId ?? ""),
+						link ? `link ${link.linkId} ${link.syncState}` : `${linkId} is not on the cached page`,
+					].join("\n"),
 				);
 				if (!accepted) return;
-				await runCli(pi, [
+				await runCli(pi, ctx, [
 					"resolve",
 					"--path",
 					state.path,
@@ -566,9 +632,11 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 					"--source",
 					source,
 					"--status",
-					status,
+					status!,
 					"--rationale",
 					rationale,
+					"--confirmed",
+					source,
 				]);
 				return;
 			}
@@ -578,16 +646,18 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 			const source = flagValue(tokens, "--source");
 			const status = flagValue(tokens, "--status");
 			const rationale = flagValue(tokens, "--rationale");
-			if (!idaId || !externalId || !binary || !source || !CHOSEN_SOURCES[source] || !status || !TRIAGE_STATUSES[status] || !rationale) {
+			const refused = statusRefusal(status);
+			if (refused) {
+				ctx.ui.notify(refused, "error");
 				return;
 			}
-			if (!state.path) return;
+			if (!idaId || !externalId || !binary || !source || !CHOSEN_SOURCES[source] || !rationale || !state.path) return;
 			const accepted = await ctx.ui.confirm(
 				"Link findings",
-				[`ida ${idaId}`, `external ${externalId}`, `binary ${binary}`, `source ${source}`, `status ${status}`, rationale].join("\n"),
+				[cachedMapping(state, idaId), cachedMapping(state, externalId)].join("\n"),
 			);
 			if (!accepted) return;
-			await runCli(pi, [
+			await runCli(pi, ctx, [
 				"link",
 				"--path",
 				state.path,
@@ -600,9 +670,11 @@ export default function vulfiBoard(pi: ExtensionAPI): void {
 				"--source",
 				source,
 				"--status",
-				status,
+				status!,
 				"--rationale",
 				rationale,
+				"--confirmed",
+				source,
 			]);
 		},
 	});

@@ -1202,6 +1202,16 @@ def _parser() -> argparse.ArgumentParser:
             help="why, recorded with the decision",
         )
         decide.add_argument("--json", action="store_true")
+        decide.add_argument(
+            "--confirmed",
+            default=None,
+            help=(
+                "the decision an operator already confirmed in another UI,"
+                " which must be this command's own name. When set, stdin is"
+                " not read for that same decision. This is not an MCP tool;"
+                " anything that can already run this command can pass it."
+            ),
+        )
 
     reopening = commands.add_parser(
         _REOPEN,
@@ -1222,6 +1232,14 @@ def _parser() -> argparse.ArgumentParser:
         help="why it is being reopened, recorded with the proposal",
     )
     reopening.add_argument("--json", action="store_true")
+    reopening.add_argument(
+        "--confirmed",
+        default=None,
+        help=(
+            "the decision an operator already confirmed elsewhere. When set"
+            " to this command's name, stdin is not read again. Not an MCP tool."
+        ),
+    )
     return parser
 
 
@@ -1262,10 +1280,19 @@ def main(argv: list[str] | None = None) -> int:
         if blocked is not None:
             print(blocked, file=dialogue)
             return 1
-        if not _confirmed(arguments.command, dialogue):
+        already = _preconfirmed(getattr(arguments, "confirmed", None), arguments.command)
+        if already is None:
+            if not _confirmed(arguments.command, dialogue):
+                print(
+                    f"Nothing was {_HAPPENED[arguments.command]} and nothing was"
+                    " changed.",
+                    file=dialogue,
+                )
+                return 1
+        elif not already:
             print(
-                f"Nothing was {_HAPPENED[arguments.command]} and nothing was"
-                " changed.",
+                f"--confirmed {arguments.confirmed!r} is not {arguments.command!r}."
+                " Nothing was changed.",
                 file=dialogue,
             )
             return 1
@@ -1329,6 +1356,13 @@ def _unready(command: str, state: str, path: str, proposal_id: str) -> str | Non
             else ""
         )
     )
+
+
+def _preconfirmed(flag: str | None, token: str) -> bool | None:
+    """``None`` asks stdin. A flag is the decision already collected, not a second one."""
+    if flag is None:
+        return None
+    return flag == token
 
 
 def _confirmed(decision: str, dialogue: Any) -> bool:
@@ -2168,6 +2202,15 @@ def _link_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", required=True, choices=TRIAGE_STATUSES)
     parser.add_argument("--rationale", required=True)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--confirmed",
+        default=None,
+        help=(
+            "the source an operator already confirmed elsewhere. When it"
+            " matches --source, stdin is not read for that decision. Not an"
+            " MCP tool."
+        ),
+    )
     return parser
 
 
@@ -2203,19 +2246,24 @@ def link_main(argv: list[str] | None = None) -> int:
                 )
             )
         return 1
-    print(
-        f"\nType '{arguments.source}' to choose that assessment as canonical,"
-        " anything else to abort: ",
-        end="",
-        file=dialogue,
-        flush=True,
-    )
-    try:
-        answer = sys.stdin.readline()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-    print("", file=dialogue)
-    if answer.strip() != arguments.source:
+    already = _preconfirmed(getattr(arguments, "confirmed", None), arguments.source)
+    if already is None:
+        print(
+            f"\nType '{arguments.source}' to choose that assessment as canonical,"
+            " anything else to abort: ",
+            end="",
+            file=dialogue,
+            flush=True,
+        )
+        try:
+            answer = sys.stdin.readline()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        print("", file=dialogue)
+        if answer.strip() != arguments.source:
+            print("Nothing was linked.", file=dialogue)
+            return 1
+    elif not already:
         print("Nothing was linked.", file=dialogue)
         return 1
     result = review_link(
@@ -2397,6 +2445,14 @@ def _resolve_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", required=True, choices=TRIAGE_STATUSES)
     parser.add_argument("--rationale", required=True)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--confirmed",
+        default=None,
+        help=(
+            "the source an operator already confirmed elsewhere. When it"
+            " matches --source, stdin is not read again. Not an MCP tool."
+        ),
+    )
     return parser
 
 
@@ -2449,19 +2505,24 @@ def resolve_main(argv: list[str] | None = None) -> int:
                 )
             )
         return 1
-    print(
-        f"\nType '{arguments.source}' to choose that assessment as canonical,"
-        " anything else to abort: ",
-        end="",
-        file=dialogue,
-        flush=True,
-    )
-    try:
-        answer = sys.stdin.readline()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-    print("", file=dialogue)
-    if answer.strip() != arguments.source:
+    already = _preconfirmed(getattr(arguments, "confirmed", None), arguments.source)
+    if already is None:
+        print(
+            f"\nType '{arguments.source}' to choose that assessment as canonical,"
+            " anything else to abort: ",
+            end="",
+            file=dialogue,
+            flush=True,
+        )
+        try:
+            answer = sys.stdin.readline()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        print("", file=dialogue)
+        if answer.strip() != arguments.source:
+            print("Nothing was resolved.", file=dialogue)
+            return 1
+    elif not already:
         print("Nothing was resolved.", file=dialogue)
         return 1
     result = resolve_link(
