@@ -114,6 +114,7 @@ __all__ = [
     "apply_ghidra_review",
     "evidence_ghidra",
     "prepare_ghidra",
+    "prove_call_site",
 ]
 
 #: The backend these results are authored by.
@@ -538,6 +539,57 @@ async def apply_ghidra_review(
         _store_record(session.binary_sha256, record)
         report.update(applied=True, revision=revision + 1)
         return report
+
+
+async def prove_call_site(
+    target: str, address: int, names: tuple[str, ...]
+) -> dict[str, object]:
+    """Image base, bytes, and call xrefs at one address in the open program.
+
+    ``names`` only chooses which function to ask ``get_xrefs_to`` about. The
+    call site is the address whose relative position and bytes are returned;
+    a name is not an identity.
+    """
+    config = _config()
+    wanted = {_normalize(name) for name in names if name}
+    async with _open_session(config, target) as (session, program):
+        raw = await _read(session, address, 16)
+        xrefs: list[dict[str, object]] = []
+        if wanted:
+            for function in await _functions(session):
+                if _normalize(str(function.get("name") or "")) not in wanted:
+                    continue
+                rows, _capped = await _xrefs(session, int(function["entry"]))
+                for row in rows:
+                    origin = row.get("address")
+                    if not isinstance(origin, int) or row.get("kind") not in CALL_REFERENCES:
+                        continue
+                    callee = int(function["entry"])
+                    xrefs.append(
+                        {
+                            "from": hex(origin),
+                            "from_rva": (
+                                hex(origin - program.base)
+                                if origin >= program.base
+                                else None
+                            ),
+                            "to": hex(callee),
+                            "to_rva": hex(callee - program.base),
+                            "kind": row["kind"],
+                        }
+                    )
+        relative = (
+            hex(address - program.base) if address >= program.base else None
+        )
+        return {
+            "image_base": program.base,
+            "address": address,
+            "relative_address": relative,
+            "bytes": raw.hex(),
+            "xrefs": xrefs,
+            "address_space": "ghidra:image",
+        }
+
 
 
 # --------------------------------------------------------------------------

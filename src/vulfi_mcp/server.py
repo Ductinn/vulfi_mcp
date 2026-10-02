@@ -403,25 +403,27 @@ def vulfi_triage(
 
 
 def main() -> None:
-    """Serve the seven tools over stdio, or run the operator review command.
+    """Serve the seven tools over stdio, or run an operator command.
 
     With no arguments this is the MCP server and stdout is its transport.
-    With ``review`` it is the operator's own command, which is deliberately
-    *not* reachable through MCP: it is the only path that applies a proposal,
-    and it asks a person first.
+    ``review`` and ``link`` are the operator's own commands. Neither is an
+    MCP tool: each asks a person before it changes a managed analysis.
     """
     if not sys.argv[1:]:
         serve_stdio()
         return
-    if sys.argv[1] != "review":
-        raise SystemExit(
-            f"vulfi-mcp: {sys.argv[1]!r} is not a command. Run 'vulfi-mcp'"
-            " with no arguments to serve MCP over stdio, or 'vulfi-mcp review"
-            " --help' to review stored recovery proposals."
-        )
-    # Imported here, not at module scope: serving MCP must not need the
-    # review path, and the review path must not register MCP tools it will
-    # never serve.
-    from vulfi_mcp.operator import main as review
+    command = sys.argv[1]
+    if command == "review":
+        from vulfi_mcp.operator import main as review
 
-    raise SystemExit(review(sys.argv[2:]))
+        raise SystemExit(review(sys.argv[2:]))
+    if command == "link":
+        from vulfi_mcp.operator import link_main
+
+        raise SystemExit(link_main(sys.argv[2:]))
+    raise SystemExit(
+        f"vulfi-mcp: {command!r} is not a command. Run 'vulfi-mcp' with no"
+        " arguments to serve MCP over stdio, 'vulfi-mcp review --help' to"
+        " review stored recovery proposals, or 'vulfi-mcp link --help' to"
+        " review a finding link."
+    )

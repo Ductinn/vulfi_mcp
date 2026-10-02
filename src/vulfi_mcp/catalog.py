@@ -40,7 +40,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
@@ -1798,6 +1799,289 @@ class Catalog:
             )
         return stored
 
+    def create_link(
+        self,
+        ida_id: str,
+        external_id: str,
+        proof: dict[str, object],
+        decision: dict[str, object],
+    ) -> dict[str, object]:
+        """Store one reviewed link and the pending creation that mirrors it.
+
+        The external decision is written in the same transaction as the
+        pending event, before any IDB save. ``link_revision`` is born at 1.
+        Readers see ``pending`` until :meth:`confirm_link_event` runs.
+        """
+        self._require_writable()
+        ida = _validate_id(ida_id, "ida_id")
+        external = _validate_id(external_id, "external_id")
+        if not isinstance(proof, dict) or not isinstance(decision, dict):
+            raise CatalogError("proof and decision must be objects")
+        try:
+            status = validate_status(decision.get("status"))
+            rationale = validate_rationale(decision.get("rationale"))
+        except OperationError as refused:
+            raise CatalogError(str(refused)) from refused
+        chosen = decision.get("chosen_source")
+        if chosen not in ("ida", "external", "new"):
+            raise CatalogError(
+                "chosen_source must be 'ida', 'external', or 'new',"
+                f" got {chosen!r}"
+            )
+        held = self.external_finding(external)
+        if held is None:
+            raise UnknownExternalFindingError(
+                f"no external finding carries the id {external!r} for"
+                f" target {self._target.key}. Nothing was written"
+            )
+        link_id = f"link-{uuid.uuid4().hex}"
+        event_id = f"event-{uuid.uuid4().hex}"
+        now = utc_now()
+        expected_external = int(held["triage_revision"])
+        expected_ida = proof.get("expected_ida_triage_revision")
+        if isinstance(expected_ida, bool) or not isinstance(expected_ida, int):
+            expected_ida = 0
+        intended_ida = expected_ida + 1
+        stored_proof = dict(proof)
+        stored_proof["expected_external_triage_revision"] = expected_external
+        stored_proof["expected_ida_triage_revision"] = expected_ida
+        payload = {
+            "kind": "create",
+            "ida_finding_id": ida,
+            "external_finding_id": external,
+            "idb_path": proof.get("idb_path"),
+            "expected_ida_revision": expected_ida,
+            "intended_ida_revision": intended_ida,
+            "decision": {
+                "status": status,
+                "rationale": rationale,
+                "chosen_source": chosen,
+                "link_id": link_id,
+                "link_revision": 1,
+                "assessed_at": now,
+            },
+            "proof": stored_proof,
+        }
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO links (link_id, target_key, ida_finding_id,"
+                " external_finding_id, proof, chosen_source, status,"
+                " rationale, link_revision, sync_state, created_at,"
+                " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending',"
+                " ?, ?)",
+                (
+                    link_id,
+                    self._target.key,
+                    ida,
+                    external,
+                    _dump_json(stored_proof),
+                    chosen,
+                    status,
+                    rationale,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE external_findings SET status = ?, rationale = ?,"
+                " assessed_at = ?, triage_revision = triage_revision + 1,"
+                " updated_at = ? WHERE finding_id = ?",
+                (status, rationale, now, now, external),
+            )
+            connection.execute(
+                "INSERT INTO sync_events (event_id, link_id, kind, state,"
+                " expected_link_revision, intended_ida_revision,"
+                " observed_ida_revision, payload, created_at, confirmed_at)"
+                " VALUES (?, ?, 'create', 'pending', 1, ?, NULL, ?, ?, NULL)",
+                (event_id, link_id, intended_ida, _dump_json(payload), now),
+            )
+        created = self.link(link_id)
+        if created is None:  # pragma: no cover - the transaction just wrote it
+            raise CatalogError(f"link {link_id} was written and cannot be read")
+        created["event_id"] = event_id
+        created["confirmed"] = False
+        return created
+
+    def link(self, link_id: str) -> dict[str, object] | None:
+        """One stored link of this target, or ``None``."""
+        row = self._connection.execute(
+            "SELECT link_id, ida_finding_id, external_finding_id, proof,"
+            " chosen_source, status, rationale, link_revision, sync_state,"
+            " created_at, updated_at FROM links WHERE link_id = ?"
+            " AND target_key = ?",
+            (_validate_id(link_id, "link_id"), self._target.key),
+        ).fetchone()
+        return None if row is None else _link_row(row)
+
+    def external_identity(self, finding_id: str) -> dict[str, object] | None:
+        """One external finding by id, including a row another target owns."""
+        identifier = _validate_id(finding_id, "finding_id")
+        row = self._connection.execute(
+            "SELECT f.finding_id, t.source_sha256, f.rule_digest,"
+            " f.address_space, f.address, f.function_name, f.stale,"
+            " s.state, s.scan_id, s.coverage, s.scope_id, f.last_seen_scan_id,"
+            " s.target_key, s.backend, f.evidence, f.triage_revision,"
+            " f.status, f.rationale, s.scope FROM external_findings f"
+            " JOIN external_scopes s ON s.scope_id = f.scope_id"
+            " JOIN targets t ON t.target_key = s.target_key"
+            " WHERE f.finding_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            return None
+        observed = {
+            str(item[0])
+            for item in self._connection.execute(
+                "SELECT finding_id FROM external_findings WHERE scope_id = ?"
+                " AND last_seen_scan_id = ?",
+                (row[10], row[8]),
+            )
+        }
+        return {
+            "id": row[0],
+            "source_sha256": row[1],
+            "rule_digest": row[2],
+            "address_space": row[3],
+            "address": "" if row[4] is None else f"0x{int(row[4]):x}",
+            "function_name": row[5],
+            "stale": bool(row[6]),
+            "scope_state": row[7],
+            "scan_id": row[8],
+            "coverage": row[9],
+            "scope_id": row[10],
+            "last_seen_scan_id": row[11],
+            "owned": row[12] == self._target.key,
+            "backend": row[13],
+            "evidence": json.loads(row[14]),
+            "triage_revision": int(row[15]),
+            "status": row[16],
+            "rationale": row[17] or "",
+            "scope": row[18],
+            "observed_ids": observed,
+        }
+
+    def confirm_link_event(
+        self, event_id: str, observed_ida_revision: int
+    ) -> dict[str, object]:
+        """Mark a pending creation complete after the IDB save was observed."""
+        self._require_writable()
+        identifier = _validate_id(event_id, "event_id")
+        if isinstance(observed_ida_revision, bool) or not isinstance(
+            observed_ida_revision, int
+        ):
+            raise CatalogError(
+                "observed_ida_revision must be an integer,"
+                f" got {observed_ida_revision!r}"
+            )
+        now = utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT e.link_id, e.state FROM sync_events e"
+                " JOIN links l ON l.link_id = e.link_id"
+                " WHERE e.event_id = ? AND l.target_key = ?",
+                (identifier, self._target.key),
+            ).fetchone()
+            if row is None:
+                raise CatalogError(
+                    f"no pending event {identifier!r} is recorded for this target"
+                )
+            if row[1] != "confirmed":
+                connection.execute(
+                    "UPDATE sync_events SET state = 'confirmed',"
+                    " observed_ida_revision = ?, confirmed_at = ?"
+                    " WHERE event_id = ?",
+                    (observed_ida_revision, now, identifier),
+                )
+                connection.execute(
+                    "UPDATE links SET sync_state = 'synchronized', updated_at = ?"
+                    " WHERE link_id = ?",
+                    (now, row[0]),
+                )
+            link_id = str(row[0])
+        stored = self.link(link_id)
+        if stored is None:  # pragma: no cover
+            raise CatalogError(f"link {link_id} was confirmed and cannot be read")
+        stored["event_id"] = identifier
+        stored["confirmed"] = True
+        return stored
+
+    def mark_link_conflict(self, link_id: str, reason: str) -> dict[str, object]:
+        """Record that a replay saw a revision it did not intend."""
+        self._require_writable()
+        identifier = _validate_id(link_id, "link_id")
+        now = utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE links SET sync_state = 'conflict', updated_at = ?"
+                " WHERE link_id = ? AND target_key = ?",
+                (now, identifier, self._target.key),
+            )
+        stored = self.link(identifier)
+        if stored is None:
+            raise CatalogError(f"no link {identifier!r} is recorded for this target")
+        stored["reason"] = reason
+        stored["confirmed"] = False
+        return stored
+
+    def pending_events(self) -> list[dict[str, object]]:
+        """Pending creation events for this target, oldest first."""
+        rows = self._connection.execute(
+            "SELECT e.event_id, e.link_id, e.kind, e.state,"
+            " e.expected_link_revision, e.intended_ida_revision, e.payload"
+            " FROM sync_events e JOIN links l ON l.link_id = e.link_id"
+            " WHERE e.state = 'pending' AND l.target_key = ?"
+            " ORDER BY e.created_at ASC, e.event_id ASC",
+            (self._target.key,),
+        ).fetchall()
+        events = []
+        for row in rows:
+            events.append(
+                {
+                    "event_id": row[0],
+                    "link_id": row[1],
+                    "kind": row[2],
+                    "state": row[3],
+                    "expected_link_revision": row[4],
+                    "intended_ida_revision": row[5],
+                    "payload": json.loads(row[6]),
+                }
+            )
+        return events
+
+    def replay_pending(
+        self, mirror: Callable[[dict[str, object]], dict[str, object]]
+    ) -> list[dict[str, object]]:
+        """Finish pending creations by comparing expected and intended revisions."""
+        self._require_writable()
+        finished: list[dict[str, object]] = []
+        for event in self.pending_events():
+            if event["kind"] != "create":
+                continue
+            outcome = mirror(event)
+            if outcome.get("conflict"):
+                stored = self.mark_link_conflict(
+                    str(event["link_id"]),
+                    str(outcome.get("reason") or "unexpected IDB revision"),
+                )
+                stored["event_id"] = event["event_id"]
+                finished.append(stored)
+                continue
+            if outcome.get("applied") or outcome.get("already"):
+                observed = outcome.get("triage_revision")
+                if isinstance(observed, bool) or not isinstance(observed, int):
+                    observed = int(event["intended_ida_revision"] or 0)
+                stored = self.confirm_link_event(str(event["event_id"]), observed)
+                stored["sync_state"] = "synchronized"
+                finished.append(stored)
+                continue
+            held = self.link(str(event["link_id"])) or {}
+            held["confirmed"] = False
+            held["event_id"] = event["event_id"]
+            held["reason"] = str(outcome.get("reason") or "the IDB was not saved")
+            finished.append(held)
+        return finished
+
+
     def _scope_row(self, row: tuple[Any, ...]) -> dict[str, object]:
         counts = self._connection.execute(
             "SELECT count(*), sum(stale) FROM external_findings"
@@ -2694,6 +2978,24 @@ def _proposal_row(row: tuple[Any, ...]) -> dict[str, object]:
         "decision_reason": row[12],
         "created_at": row[13],
     }
+
+
+def _link_row(row: tuple[Any, ...]) -> dict[str, object]:
+    """One stored link, with its proof unpacked."""
+    return {
+        "link_id": row[0],
+        "ida_finding_id": row[1],
+        "external_finding_id": row[2],
+        "proof": json.loads(row[3]),
+        "chosen_source": row[4],
+        "status": row[5],
+        "rationale": row[6],
+        "link_revision": int(row[7]),
+        "sync_state": row[8],
+        "created_at": row[9],
+        "updated_at": row[10],
+    }
+
 
 
 def _validate_id(value: object, what: str) -> str:

@@ -91,6 +91,7 @@ __all__ = [
     "existing_managed_idb",
     "findings_ida",
     "invoke_ida",
+    "mirror_linked_ida",
     "scan_ida",
     "triage_ida",
     "unscanned_findings_page",
@@ -457,6 +458,47 @@ def triage_ida(
         "sync_state": SYNC_STATE,
         "warnings": [_CATALOG_WARNING],
     }
+
+
+def call_site_proof_ida(idb_path: str, address: int | str) -> dict[str, object]:
+    """The open database's image base, bytes, and xrefs at one address."""
+    return invoke_ida(idb_path, "call_site_proof", {"address": address})
+
+
+def mirror_linked_ida(
+    idb_path: str,
+    finding_id: str,
+    event_id: str,
+    expected_revision: int,
+    decision: dict[str, object],
+) -> dict[str, object]:
+    """Compare one finding's revision, mirror the linked decision, and save.
+
+    One worker operation does the compare and the write. The lease saves only
+    when that operation mutated the record, so a replay that finds the
+    intended revision already present does not save again.
+    """
+    if not isinstance(finding_id, str) or not finding_id:
+        raise ValueError("finding_id must be a non-empty string")
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("event_id must be a non-empty string")
+    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+        raise ValueError(
+            f"expected_revision must be an integer, got {expected_revision!r}"
+        )
+    if not isinstance(decision, dict):
+        raise ValueError("decision must be an object")
+    return invoke_ida(
+        idb_path,
+        "mirror_linked",
+        {
+            "finding_id": finding_id,
+            "event_id": event_id,
+            "expected_revision": expected_revision,
+            "decision": decision,
+        },
+    )
+
 
 
 # --------------------------------------------------------------------------

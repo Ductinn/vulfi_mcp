@@ -7163,12 +7163,178 @@ def _recover_reviewed_proposal(payload: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _proof_address(value: object) -> int:
+    if isinstance(value, bool) or not (
+        isinstance(value, int) or isinstance(value, str)
+    ):
+        raise OperationError(
+            f"call_site_proof: address must be an integer or hex string, got {value!r}"
+        )
+    if isinstance(value, int):
+        if value < 0:
+            raise OperationError(f"call_site_proof: address must be >= 0, got {value}")
+        return value
+    try:
+        parsed = int(value, 16)
+    except ValueError as refused:
+        raise OperationError(
+            f"call_site_proof: address is not hexadecimal, got {value!r}"
+        ) from refused
+    if parsed < 0:
+        raise OperationError(f"call_site_proof: address must be >= 0, got {value!r}")
+    return parsed
+
+
+def _call_site_proof(payload: dict[str, object]) -> dict[str, object]:
+    """Bytes, image base, and outgoing xrefs at one call site.
+
+    Read from the open database, not from a stored finding: a link has to
+    prove the call site that is there now, not the one a scan remembered.
+    """
+    import ida_bytes
+    import ida_nalt
+    import ida_segment
+    import idaapi
+    import idautils
+
+    address = _proof_address(payload.get("address"))
+    image_base = int(idaapi.get_imagebase())
+    raw = ida_bytes.get_bytes(address, 16) or b""
+    xrefs = []
+    for xref in idautils.XrefsFrom(address, 0):
+        target = int(xref.to)
+        xrefs.append(
+            {
+                "to": hex(target),
+                "to_rva": hex(target - image_base) if target >= image_base else None,
+                "iscode": bool(xref.iscode),
+                "type": int(xref.type),
+            }
+        )
+    segment = ida_segment.getseg(address)
+    digest = ida_nalt.retrieve_input_file_sha256()
+    record, _blob = _read_record()
+    return {
+        "mutated": False,
+        "image_base": hex(image_base),
+        "address": hex(address),
+        "relative_address": (
+            hex(address - image_base) if address >= image_base else None
+        ),
+        "bytes": bytes(raw).hex(),
+        "xrefs_from": xrefs,
+        "segment": None if segment is None else ida_segment.get_segm_name(segment),
+        "input_sha256": digest.hex() if digest else None,
+        "managed_idb_id": record.get("managed_idb_id"),
+    }
+
+
+def _mirror_linked(payload: dict[str, object]) -> dict[str, object]:
+    """Write one linked assessment if the finding is still at the expected revision.
+
+    The intended revision is ``expected_revision + 1``. A finding already at
+    that revision with this link applied is left alone, so a replay after a
+    save does not increment again. Any other revision is a conflict.
+    """
+    finding_id = payload.get("finding_id")
+    if not isinstance(finding_id, str) or not finding_id:
+        raise OperationError("mirror_linked: 'finding_id' must be a non-empty string")
+    expected = payload.get("expected_revision")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise OperationError(
+            "mirror_linked: 'expected_revision' must be an integer >= 0,"
+            f" got {expected!r}"
+        )
+    decision = payload.get("decision")
+    if not isinstance(decision, dict):
+        raise OperationError("mirror_linked: 'decision' must be an object")
+    status = validate_status(decision.get("status"))
+    rationale = validate_rationale(decision.get("rationale"))
+    link_id = decision.get("link_id")
+    if not isinstance(link_id, str) or not link_id:
+        raise OperationError("mirror_linked: decision.link_id must be a non-empty string")
+    link_revision = decision.get("link_revision")
+    if isinstance(link_revision, bool) or not isinstance(link_revision, int):
+        link_revision = 1
+    event_id = payload.get("event_id")
+
+    record, _blob = _read_record()
+    located: tuple[str, dict[str, Any], dict[str, Any]] | None = None
+    for name, entry in sorted(record["scopes"].items()):
+        stored = entry["findings"].get(finding_id)
+        if isinstance(stored, dict):
+            located = (name, entry, stored)
+            break
+    if located is None:
+        raise UnknownFindingError(
+            f"no stored finding carries the id {finding_id!r}"
+        )
+    name, _entry, stored = located
+    current = stored.get("triage_revision")
+    current = current if isinstance(current, int) and not isinstance(current, bool) else 0
+    intended = expected + 1
+    if (
+        current == intended
+        and stored.get("link_id") == link_id
+        and stored.get("status") == status
+        and stored.get("rationale") == rationale
+    ):
+        return {
+            "mutated": False,
+            "applied": False,
+            "already": True,
+            "conflict": False,
+            "triage_revision": current,
+            "link_id": link_id,
+            "link_revision": stored.get("link_revision"),
+            "event_id": event_id,
+            "scope": name,
+        }
+    if current != expected:
+        return {
+            "mutated": False,
+            "applied": False,
+            "already": False,
+            "conflict": True,
+            "triage_revision": current,
+            "reason": (
+                f"IDA finding {finding_id} is at triage revision {current},"
+                f" not the expected {expected} or the intended {intended}"
+            ),
+            "event_id": event_id,
+            "scope": name,
+        }
+    assessed_at = decision.get("assessed_at")
+    stored["status"] = status
+    stored["rationale"] = rationale
+    stored["assessed_at"] = assessed_at if isinstance(assessed_at, str) else utc_now()
+    stored["link_id"] = link_id
+    stored["link_revision"] = link_revision
+    stored["triage_revision"] = intended
+    _write_record(record)
+    return {
+        "mutated": True,
+        "applied": True,
+        "already": False,
+        "conflict": False,
+        "triage_revision": intended,
+        "link_id": link_id,
+        "link_revision": link_revision,
+        "event_id": event_id,
+        "scope": name,
+    }
+
+
+
+
 #: Every operation ``run`` accepts, by name. Each takes the JSON payload and
 #: returns a JSON-native dictionary.
 _OPERATIONS: Final[dict[str, Callable[[dict[str, object]], dict[str, object]]]] = {
     "apply_reviewed_proposal": _apply_reviewed_proposal,
+    "call_site_proof": _call_site_proof,
     "database_summary": _database_summary,
     "findings_page": _findings_page,
+    "mirror_linked": _mirror_linked,
     "prepare": _run_preparation,
     "preparation_summary": _preparation_summary,
     "proposal_evidence": _proposal_evidence,

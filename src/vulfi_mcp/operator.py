@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import shlex
@@ -64,6 +65,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
 
 from vulfi_mcp.catalog import (
+    ASSOCIATION_VERIFIED,
     CATALOG_UNAVAILABLE_REASON,
     Catalog,
     CatalogError,
@@ -75,15 +77,21 @@ from vulfi_mcp.ida_adapter import (
     BACKEND,
     IDB_SUFFIXES,
     ManagedDatabaseError,
+    call_site_proof_ida,
     existing_managed_idb,
+    findings_ida,
     invoke_ida,
+    mirror_linked_ida,
 )
 from vulfi_mcp.ida_runtime import (
     PROPOSAL_STATES,
+    TRIAGE_STATUSES,
     OperationError,
     proposal_payload,
     validate_page,
     validate_proposal,
+    validate_rationale,
+    validate_status,
 )
 from vulfi_mcp.prepare import (
     NO_MANAGED_DATABASE_REASON,
@@ -103,10 +111,14 @@ __all__ = [
     "DECISIONS",
     "ReviewError",
     "ReviewResult",
+    "link_main",
     "list_proposals",
     "main",
     "proposal_briefing",
+    "prove_provider_call_site",
     "reopen_proposal",
+    "replay_pending_links",
+    "review_link",
     "review_proposal",
 ]
 
@@ -1479,3 +1491,648 @@ def _render_result(result: ReviewResult) -> str:
     if result["reconciliation"] is not None:
         lines.append(f"  reconciliation    {json.dumps(result['reconciliation'])}")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Reviewed links. Local command only: nothing here is an MCP tool.
+# --------------------------------------------------------------------------
+
+CHOSEN_SOURCES: Final[tuple[str, ...]] = ("ida", "external", "new")
+_PROOF_BYTES: Final = 16
+
+
+class LinkError(ValueError):
+    """A link was refused before both stores claimed it was synchronized."""
+
+
+def prove_provider_call_site(
+    target: str, address: int, names: tuple[str, ...]
+) -> dict[str, object]:
+    """The configured Ghidra provider's call-site proof."""
+    return _prove_backend("ghidra", target, address, names)
+
+
+def _prove_backend(
+    backend: str, target: str, address: int, names: tuple[str, ...]
+) -> dict[str, object]:
+    if backend == "ghidra":
+        from vulfi_mcp.providers.ghidra import prove_call_site
+    elif backend == "r2":
+        from vulfi_mcp.providers.r2 import prove_call_site
+    else:
+        raise LinkError(f"no provider proof is defined for backend {backend!r}")
+    return run_provider(prove_call_site(target, address, names))
+
+
+def review_link(
+    path: str,
+    ida_finding_id: str,
+    external_finding_id: str,
+    binary_path: str,
+    chosen_source: Literal["ida", "external", "new"],
+    status: str,
+    rationale: str,
+) -> dict[str, object]:
+    """Create one reviewer-verified link, or say why nothing was synchronized."""
+    blank = _link_result(ida_finding_id, external_finding_id)
+    if chosen_source not in CHOSEN_SOURCES:
+        blank["reason"] = (
+            "chosen_source must be 'ida', 'external', or 'new',"
+            f" got {chosen_source!r}"
+        )
+        return blank
+    if status not in TRIAGE_STATUSES:
+        blank["reason"] = (
+            f"status must be one of {' | '.join(TRIAGE_STATUSES)}, got {status!r}"
+        )
+        return blank
+    try:
+        why = validate_rationale(rationale)
+    except OperationError as refused:
+        blank["reason"] = str(refused)
+        return blank
+    try:
+        binary = Path(binary_path).expanduser().resolve()
+        named = Path(path).expanduser().resolve()
+    except OSError as refused:
+        blank["reason"] = str(refused)
+        return blank
+    if not binary.is_file() or binary.suffix.lower() in IDB_SUFFIXES:
+        blank["reason"] = (
+            f"{binary} is not the original binary a link can be proved against"
+        )
+        return blank
+    file_sha = _file_sha(binary)
+    idb_path = (
+        str(named)
+        if named.suffix.lower() in IDB_SUFFIXES
+        else existing_managed_idb(str(named))
+    )
+    if idb_path is None:
+        blank["reason"] = f"no managed IDB exists for {named}; nothing was linked"
+        return blank
+    try:
+        catalog, refusal = _catalog_for_link(named, binary, file_sha, idb_path)
+    except (CatalogError, ManagedDatabaseError, OSError) as refused:
+        blank["reason"] = str(refused)
+        return blank
+    if catalog is None:
+        blank["reason"] = refusal or "provisional IDB without verified source proof"
+        return blank
+    try:
+        return _review_open(
+            catalog,
+            idb_path,
+            str(binary),
+            file_sha,
+            ida_finding_id,
+            external_finding_id,
+            chosen_source,
+            status,
+            why,
+        )
+    finally:
+        catalog.close()
+
+
+def replay_pending_links(path: str) -> list[dict[str, object]]:
+    """Finish interrupted link creations for ``path``."""
+    with open_catalog(path) as catalog:
+        return catalog.replay_pending(_mirror_event)
+
+
+def _mirror_event(event: dict[str, object]) -> dict[str, object]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return {
+            "applied": False,
+            "already": False,
+            "conflict": False,
+            "reason": "event has no payload",
+        }
+    try:
+        return mirror_linked_ida(
+            str(payload["idb_path"]),
+            str(payload["ida_finding_id"]),
+            str(event["event_id"]),
+            int(payload["expected_ida_revision"]),
+            dict(payload["decision"]),
+        )
+    except (ManagedDatabaseError, OSError, ValueError) as failed:
+        return {
+            "applied": False,
+            "already": False,
+            "conflict": False,
+            "reason": str(failed),
+        }
+
+
+def _review_open(
+    catalog: Catalog,
+    idb_path: str,
+    binary: str,
+    file_sha: str,
+    ida_finding_id: str,
+    external_finding_id: str,
+    chosen_source: str,
+    status: str,
+    rationale: str,
+) -> dict[str, object]:
+    blank = _link_result(ida_finding_id, external_finding_id)
+    identity = catalog.external_identity(external_finding_id)
+    if identity is None:
+        blank["reason"] = (
+            f"no external finding {external_finding_id!r} is stored; nothing was linked"
+        )
+        return blank
+    if not identity["owned"] or identity["source_sha256"] != file_sha:
+        blank["reason"] = (
+            f"external finding {external_finding_id} belongs to original-binary"
+            f" SHA-256 {identity['source_sha256']}, not {file_sha}; equal"
+            " addresses do not make them the same image"
+        )
+        return blank
+    ida_row, ida_rows = _ida_row(idb_path, ida_finding_id, binary)
+    if ida_row is None:
+        blank["reason"] = (
+            f"no IDA finding {ida_finding_id!r} is stored; nothing was linked"
+        )
+        return blank
+    if ida_row["rule_digest"] != identity["rule_digest"]:
+        blank["reason"] = (
+            f"rule digests differ ({ida_row['rule_digest']} and"
+            f" {identity['rule_digest']}); a shared function name is not a"
+            " link. Nothing was linked"
+        )
+        return blank
+    if (
+        identity["address_space"] != f"{identity['backend']}:image"
+        or ida_row["address_space"] != "image"
+    ):
+        blank["reason"] = (
+            f"address spaces {ida_row['address_space']!r} and"
+            f" {identity['address_space']!r} are not the same image space;"
+            " a shared numeric address is not a mapping. Nothing was linked"
+        )
+        return blank
+    if _partial_stale(identity) or _ida_partial_stale(ida_row, ida_rows):
+        blank["reason"] = (
+            "a partial scan saw other rows and did not reconfirm this"
+            " finding; the link is refused rather than attached to a stale"
+            " member. Nothing was linked"
+        )
+        return blank
+    ida_address = _parse_address(ida_row["address"])
+    external_address = _parse_address(identity["address"])
+    if ida_address is None or external_address is None:
+        blank["reason"] = "a finding address could not be read; nothing was linked"
+        return blank
+    try:
+        ida_proof = call_site_proof_ida(idb_path, ida_address)
+        names = _rule_names(identity, ida_row)
+        if identity["backend"] == "ghidra":
+            provider_proof = prove_provider_call_site(binary, external_address, names)
+        else:
+            provider_proof = _prove_backend(
+                str(identity["backend"]), binary, external_address, names
+            )
+    except (ManagedDatabaseError, LinkError, ProviderError, OSError) as refused:
+        blank["reason"] = str(refused)
+        return blank
+    mapped = _mapping_refusal(
+        ida_proof, provider_proof, ida_address, external_address, binary
+    )
+    if mapped is not None:
+        blank["reason"] = mapped
+        return blank
+    ida_base = int(str(ida_proof["image_base"]), 16)
+    provider_base = int(provider_proof["image_base"])
+    rva = ida_address - ida_base
+    proof = {
+        "rule_digest": ida_row["rule_digest"],
+        "source_sha256": file_sha,
+        "managed_idb_id": ida_proof.get("managed_idb_id"),
+        "idb_path": idb_path,
+        "ida_address_space": "image",
+        "external_address_space": identity["address_space"],
+        "ida_address": hex(ida_address),
+        "external_address": hex(external_address),
+        "ida_image_base": hex(ida_base),
+        "external_image_base": hex(provider_base),
+        "rva": hex(rva),
+        "bytes": str(ida_proof.get("bytes") or ""),
+        "xrefs": {
+            "ida": ida_proof.get("xrefs_from") or [],
+            "external": provider_proof.get("xrefs") or [],
+        },
+        "segment": ida_proof.get("segment"),
+        "expected_ida_triage_revision": int(ida_row["triage_revision"]),
+        "expected_external_triage_revision": int(identity["triage_revision"]),
+    }
+    try:
+        created = catalog.create_link(
+            ida_finding_id,
+            external_finding_id,
+            proof,
+            {
+                "chosen_source": chosen_source,
+                "status": status,
+                "rationale": rationale,
+            },
+        )
+    except CatalogError as refused:
+        blank["reason"] = str(refused)
+        return blank
+    decision = {
+        "status": status,
+        "rationale": rationale,
+        "chosen_source": chosen_source,
+        "link_id": created["link_id"],
+        "link_revision": 1,
+        "assessed_at": created["updated_at"],
+    }
+    try:
+        mirrored = mirror_linked_ida(
+            idb_path,
+            ida_finding_id,
+            str(created["event_id"]),
+            int(ida_row["triage_revision"]),
+            decision,
+        )
+    except (ManagedDatabaseError, OSError, ValueError) as failed:
+        created["confirmed"] = False
+        created["sync_state"] = "pending"
+        created["reason"] = str(failed)
+        return created
+    if mirrored.get("conflict"):
+        conflicted = catalog.mark_link_conflict(
+            str(created["link_id"]),
+            str(mirrored.get("reason") or "unexpected IDB revision"),
+        )
+        conflicted["event_id"] = created["event_id"]
+        return conflicted
+    if not (mirrored.get("applied") or mirrored.get("already")):
+        created["confirmed"] = False
+        created["sync_state"] = "pending"
+        created["reason"] = str(mirrored.get("reason") or "the IDB was not saved")
+        return created
+    observed = mirrored.get("triage_revision")
+    if isinstance(observed, bool) or not isinstance(observed, int):
+        observed = int(ida_row["triage_revision"]) + 1
+    confirmed = catalog.confirm_link_event(str(created["event_id"]), observed)
+    confirmed["reason"] = ""
+    return confirmed
+
+
+def _catalog_for_link(
+    named: Path, binary: Path, file_sha: str, idb_path: str
+) -> tuple[Catalog | None, str | None]:
+    if named.suffix.lower() in IDB_SUFFIXES:
+        page = findings_ida(idb_path, 0, 1, path=str(named))
+        health = page["store_health"]["ida"]
+        idb_id = health.get("managed_idb_id") if isinstance(health, dict) else None
+        if not isinstance(idb_id, str) or not idb_id:
+            return None, (
+                "provisional IDB without verified source proof: the database"
+                " has no managed id to join to the original binary"
+            )
+        catalog = open_catalog(str(named), idb_id)
+        if (
+            catalog.source_association != ASSOCIATION_VERIFIED
+            or catalog.source_sha256 != file_sha
+        ):
+            catalog.close()
+            return None, (
+                "provisional IDB without verified source proof: naming a"
+                f" binary ({file_sha}) does not verify this database"
+            )
+        return catalog, None
+    catalog = open_catalog(str(named))
+    if catalog.source_sha256 != file_sha:
+        catalog.close()
+        return None, (
+            f"this catalog is keyed by SHA-256 {catalog.source_sha256}, not {file_sha}"
+        )
+    try:
+        sample = call_site_proof_ida(idb_path, 0)
+    except ManagedDatabaseError:
+        sample = {}
+    ida_sha = sample.get("input_sha256") if isinstance(sample, dict) else None
+    if (
+        isinstance(ida_sha, str)
+        and ida_sha == file_sha
+        and catalog.source_association != ASSOCIATION_VERIFIED
+        and catalog.managed_idb_id
+    ):
+        catalog.attach_source(
+            str(binary), {"kind": "input_fingerprint", "sha256": ida_sha}
+        )
+    return catalog, None
+
+
+def _partial_stale(identity: Mapping[str, object]) -> bool:
+    if not identity.get("stale"):
+        return False
+    observed = identity.get("observed_ids")
+    seen = set(observed) if isinstance(observed, set) else set()
+    if identity.get("scope_state") == "failed" and not seen:
+        return False
+    return bool(seen - {identity.get("id")})
+
+
+def _ida_partial_stale(
+    finding: Mapping[str, object], rows: list[dict[str, Any]]
+) -> bool:
+    if not finding.get("stale"):
+        return False
+    return any(
+        row["source"] == finding.get("source")
+        and row["id"] != finding.get("id")
+        and not row.get("stale")
+        for row in rows
+    )
+
+
+def _mapping_refusal(
+    ida_proof: Mapping[str, object],
+    provider_proof: Mapping[str, object],
+    ida_address: int,
+    external_address: int,
+    binary: str,
+) -> str | None:
+    ida_base = _parse_address(ida_proof.get("image_base"))
+    provider_base = provider_proof.get("image_base")
+    if isinstance(provider_base, str):
+        provider_base = _parse_address(provider_base)
+    if ida_base is None or not isinstance(provider_base, int):
+        return "the image base of one side could not be read; nothing was linked"
+    if ida_address < ida_base or external_address < provider_base:
+        return (
+            "a call-site address falls below its image base, so no relative"
+            " address can be proved. Nothing was linked"
+        )
+    ida_rva = ida_address - ida_base
+    external_rva = external_address - provider_base
+    if ida_rva != external_rva:
+        if ida_address == external_address:
+            return (
+                f"the numeric address {hex(ida_address)} is the same, but the"
+                f" image bases {hex(ida_base)} and {hex(provider_base)} put it"
+                f" at different RVAs ({hex(ida_rva)} and {hex(external_rva)})."
+                " Nothing was linked"
+            )
+        return (
+            f"relative addresses {hex(ida_rva)} and {hex(external_rva)} do not"
+            " name the same call site. Nothing was linked"
+        )
+    ida_bytes = bytes.fromhex(str(ida_proof.get("bytes") or ""))
+    provider_bytes = bytes.fromhex(str(provider_proof.get("bytes") or ""))
+    length = min(len(ida_bytes), len(provider_bytes), _PROOF_BYTES)
+    if length < 1 or ida_bytes[:length] != provider_bytes[:length]:
+        return (
+            "the call-site bytes the two backends read do not match."
+            " Nothing was linked"
+        )
+    file_bytes = _file_bytes(Path(binary), ida_rva, length)
+    if file_bytes != ida_bytes[:length]:
+        return (
+            "the call-site bytes are not at that RVA in the original binary."
+            " Nothing was linked"
+        )
+    ida_xrefs = ida_proof.get("xrefs_from")
+    provider_xrefs = provider_proof.get("xrefs")
+    if not isinstance(ida_xrefs, list) or not any(
+        isinstance(item, dict) and item.get("iscode") for item in ida_xrefs
+    ):
+        return "IDA reports no code xref from this call site. Nothing was linked"
+    wanted = hex(ida_rva)
+    if not isinstance(provider_xrefs, list) or not any(
+        isinstance(item, dict) and item.get("from_rva") == wanted
+        for item in provider_xrefs
+    ):
+        return (
+            "the provider's source xrefs do not include a call at this RVA."
+            " Nothing was linked"
+        )
+    return None
+
+
+def _file_bytes(binary: Path, rva: int, length: int) -> bytes | None:
+    raw = binary.read_bytes()
+    if len(raw) < 64 or raw[:4] != b"\x7fELF" or raw[4] != 2:
+        return None
+    endian = "little" if raw[5] == 1 else "big"
+    phoff = int.from_bytes(raw[32:40], endian)
+    phentsize = int.from_bytes(raw[54:56], endian)
+    phnum = int.from_bytes(raw[56:58], endian)
+    loads = []
+    for index in range(phnum):
+        entry = raw[phoff + index * phentsize : phoff + (index + 1) * phentsize]
+        if len(entry) < 40 or int.from_bytes(entry[0:4], endian) != 1:
+            continue
+        loads.append(
+            (
+                int.from_bytes(entry[8:16], endian),
+                int.from_bytes(entry[16:24], endian),
+                int.from_bytes(entry[32:40], endian),
+            )
+        )
+    if not loads:
+        return None
+    base = min(item[1] for item in loads)
+    for offset, vaddr, filesz in loads:
+        start = vaddr - base
+        if start <= rva < start + filesz:
+            file_at = offset + (rva - start)
+            return raw[file_at : file_at + length]
+    return None
+
+
+def _rule_names(
+    identity: Mapping[str, object], ida_row: Mapping[str, Any]
+) -> tuple[str, ...]:
+    evidence = identity.get("evidence")
+    names: list[str] = []
+    if isinstance(evidence, dict):
+        stored = evidence.get("rule_function_names")
+        if isinstance(stored, list):
+            names.extend(str(item) for item in stored if isinstance(item, str) and item)
+    for row in (identity, ida_row):
+        name = row.get("function_name")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _ida_row(
+    idb_path: str, finding_id: str, path: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = findings_ida(idb_path, offset, 200, path=path)
+        found = [row for row in page["findings"] if isinstance(row, dict)]
+        rows.extend(found)
+        matched = next((row for row in found if row.get("id") == finding_id), None)
+        if matched is not None:
+            return matched, rows
+        if offset + int(page["loaded"]) >= int(page["target_total"]) or not found:
+            return None, rows
+        offset += int(page["loaded"])
+
+
+def _parse_address(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = int(value, 16)
+        except ValueError:
+            return None
+        return parsed if parsed >= 0 else None
+    return None
+
+
+def _file_sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _link_result(ida_id: str, external_id: str) -> dict[str, object]:
+    return {
+        "confirmed": False,
+        "sync_state": "unlinked",
+        "link_id": None,
+        "link_revision": None,
+        "event_id": None,
+        "status": None,
+        "rationale": None,
+        "chosen_source": None,
+        "reason": "",
+        "proof": {},
+        "ida_finding_id": ida_id,
+        "external_finding_id": external_id,
+    }
+
+
+def link_briefing(
+    path: str, ida_finding_id: str, external_finding_id: str, binary_path: str
+) -> dict[str, object]:
+    """Both assessments, read before a reviewer is asked to choose."""
+    binary = str(Path(binary_path).expanduser().resolve())
+    named = Path(path).expanduser().resolve()
+    idb_path = (
+        str(named)
+        if named.suffix.lower() in IDB_SUFFIXES
+        else existing_managed_idb(str(named))
+    )
+    ida_row = None
+    if idb_path is not None:
+        ida_row, _rows = _ida_row(idb_path, ida_finding_id, binary)
+    external = None
+    catalog = get_catalog(binary)
+    if catalog is not None:
+        try:
+            external = catalog.external_finding(external_finding_id)
+        finally:
+            catalog.close()
+    return {"ida": ida_row, "external": external, "path": str(named), "binary": binary}
+
+
+def _render_link_briefing(briefing: Mapping[str, object]) -> str:
+    lines = ["Both assessments, before a canonical source is chosen:"]
+    for label, key in (("IDA", "ida"), ("External", "external")):
+        row = briefing.get(key)
+        lines.append(f"{label} finding")
+        if not isinstance(row, dict):
+            lines.append("  (not stored)")
+            continue
+        lines.append(f"  id        {row.get('id')}")
+        lines.append(f"  status    {row.get('status')}")
+        lines.append(f"  rationale {row.get('rationale') or '(none)'}")
+        lines.append(
+            f"  address   {row.get('address')} space {row.get('address_space')}"
+        )
+        lines.append(f"  digest    {row.get('rule_digest')}")
+    return "\n".join(lines)
+
+
+def _link_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="vulfi-mcp link",
+        description=(
+            "Review a link between one IDA finding and one external finding."
+            " This is not an MCP tool. Both assessments are shown before the"
+            " canonical source is chosen."
+        ),
+    )
+    parser.add_argument("--path", required=True)
+    parser.add_argument("--ida-id", required=True)
+    parser.add_argument("--external-id", required=True)
+    parser.add_argument("--binary", required=True)
+    parser.add_argument("--source", required=True, choices=CHOSEN_SOURCES)
+    parser.add_argument("--status", required=True, choices=TRIAGE_STATUSES)
+    parser.add_argument("--rationale", required=True)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def link_main(argv: list[str] | None = None) -> int:
+    """Run ``vulfi-mcp link``. Returns the process exit status."""
+    try:
+        arguments = _link_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    except SystemExit as exited:
+        return int(exited.code or 0)
+    dialogue = sys.stderr if arguments.json else sys.stdout
+    try:
+        briefing = link_briefing(
+            arguments.path,
+            arguments.ida_id,
+            arguments.external_id,
+            arguments.binary,
+        )
+    except (CatalogError, ManagedDatabaseError, OSError) as refused:
+        print(f"vulfi-mcp link: {refused}", file=sys.stderr)
+        return 1
+    print(_render_link_briefing(briefing), file=dialogue)
+    print(
+        f"\nType '{arguments.source}' to choose that assessment as canonical,"
+        " anything else to abort: ",
+        end="",
+        file=dialogue,
+        flush=True,
+    )
+    try:
+        answer = sys.stdin.readline()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    print("", file=dialogue)
+    if answer.strip() != arguments.source:
+        print("Nothing was linked.", file=dialogue)
+        return 1
+    result = review_link(
+        arguments.path,
+        arguments.ida_id,
+        arguments.external_id,
+        arguments.binary,
+        arguments.source,
+        arguments.status,
+        arguments.rationale,
+    )
+    if arguments.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        print(
+            f"link {result.get('link_id')}: "
+            + ("synchronized" if result.get("confirmed") else "NOT synchronized"),
+            file=dialogue,
+        )
+        if result.get("reason"):
+            print(result["reason"], file=dialogue)
+    return 0 if result.get("confirmed") else 1
+

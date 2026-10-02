@@ -463,6 +463,59 @@ async def evidence_r2(target: str, rule: Rule, rule_index: int) -> RuleEvidence:
         return _evidence(rule_index, [], [], "failed", str(refused))
 
 
+async def prove_call_site(
+    target: str, address: int, names: tuple[str, ...]
+) -> dict[str, object]:
+    """Image base, bytes, and call xrefs at one address.
+
+    ``names`` only chooses which function to ask ``xrefs_to`` about.
+    """
+    config = _config()
+    wanted = {_normalize(name) for name in names if name}
+    async with provider_session(config, target, allowlist=ALLOWLIST) as session:
+        image = await _open(session)
+        try:
+            raw = await _read(session, address, 16)
+            xrefs: list[dict[str, object]] = []
+            if wanted:
+                functions, _short = await _functions(session)
+                for function in functions:
+                    if _normalize(str(function.get("name") or "")) not in wanted:
+                        continue
+                    callee = int(function["entry"])
+                    for row in await _xrefs(session, callee):
+                        if row.get("kind") not in CALL_REFERENCES:
+                            continue
+                        origin = row.get("address")
+                        if not isinstance(origin, int):
+                            continue
+                        xrefs.append(
+                            {
+                                "from": hex(origin),
+                                "from_rva": (
+                                    hex(origin - image.base)
+                                    if origin >= image.base
+                                    else None
+                                ),
+                                "to": hex(callee),
+                                "to_rva": hex(callee - image.base),
+                                "kind": row["kind"],
+                            }
+                        )
+            relative = hex(address - image.base) if address >= image.base else None
+            return {
+                "image_base": image.base,
+                "address": address,
+                "relative_address": relative,
+                "bytes": raw.hex(),
+                "xrefs": xrefs,
+                "address_space": "r2:image",
+            }
+        finally:
+            await _release(session)
+
+
+
 # --------------------------------------------------------------------------
 # configuration, and the one open session
 # --------------------------------------------------------------------------

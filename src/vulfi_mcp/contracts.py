@@ -43,6 +43,8 @@ __all__ = [
     "SyncState",
     "TriageResult",
     "TriageStatus",
+    "ChosenSource",
+    "LinkResult",
 ]
 
 #: One arbitrary JSON value. Spelled ``Any`` rather than ``object`` because
@@ -142,10 +144,34 @@ if TYPE_CHECKING:
     #: ``evaluated`` means a backend really ran these rules over this scope;
     #: the others carry the same distinctions :data:`AttemptOutcome` does.
     ScopeState = Literal["evaluated", "failed", "unavailable", "unverified"]
+    ChosenSource = Literal["ida", "external", "new"]
 else:
     Backend = Priority = TriageStatus = ScanCoverage = RuleState = SyncState = str
     PassName = PassStage = RangeCoverage = CandidateState = CandidateKind = str
-    AttemptOutcome = RouteState = ScopeState = str
+    AttemptOutcome = RouteState = ScopeState = ChosenSource = str
+
+
+class LinkResult(TypedDict):
+    """What one local ``vulfi-mcp link`` decision did.
+
+    ``confirmed`` is true only after the IDB save and the catalog event both
+    landed. ``pending`` is the crash window between those two. This is not an
+    MCP tool result.
+    """
+
+    confirmed: bool
+    sync_state: str
+    link_id: str | None
+    link_revision: int | None
+    event_id: str | None
+    ida_finding_id: str
+    external_finding_id: str
+    chosen_source: str | None
+    status: str | None
+    rationale: str | None
+    reason: str
+    proof: dict[str, JsonValue]
+
 
 
 class Finding(TypedDict):
