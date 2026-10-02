@@ -2,7 +2,26 @@
 
 VulFi-style vulnerability-hunting rules, evidence-first analysis preparation, and operator-reviewed recovery for the official Hex-Rays IDA MCP server. Importing this package's entry point registers seven VulFi tools on the server `ida-mcp` already owns, so one stdio connection serves the six stock IDA tools and the seven VulFi tools from a single process. It is not a second MCP server and not a fork of the official one.
 
-**Status: internal IDA-only milestone, not a release.** Everything below works end to end against real IDA. The external Ghidra/radare2 providers and reviewer-linked triage described in the design documents are **not implemented**, and the tools refuse the parameters that would need them instead of answering as if they existed.
+**Status: not a release.** The operator surface below is implemented, and the limits are the ones this build measured. The live gate `VULFI_REQUIRE_LIVE=1 uv run --python 3.11 pytest -q` did not pass: 5 failed, 423 passed, 1 skipped in 805.17s. The skip is not a licensed IDA, Ghidra, or r2 integration (`test_the_previous_build_refuses_this_builds_catalog_by_name` skips because HEAD already has schema 2). The failures are `test_provider_pseudocode_without_facts_is_not_clean` (r2 scope `failed`, not `evaluated`), `test_unimplemented_capabilities_are_refused_not_answered_empty` (naming `ghidra` or `r2` is no longer an MCP error), `test_invalid_passes_and_rules_do_not_mutate` (`backend="ghidra"` no longer raises), `test_failed_save_retains_partial` (an injected IDA save failure is reported as an unconfigured r2 instead), and `test_stale_and_failed_review_do_not_confirm` (failed in the full run, passed when re-run alone). Do not treat this checkout as a published release.
+
+## Release matrix
+
+Tested on this machine, ELF x86-64 only. No other architecture, OS, or IDA GUI session was exercised. A cell that says unavailable is not a clean negative.
+
+| Surface | Tested pin | What it does here |
+| --- | --- | --- |
+| Python | 3.11.15 (`requires-python >= 3.11`) | host and IDA worker |
+| IDA | 9.4.260714 at `/home/ductin/Applications/ida-pro-9.4`, `idalib` | managed copy, netnode `vulfi_mcp.v2`, six stock tools |
+| Official IDA MCP | `ida-mcp==20260924.0.3`, `ida-nexus==0.13.0`, `ida-domain==0.5.1`, `idapro==0.0.10` | `open_database`, `execute_python`, `reference`, `list_databases`, `save_database`, `close_database` |
+| MCP client | `mcp==2.2.0` | stdio to providers; protocol the pins were measured at |
+| VulFi tools | seven, no eighth | `vulfi_rule_template`, `vulfi_scan`, `vulfi_prepare`, `vulfi_preparation`, `vulfi_propose_recovery`, `vulfi_findings`, `vulfi_triage` |
+| Ghidra | 12.1.2_PUBLIC, GhidraMCP 6.0.0, bridge stdio to `http://127.0.0.1:8192` | strings, functions, P-code facts the typed tools state |
+| Ghidra JVM | the live process was OpenJDK 25.0.1, not Java 21 | Java 21 (`temurin-21.0.12+101.0.LTS`) is installed; this gate's server was not started with it. Do not claim a Java 21 runtime from this checkout. |
+| radare2 | 6.2.2, `radareorg/radare2-mcp` 1.8.8 at `/tmp/vulfi-providers/r2mcp/src/r2mcp` | strings and functions. `LD_LIBRARY_PATH=/tmp/vulfi-providers/r2/lib` |
+| OMP board | `@oh-my-pi/pi-coding-agent` 18.3.2 | optional widget. Not a second MCP client. |
+
+Authorities: the managed IDB netnode is authoritative for unlinked IDA assessments. SQLite is authoritative for external rows and for the canonical decision of a reviewer-created link. A linked pair is two findings, not one vulnerability. No public tool was added for approval or linking.
+
 
 ## What works today
 
@@ -36,7 +55,40 @@ The order is checkpoint, apply, save, observe, record. The decision is written t
 
 `reopen` is the way back from the last of those. The row it leaves behind says `approved` with no change behind it: nothing can decide it, and re-submitting the identical change is refused as a duplicate because a proposal's id is derived from its content. `reopen` returns such a row to `pending` — after reading the managed artifact again and finding that what the proposal asks for really is not there. A proposal whose change *is* there is left alone and said so, and one whose candidate no longer carries its evidence is marked `stale` instead. It approves nothing itself: the operator decides it afterwards the usual way.
 
-**The separation is procedural.** This is an ordinary program on an ordinary PATH, so anything running with the operator's own OS permissions — including a shell-capable agent — can run it. What the split prevents is an MCP client applying its own proposals through the protocol it is already talking. An installation that needs enforced human separation has to enforce it with credentials: run the MCP server as a principal that cannot execute `vulfi-mcp review` and cannot write the managed data directory, and give the reviewer a different one.
+**The separation is procedural.** This is an ordinary program on an ordinary PATH, so anything running with the operator's own OS permissions — including a shell-capable agent — can run `vulfi-mcp review`, `vulfi-mcp link`, and `vulfi-mcp resolve`, and can pass `--confirmed`. What the split prevents is an MCP client applying its own proposals or links through the protocol it is already talking. `--confirmed` is not an MCP tool. An installation that needs enforced human separation has to enforce it with credentials: run the MCP server as a principal that cannot execute those commands and cannot write the managed data directory, and give the reviewer a different one.
+
+## Linking findings: `vulfi-mcp link` and `vulfi-mcp resolve`
+
+These are local commands, not MCP tools. A link is created only after the operator has seen both assessments and the mapping evidence: both image bases, the RVA, the original bytes, and the xref proof. A pair the machine has already rejected is printed as a refusal and is not prompted.
+
+```sh
+vulfi-mcp link --path ./target --ida-id ida:... --external-id ghidra:... \
+  --binary ./target --source new --status Suspicious \
+  --rationale "same call site, reviewed"
+vulfi-mcp resolve --path ./target --link-id L-... --source ida \
+  --status "False Positive" --rationale "reviewer chose the IDA assessment"
+```
+
+`--source` is `ida`, `external`, or `new`. `--status` is one of `Not Checked`, `False Positive`, `Suspicious`, `Vulnerable`. The command waits for that source to be typed out in full. `--confirmed <token>` skips that stdin read only when the token is the decision already given; a missing or disagreeing token writes nothing. `--confirmed` is a CLI flag, not an MCP tool. A shell that can already run `vulfi-mcp` can pass it. That is the credential risk, not a second protocol.
+
+Link proof is original-binary SHA-256, the full rule digest, a verified address-space mapping to the same call site (RVA, bytes, and a code xref), and the live finding ids. `function_name` is not an identity. External rules that name more than one function store an empty `function_name`. Name matching is not supported. Equal numeric addresses with different image bases do not link. A provisional IDB without verified source proof does not link.
+
+A later triage of either finding id journals one decision. `pending` is the crash window. `synchronized` is only after the IDB save is observed. `conflict` is an unexpected revision; the next update does not overwrite. `paused` is a stale or missing member. `unavailable` is a store that did not answer. `vulfi-mcp resolve` writes a new guarded event after the operator sees the evidence again. It is not last-write-wins, and it does not unpause a link.
+
+## Status meanings
+
+| Word | Where | Meaning |
+| --- | --- | --- |
+| `Not Checked`, `False Positive`, `Suspicious`, `Vulnerable` | finding assessment | the four triage states. A new row is `Not Checked`. |
+| `pending`, `approved`, `rejected`, `applied`, `stale` | proposal | `approved` is the decision recorded before the write. `applied` is the only state that claims the artifact changed. `stale` means the candidate or the bytes moved; nothing was applied. |
+| `evaluated`, `unsupported`, `failed` | rule | facts were established, the backend states it cannot establish them, or the call did not finish. None of those is a clean "no finding" unless the rule was `evaluated` and matched nothing. |
+| `answered`, `unsupported`, `failed`, `unavailable`, `unverified` | routing attempt | see the routing table below. They are not interchangeable. |
+| `complete`, `partial`, `unavailable` | pass coverage | `partial` is ordinary. `unavailable` means that pass was not established, not that the image had nothing. |
+| `pending`, `synchronized`, `conflict`, `paused`, `unavailable` | link | crash window, confirmed mirror, unexpected revision, member not reconfirmed or gone, store did not answer. |
+| `stale` on a row | finding | the catalog sets this bit when a later scan did not observe the row. It is not, by itself, a paused link. |
+
+A `stale` bit set by a scope whose stored state is `failed` and that observed no findings is not "not reconfirmed." The server does not pause a link for that bit. A partial scan that saw other rows and did not reconfirm the member does pause. The catalog still sets the bit in both cases. The distinction is the scope state plus whether that scan observed other rows.
+
 
 ## Routing across backends
 
@@ -54,15 +106,53 @@ Every pass and every rule reports what each backend said, in five words that are
 
 Nothing upgrades a coverage. A bounded or truncated read makes a pass `partial` whatever its geometry, an `unavailable` range is never raised, and a pass no backend could run is named in `routing` with each backend's reason rather than left out as though it had run and found nothing.
 
-What each backend can actually do here was measured, not assumed. Ghidra answers `strings` and `functions` and establishes argument and return-check facts from high P-code only; `structures` and `pointer_tables` are `unsupported` because that build exposes no typed tool that proves a field width or a relocation. radare2 answers the same two passes and establishes exactly one rule fact — which functions a call site is reached from — so twenty-three of the twenty-four stock rules are `unsupported` on it. Its contribution is preparation evidence, not rule coverage. **No backend turns decompiled C into a structural fact**; a provider that has only pseudocode has no contexts and says so.
+What each backend can actually do here was measured, not assumed. Ghidra answers `strings` and `functions` and establishes argument and return-check facts from high P-code only. `structures` and `pointer_tables` are `unavailable` on this Ghidra build: it exposes no typed tool that proves a field width or a relocation. Stock Buffer Overflow is `unsupported` on this Ghidra build because it needs `calls_before`, and GhidraMCP 6.0.0 states no argument flow across a call. radare2 answers the same two passes and establishes exactly one rule fact — which functions a call site is reached from — so a stock rule that needs argument structure, including Buffer Overflow, is `unsupported` on it. Its contribution is preparation evidence, not rule coverage. radare2 has no safe writer: no project, no save, and a proposal against one of its candidates is refused by name. **No backend turns decompiled C into a structural fact**; a provider that has only pseudocode has no contexts and says so.
 
 Findings are scoped by backend **and** by `default`/`custom:<scan_name>`, in independent stores. A scan may retire a row only when it really ran, covered the whole image and was asked every rule in the scan; anything less keeps the rows it did not observe and marks them `stale`. A complete Ghidra scan of `default` therefore cannot touch Ghidra's `custom:nightly`, radare2's scopes, or the IDA netnode. External rows belong to the original binary's SHA-256 namespace: a database-only target must supply `binary_path`, which is proved against the input digest the database itself records, and an unrelated binary is refused rather than guessed at.
 
 `vulfi-mcp review approve` can apply a reviewed change to Ghidra's managed project, through its own safe writer, which revalidates the overlap and the project revision at the moment it applies. radare2 has no project and no save, so a mutation would not outlive the session that made it: a proposal against one of its candidates is refused by name.
 
+## External identity
+
+Provider configuration is one TOML file: `$VULFI_MCP_PROVIDER_CONFIG`, or `providers.toml` under the managed data directory. No MCP argument, rule, or provider response chooses the executable or the URL. A stdio `command` must be an absolute path. `[[ghidra.binaries]]` and `[[r2.binaries]]` map a local directory to the path that provider sees. A binary outside that map is not sent. The client hashes the mapped file when it can read it; it does not take the provider's word for bytes it can hash itself. An unverified identity stops the chain. External finding ids include the original binary's SHA-256. Two binaries do not share an id. An IDB-only request does not join external rows until `binary_path` is proved against the digest the database records.
+
+```toml
+[ghidra]
+transport = "stdio"
+command = "/absolute/path/to/bridge-mcp-ghidra"
+args = []
+
+[ghidra.env]
+GHIDRA_MCP_URL = "http://127.0.0.1:8192"
+
+[[ghidra.binaries]]
+local = "/work/samples"
+remote = "/work/samples"
+
+[r2]
+transport = "stdio"
+command = "/tmp/vulfi-providers/r2mcp/src/r2mcp"
+args = []
+
+[r2.env]
+PATH = "/tmp/vulfi-providers/r2/bin:/usr/bin:/bin"
+LD_LIBRARY_PATH = "/tmp/vulfi-providers/r2/lib"
+
+[[r2.binaries]]
+local = "/work/samples"
+remote = "/work/samples"
+```
+
+The paths above are the pins this checkout measured, not a portable install. A loopback endpoint needs the operator's own authentication; this file is the only place a token is read, and it is not echoed in errors.
+
+
 ## Limits
 
-- **Automatic links.** No link is created by a matching address or a matching name. A reviewer creates one with `vulfi-mcp link`, and chooses the assessment that wins a conflict with `vulfi-mcp resolve`. Both are local commands, not MCP tools.
+- **Automatic links.** No link is created by a matching address, a matching RVA alone, or a matching name. A reviewer creates one with `vulfi-mcp link`.
+- **A recovered IDA function is not a Ghidra finding.** Defining a function over unreferenced bytes in the managed IDB does not make Ghidra disassemble those bytes. On this build an unreferenced executable section is loaded and no function is created over it, so there is no xref at that call and nothing to link. The `strcpy` in `main` is a different site. Do not link them.
+- **Empty `function_name`.** External multi-name rules store an empty `function_name`. Links do not read that field.
+- **Ghidra `structures` and `pointer_tables`.** Unavailable. No typed tool. radare2 has no safe writer. Stock Buffer Overflow is unsupported on this Ghidra build because it needs `calls_before`.
+- **Stale is not pause.** See the status table. A failed scope with no findings does not pause a link. A partial scan that saw other rows does.
 
 ### A save IDA 9.4.260714 cannot read back
 
@@ -72,11 +162,16 @@ This server does not retry and does not hide it. Every save it makes to a manage
 
 Your recourse when it happens: **rescan.** The rolled-back workspace is usable again immediately and is missing only what the failed save changed. If the kept bytes cannot be opened either, the error says the workspace has to be rebuilt, which `vulfi_scan` does by pointing it at the source binary again — the source is never written to, so it is always available to rebuild from.
 
+A rolled-back mirror can leave SQLite at a revision the IDB no longer has. The next linked update conflicts instead of overwriting. Rescan does not invent a synchronized state for that window. `resolve` is how an operator chooses again, after the evidence is on screen.
+
+
 ## Requirements
 
-- Python >= 3.11.
-- IDA >= 9.4 with an activated `idalib` license. Analysis runs headless through `ida-nexus`; no IDA GUI session is attached and no database is opened in place.
+- Python >= 3.11. This checkout was run with 3.11.15.
+- IDA >= 9.4 with an activated `idalib` license. Measured: 9.4.260714. Analysis runs headless through `ida-nexus`; no IDA GUI session is attached and no database is opened in place. ELF x86-64 is the only architecture these gates exercised.
 - Hex-Rays for rules that need argument recovery. Without a decompiler, scans still run against disassembly and report `partial` coverage with the affected rules `unsupported`.
+- Java for the Ghidra headless server. The live process in this gate was OpenJDK 25.0.1 with Ghidra 12.1.2_PUBLIC and GhidraMCP 6.0.0. Java 21 (`temurin-21.0.12+101.0.LTS`) is installed here and was not the JVM that answered. Do not treat that install path as a tested runtime.
+- radare2 6.2.2 and radare2-mcp 1.8.8, with `LD_LIBRARY_PATH` pointing at that radare2's `lib`. The measured binary is `/tmp/vulfi-providers/r2mcp/src/r2mcp`.
 - `gcc` only to build the test fixtures.
 
 ## Install and run
@@ -125,7 +220,9 @@ The board is stale until the agent calls `vulfi_findings` or `vulfi_preparation`
 
 ## Managed workspace
 
-Everything this server writes lives under one root: `$VULFI_MCP_DATA_DIR` when set, otherwise `$XDG_DATA_HOME/vulfi-mcp` (`~/.local/share/vulfi-mcp` by default). Managed databases are created under `databases/<name>-<hash>/`, one deterministic directory per target, and the same file at the same path always resolves to the same managed database instead of being analyzed again. The preparation catalog — candidates, their evidence, and every proposal and review decision — is the single `catalog.sqlite3` beside them. Nothing is ever written next to the target, and the target itself is never written to at all.
+Everything this server writes lives under one root: `$VULFI_MCP_DATA_DIR` when set, otherwise `$XDG_DATA_HOME/vulfi-mcp` (`~/.local/share/vulfi-mcp` by default). Managed databases are created under `databases/<name>-<hash>/`, one deterministic directory per target, and the same file at the same path always resolves to the same managed database instead of being analyzed again. The preparation catalog — candidates, their evidence, proposals, review decisions, external findings, and link events — is the single `catalog.sqlite3` beside them. Nothing is ever written next to the target, and the target itself is never written to at all.
+
+There is no second catalog generation. An operator who wants a catalog backup copies `catalog.sqlite3` themselves; this server does not. Each mutating save of a published managed IDB keeps the bytes it replaces in `<database>.pre-save` beside that database, for the bad-pack rollback above. That spare is not an operator snapshot tool, and it is dropped once a later open proves the new bytes readable. The staging save that first publishes a database has no spare.
 
 ## Tests
 
@@ -133,10 +230,10 @@ Everything this server writes lives under one root: `$VULFI_MCP_DATA_DIR` when s
 uv run --python 3.11 pytest -q
 ```
 
-Tests that need IDA, or `gcc`, skip when the prerequisite is missing. Set `VULFI_REQUIRE_LIVE=1` to turn any such skip into a failure, which is how the live coverage is verified.
+Tests that need IDA, Ghidra, radare2, or `gcc` skip when the prerequisite is missing. Set `VULFI_REQUIRE_LIVE=1` to turn any such skip into a failure. A skip of a licensed IDA, live Ghidra, or live r2 integration under that flag is a failed release gate, not a pass. `bun test omp/extension.test.ts` is the OMP gate. Do not wrap pytest in an outer flock on the Ghidra lock: the suite takes `/tmp/vulfi-ghidra-<host>-<port>.lock` itself, and an outer flock makes every provider test wait out and skip.
 
 ## Upstream projects
 
 Built on [Hex-Rays IDA MCP](https://github.com/HexRaysSA/ida-mcp), [IDA Nexus](https://github.com/HexRaysSA/ida-nexus), and [ida-domain](https://github.com/HexRaysSA/ida-domain). The 24 stock rules and the function-prototype table in `src/vulfi_mcp/data/` are derived from [Accenture VulFi](https://github.com/Accenture/VulFi) and are redistributed under its Apache-2.0 licence, a copy of which ships beside them and in `THIRD_PARTY_LICENSES/`. The rule evaluator is an independent implementation: it interprets a restricted syntax tree rather than executing rule expressions as Python.
 
-The full architecture is described in the [MCP, fallback, and data design](docs/superpowers/specs/2026-09-28-vulfi-ida-mcp-design.md) and the [RE preparation design](docs/superpowers/specs/2026-09-29-vulfi-re-preparation-design.md). The parts those documents describe that are listed above as not implemented are proposed contracts, not available commands.
+The full architecture is described in the [MCP, fallback, and data design](docs/superpowers/specs/2026-09-28-vulfi-ida-mcp-design.md) and the [RE preparation design](docs/superpowers/specs/2026-09-29-vulfi-re-preparation-design.md). Where those documents describe a pass, a rule, or a link this README lists as unavailable, that description is not a command.
